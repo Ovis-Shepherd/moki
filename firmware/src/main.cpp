@@ -458,7 +458,7 @@ static void build_home_content(lv_obj_t *parent) {
 
   lv_obj_t *mq = lv_label_create(mood);
   lv_label_set_text(mq, "wie fühlst du dich heute?");
-  lv_obj_set_style_text_font(mq, &moki_fraunces_italic_16, LV_PART_MAIN);
+  lv_obj_set_style_text_font(mq, &moki_fraunces_italic_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(mq, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
 
   lv_obj_t *ma = lv_label_create(mood);
