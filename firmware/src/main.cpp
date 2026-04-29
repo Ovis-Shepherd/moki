@@ -1352,17 +1352,15 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_style_text_font(name, &moki_fraunces_regular_36, LV_PART_MAIN);
       lv_obj_set_style_text_color(name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
+      // Streak as plain text — JetBrains Mono ships ASCII + Umlauts but not
+      // ● / ○ (U+25CF / U+25CB), so dot-strings render as missing glyphs.
       char ser[32];
-      snprintf(ser, sizeof(ser), "%s",
-               h->streak > 0 ? "•••○○" : "noch keine serie");
-      // Render streak as filled/empty dots — quick approximation
-      char dots[16] = {0};
-      int filled = h->streak > 5 ? 5 : (int)h->streak;
-      for (int d = 0; d < 5; d++) {
-        strcat(dots, d < filled ? "● " : "○ ");
-      }
+      if (h->streak > 0)
+        snprintf(ser, sizeof(ser), "%u TAGE IN FOLGE", (unsigned)h->streak);
+      else
+        strcpy(ser, "NOCH KEINE SERIE");
       lv_obj_t *s = lv_label_create(txt);
-      lv_label_set_text(s, dots);
+      lv_label_set_text(s, ser);
       lv_obj_set_style_text_font(s, &moki_jetbrains_mono_22, LV_PART_MAIN);
       lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
       lv_obj_set_style_pad_top(s, 4, LV_PART_MAIN);
@@ -2273,6 +2271,12 @@ static void poll_serial(void) {
                       (unsigned)ESP.getFreeHeap(),
                       (unsigned)ESP.getFreePsram(),
                       g_todos_count, g_habits_count);
+        for (int i = 0; i < g_habits_count; i++) {
+          Serial.printf("  habit[%d] '%s' today=%u streak=%u\n",
+                        i, g_habits[i].name,
+                        (unsigned)g_habits[i].today_count,
+                        (unsigned)g_habits[i].streak);
+        }
       }
     } else if (g_serial_buf.length() < 64) {
       g_serial_buf += c;
