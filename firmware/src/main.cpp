@@ -49,7 +49,7 @@ static TouchDrvGT911 touch;
 // Sample state (in-RAM only — Stage 3 Persistence will move this to NVS/LittleFS)
 // Mirrors simulator's createInitialState (simulator.jsx lines 69-238).
 // ============================================================================
-typedef struct { const char *name; uint8_t today_count; uint8_t streak; } moki_habit_t;
+typedef struct { char name[48]; uint8_t today_count; uint8_t streak; } moki_habit_t;
 typedef struct {
   char title[64];
   char cat[16];          // home/plants/work/self/social
@@ -69,6 +69,17 @@ static const moki_habit_t SAMPLE_HABITS[] = {
   { "Tagebuch",       0, 0 },
 };
 static const int SAMPLE_HABITS_COUNT = sizeof(SAMPLE_HABITS) / sizeof(SAMPLE_HABITS[0]);
+
+#define MAX_HABITS 16
+static moki_habit_t g_habits[MAX_HABITS];
+static int g_habits_count = 0;
+
+static void state_init_habits(void) {
+  for (int i = 0; i < SAMPLE_HABITS_COUNT && i < MAX_HABITS; i++) {
+    g_habits[i] = SAMPLE_HABITS[i];
+  }
+  g_habits_count = SAMPLE_HABITS_COUNT;
+}
 
 static const moki_todo_t SAMPLE_TODOS[] = {
   { "Pflanzen gießen",     "plants", "morgen",      true,  false },
@@ -122,6 +133,36 @@ static void state_load_todos(void) {
     Serial.println(F("[persist] NVS empty — bootstrapping with sample data"));
     state_init_todos();
     state_save_todos();
+  }
+}
+
+static void state_save_habits(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt("habits_n", (uint32_t)g_habits_count);
+  if (g_habits_count > 0) {
+    g_prefs.putBytes("habits", g_habits, sizeof(moki_habit_t) * g_habits_count);
+  } else {
+    g_prefs.remove("habits");
+  }
+  g_prefs.end();
+  Serial.printf("[persist] saved %d habits to NVS\n", g_habits_count);
+}
+
+static void state_load_habits(void) {
+  g_prefs.begin("moki", true);
+  uint32_t n = g_prefs.getUInt("habits_n", 0xFFFFFFFFu);
+  if (n != 0xFFFFFFFFu && n <= MAX_HABITS) {
+    g_habits_count = (int)n;
+    if (g_habits_count > 0) {
+      g_prefs.getBytes("habits", g_habits, sizeof(moki_habit_t) * g_habits_count);
+    }
+    g_prefs.end();
+    Serial.printf("[persist] loaded %d habits from NVS\n", g_habits_count);
+  } else {
+    g_prefs.end();
+    Serial.println(F("[persist] NVS habits empty — bootstrapping"));
+    state_init_habits();
+    state_save_habits();
   }
 }
 
@@ -231,6 +272,7 @@ static void build_read(void);
 static void build_chats(void);
 static void build_map(void);
 void open_compose_todo(void);
+void open_compose_habit(void);
 
 static void on_dock_clicked(lv_event_t *e) {
   intptr_t idx = (intptr_t)lv_event_get_user_data(e);
@@ -255,8 +297,10 @@ static void on_map_tab_clicked(lv_event_t *e) {
 }
 
 // ============================================================================
-// Compose sheet — shared state + helpers (Stage 5-lite, todos only)
+// Compose sheet — shared state + helpers
 // ============================================================================
+typedef enum { COMPOSE_TODO, COMPOSE_HABIT } compose_kind_t;
+static compose_kind_t g_compose_kind     = COMPOSE_TODO;
 static char        g_compose_title[64]   = "";
 static char        g_compose_cat[16]     = "self";
 static char        g_compose_deadline[24]= "";
@@ -272,23 +316,34 @@ static void compose_close(void) {
 }
 
 static void compose_save(void) {
-  if (g_compose_title[0] == 0)            return;
-  if (g_todos_count >= MAX_TODOS)         return;
+  if (g_compose_title[0] == 0) return;
 
-  moki_todo_t *t = &g_todos[g_todos_count++];
-  strncpy(t->title,    g_compose_title,    sizeof(t->title)-1);    t->title[sizeof(t->title)-1] = 0;
-  strncpy(t->cat,      g_compose_cat,      sizeof(t->cat)-1);      t->cat[sizeof(t->cat)-1] = 0;
-  strncpy(t->deadline, g_compose_deadline, sizeof(t->deadline)-1); t->deadline[sizeof(t->deadline)-1] = 0;
-  t->recurring = false;
-  t->done      = false;
-
-  Serial.printf("[compose] saved todo: '%s'\n", t->title);
-  state_save_todos();
+  if (g_compose_kind == COMPOSE_TODO) {
+    if (g_todos_count >= MAX_TODOS) return;
+    moki_todo_t *t = &g_todos[g_todos_count++];
+    strncpy(t->title,    g_compose_title,    sizeof(t->title)-1);    t->title[sizeof(t->title)-1] = 0;
+    strncpy(t->cat,      g_compose_cat,      sizeof(t->cat)-1);      t->cat[sizeof(t->cat)-1] = 0;
+    strncpy(t->deadline, g_compose_deadline, sizeof(t->deadline)-1); t->deadline[sizeof(t->deadline)-1] = 0;
+    t->recurring = false;
+    t->done      = false;
+    Serial.printf("[compose] saved todo: '%s'\n", t->title);
+    state_save_todos();
+  } else { // COMPOSE_HABIT
+    if (g_habits_count >= MAX_HABITS) return;
+    moki_habit_t *h = &g_habits[g_habits_count++];
+    strncpy(h->name, g_compose_title, sizeof(h->name)-1); h->name[sizeof(h->name)-1] = 0;
+    h->today_count = 0;
+    h->streak      = 0;
+    Serial.printf("[compose] saved habit: '%s'\n", h->name);
+    state_save_habits();
+  }
 
   g_compose_title[0]    = 0;
   strcpy(g_compose_cat, "self");
   g_compose_deadline[0] = 0;
   compose_close();
+  // Re-arm the DO screen so we pick the right tab
+  current_do_tab = (g_compose_kind == COMPOSE_TODO) ? DO_TODOS : DO_HABITS;
   switch_screen(SCR_DO);
 }
 
@@ -357,7 +412,12 @@ static void on_save_clicked(lv_event_t *e) {
   compose_save();
 }
 
-void open_compose_todo(void) {
+static void build_compose_overlay(void);
+
+void open_compose_todo(void)  { g_compose_kind = COMPOSE_TODO;  build_compose_overlay(); }
+void open_compose_habit(void) { g_compose_kind = COMPOSE_HABIT; build_compose_overlay(); }
+
+static void build_compose_overlay(void) {
   if (g_compose_overlay) return;
   g_compose_overlay = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(g_compose_overlay);
@@ -390,7 +450,7 @@ void open_compose_todo(void) {
   lv_obj_add_event_cb(cancel, on_cancel_clicked, LV_EVENT_CLICKED, NULL);
 
   lv_obj_t *t = lv_label_create(hdr);
-  lv_label_set_text(t, "NEUE AUFGABE");
+  lv_label_set_text(t, g_compose_kind == COMPOSE_TODO ? "NEUE AUFGABE" : "NEUE GEWOHNHEIT");
   lv_obj_set_style_text_font(t, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(t, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(t, 3, LV_PART_MAIN);
@@ -1046,6 +1106,17 @@ static void on_todo_toggle(lv_event_t *e) {
   switch_screen(SCR_DO);
 }
 
+static void on_habit_increment(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= g_habits_count) return;
+  moki_habit_t *h = &g_habits[idx];
+  if (h->today_count == 0) h->streak += 1;       // first count of today
+  if (h->today_count < 99) h->today_count += 1;
+  Serial.printf("[habit] inc #%d → today=%d streak=%d\n", idx, h->today_count, h->streak);
+  state_save_habits();
+  switch_screen(SCR_DO);
+}
+
 static void build_todo_row(lv_obj_t *parent, int idx) {
   const moki_todo_t *t = &g_todos[idx];
   lv_obj_t *row = lv_obj_create(parent);
@@ -1174,8 +1245,8 @@ static void build_do_content(lv_obj_t *parent) {
     lv_obj_set_style_text_color(plus, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(plus, 3, LV_PART_MAIN);
   } else if (current_do_tab == DO_HABITS) {
-    for (int i = 0; i < SAMPLE_HABITS_COUNT; i++) {
-      const moki_habit_t *h = &SAMPLE_HABITS[i];
+    for (int i = 0; i < g_habits_count; i++) {
+      const moki_habit_t *h = &g_habits[i];
       lv_obj_t *row = lv_obj_create(body);
       lv_obj_remove_style_all(row);
       lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
@@ -1187,6 +1258,8 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
       lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                             LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, on_habit_increment, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
       lv_obj_t *txt = lv_obj_create(row);
       lv_obj_remove_style_all(txt);
@@ -1235,6 +1308,26 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_style_text_color(cl,
         lv_color_hex(h->today_count > 0 ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
     }
+
+    // "+ neue gewohnheit" button
+    lv_obj_t *add = lv_obj_create(body);
+    lv_obj_remove_style_all(add);
+    lv_obj_set_size(add, LV_PCT(100), 56);
+    lv_obj_set_style_border_color(add, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(add, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(add, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(add, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(add, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(add, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(add, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(add, [](lv_event_t *){ open_compose_habit(); },
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *plus = lv_label_create(add);
+    lv_label_set_text(plus, "+ NEUE GEWOHNHEIT");
+    lv_obj_set_style_text_font(plus, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(plus, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(plus, 3, LV_PART_MAIN);
   } else { // DO_CALENDAR
     static const char *dates[] = {"19","20","21","22","23","24","25"};
     static const char *weekdays[] = {"M","D","M","D","F","S","S"};
@@ -1819,6 +1912,7 @@ void setup() {
   }
 
   state_load_todos();
+  state_load_habits();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
