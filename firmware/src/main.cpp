@@ -49,7 +49,29 @@ static TouchDrvGT911 touch;
 // Sample state (in-RAM only — Stage 3 Persistence will move this to NVS/LittleFS)
 // Mirrors simulator's createInitialState (simulator.jsx lines 69-238).
 // ============================================================================
-typedef struct { char name[48]; uint8_t today_count; uint8_t streak; } moki_habit_t;
+typedef struct {
+  char    name[48];
+  uint8_t today_count;
+  uint8_t streak;
+  uint8_t history[84];          // 12 weeks × 7 days, count per day; idx 83 = today
+} moki_habit_t;
+#define HABITS_SCHEMA_V 2
+
+// Generate plausibly varied count history (mirrors simulator's genHistory).
+static void gen_habit_history(uint8_t *hist, float intensity) {
+  uint32_t seed = 13;
+  for (int i = 0; i < 84; i++) {
+    seed = (seed * 9301u + 49297u) % 233280u;
+    float r = (float)seed / 233280.0f;
+    if (r > intensity) { hist[i] = 0; continue; }
+    seed = (seed * 17u + 31u) % 233280u;
+    float r2 = (float)seed / 233280.0f;
+    if      (r2 < 0.55f) hist[i] = 1;
+    else if (r2 < 0.82f) hist[i] = 2;
+    else if (r2 < 0.95f) hist[i] = 3;
+    else                 hist[i] = 4;
+  }
+}
 typedef struct {
   char title[64];
   char cat[16];          // home/plants/work/self/social
@@ -62,13 +84,14 @@ typedef struct {
   const char *kind;       // private/friends/public
 } moki_event_t;
 
-static const moki_habit_t SAMPLE_HABITS[] = {
-  { "Lesen · 10 min", 1, 4 },
-  { "Spaziergang",    2, 7 },
-  { "Wasser",         3, 2 },
-  { "Tagebuch",       0, 0 },
+struct sample_habit_def { const char *name; uint8_t today; uint8_t streak; float intensity; };
+static const sample_habit_def SAMPLE_HABITS_DEF[] = {
+  { "Lesen · 10 min", 1, 4, 0.65f },
+  { "Spaziergang",    2, 7, 0.85f },
+  { "Wasser",         3, 2, 0.90f },
+  { "Tagebuch",       0, 0, 0.30f },
 };
-static const int SAMPLE_HABITS_COUNT = sizeof(SAMPLE_HABITS) / sizeof(SAMPLE_HABITS[0]);
+static const int SAMPLE_HABITS_COUNT = sizeof(SAMPLE_HABITS_DEF) / sizeof(SAMPLE_HABITS_DEF[0]);
 
 #define MAX_HABITS 16
 static moki_habit_t g_habits[MAX_HABITS];
@@ -76,7 +99,13 @@ static int g_habits_count = 0;
 
 static void state_init_habits(void) {
   for (int i = 0; i < SAMPLE_HABITS_COUNT && i < MAX_HABITS; i++) {
-    g_habits[i] = SAMPLE_HABITS[i];
+    moki_habit_t *h = &g_habits[i];
+    strncpy(h->name, SAMPLE_HABITS_DEF[i].name, sizeof(h->name)-1);
+    h->name[sizeof(h->name)-1] = 0;
+    h->today_count = SAMPLE_HABITS_DEF[i].today;
+    h->streak      = SAMPLE_HABITS_DEF[i].streak;
+    gen_habit_history(h->history, SAMPLE_HABITS_DEF[i].intensity);
+    h->history[83] = h->today_count;             // make today match the badge
   }
   g_habits_count = SAMPLE_HABITS_COUNT;
 }
@@ -138,6 +167,7 @@ static void state_load_todos(void) {
 
 static void state_save_habits(void) {
   g_prefs.begin("moki", false);
+  g_prefs.putUInt("habits_v", HABITS_SCHEMA_V);
   g_prefs.putUInt("habits_n", (uint32_t)g_habits_count);
   if (g_habits_count > 0) {
     g_prefs.putBytes("habits", g_habits, sizeof(moki_habit_t) * g_habits_count);
@@ -145,22 +175,24 @@ static void state_save_habits(void) {
     g_prefs.remove("habits");
   }
   g_prefs.end();
-  Serial.printf("[persist] saved %d habits to NVS\n", g_habits_count);
+  Serial.printf("[persist] saved %d habits (v%u)\n", g_habits_count, HABITS_SCHEMA_V);
 }
 
 static void state_load_habits(void) {
   g_prefs.begin("moki", true);
+  uint32_t v = g_prefs.getUInt("habits_v", 0);
   uint32_t n = g_prefs.getUInt("habits_n", 0xFFFFFFFFu);
-  if (n != 0xFFFFFFFFu && n <= MAX_HABITS) {
+  if (v == HABITS_SCHEMA_V && n != 0xFFFFFFFFu && n <= MAX_HABITS) {
     g_habits_count = (int)n;
     if (g_habits_count > 0) {
       g_prefs.getBytes("habits", g_habits, sizeof(moki_habit_t) * g_habits_count);
     }
     g_prefs.end();
-    Serial.printf("[persist] loaded %d habits from NVS\n", g_habits_count);
+    Serial.printf("[persist] loaded %d habits (v%u)\n", g_habits_count, v);
   } else {
     g_prefs.end();
-    Serial.println(F("[persist] NVS habits empty — bootstrapping"));
+    Serial.printf("[persist] habits schema mismatch (have v%u, want %u) — bootstrapping\n",
+                  v, HABITS_SCHEMA_V);
     state_init_habits();
     state_save_habits();
   }
@@ -1106,14 +1138,47 @@ static void on_todo_toggle(lv_event_t *e) {
   switch_screen(SCR_DO);
 }
 
+static int g_active_habit = -1;                  // selected habit for detail view
+static void build_habit_detail(void);
+
 static void on_habit_increment(lv_event_t *e) {
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   if (idx < 0 || idx >= g_habits_count) return;
   moki_habit_t *h = &g_habits[idx];
   if (h->today_count == 0) h->streak += 1;       // first count of today
-  if (h->today_count < 99) h->today_count += 1;
-  Serial.printf("[habit] inc #%d → today=%d streak=%d\n", idx, h->today_count, h->streak);
+  if (h->today_count < 99) {
+    h->today_count += 1;
+    h->history[83]  = h->today_count;
+  }
+  Serial.printf("[habit] +1 #%d → today=%d streak=%d\n", idx, h->today_count, h->streak);
   state_save_habits();
+  // Re-render whichever screen we're on (DO list or detail)
+  if (g_active_habit == idx) build_habit_detail();
+  else                       switch_screen(SCR_DO);
+}
+
+static void on_habit_decrement(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= g_habits_count) return;
+  moki_habit_t *h = &g_habits[idx];
+  if (h->today_count > 0) {
+    h->today_count -= 1;
+    h->history[83]  = h->today_count;
+    if (h->today_count == 0 && h->streak > 0) h->streak -= 1;  // undo the 0→1 streak bump
+  }
+  Serial.printf("[habit] -1 #%d → today=%d streak=%d\n", idx, h->today_count, h->streak);
+  state_save_habits();
+  if (g_active_habit == idx) build_habit_detail();
+  else                       switch_screen(SCR_DO);
+}
+
+static void on_habit_open_detail(lv_event_t *e) {
+  g_active_habit = (int)(intptr_t)lv_event_get_user_data(e);
+  build_habit_detail();
+}
+
+static void on_habit_back(lv_event_t *e) {
+  g_active_habit = -1;
   switch_screen(SCR_DO);
 }
 
@@ -1259,7 +1324,8 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                             LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-      lv_obj_add_event_cb(row, on_habit_increment, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+      lv_obj_add_event_cb(row, on_habit_increment,    LV_EVENT_CLICKED,      (void *)(intptr_t)i);
+      lv_obj_add_event_cb(row, on_habit_decrement,    LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
 
       lv_obj_t *txt = lv_obj_create(row);
       lv_obj_remove_style_all(txt);
@@ -1286,10 +1352,10 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
       lv_obj_set_style_pad_top(s, 4, LV_PART_MAIN);
 
-      // Count badge
+      // Count badge — tap = open detail screen
       lv_obj_t *pill = lv_obj_create(row);
       lv_obj_remove_style_all(pill);
-      lv_obj_set_size(pill, 70, 44);
+      lv_obj_set_size(pill, 86, 56);
       lv_obj_set_style_bg_color(pill,
         lv_color_hex(h->today_count > 0 ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
       lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, LV_PART_MAIN);
@@ -1299,6 +1365,8 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_ROW);
       lv_obj_set_flex_align(pill, LV_FLEX_ALIGN_CENTER,
                             LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(pill, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(pill, on_habit_open_detail, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
       char cnt[8];
       snprintf(cnt, sizeof(cnt), "%u×", (unsigned)h->today_count);
@@ -1514,6 +1582,230 @@ static void build_read_content(lv_obj_t *parent) {
 static void build_read(void) {
   lv_obj_t *content = build_screen_chrome(lv_scr_act(), 2);
   build_read_content(content);
+}
+
+// ----------------------------------------------------------------------------
+// HABIT DETAIL — 12-week × 7-day GitHub-style heatmap
+//
+// Five grey levels chosen to survive the disp_flush luminance threshold
+// (y8 < 80 → 0, y8 > 175 → 255). 0 and 4 hit pure PAPER and pure INK; the
+// three mid levels stay inside the unsnapped band for visible greys.
+// ----------------------------------------------------------------------------
+static const uint32_t HEAT_COLORS[5] = {
+  0xE8E2D1u,   // 0 — PAPER (white)
+  0xA5A5A5u,   // 1 — light grey, y8 ≈ 165 → gray4 = 10
+  0x7A7A7Au,   // 2 — mid  grey, y8 ≈ 122 → gray4 = 7
+  0x5A5A5Au,   // 3 — dark grey, y8 ≈  90 → gray4 = 5
+  0x1A1612u,   // 4 — INK (black)
+};
+
+static void build_habit_detail(void) {
+  if (g_active_habit < 0 || g_active_habit >= g_habits_count) {
+    switch_screen(SCR_DO);
+    return;
+  }
+  const moki_habit_t *h = &g_habits[g_active_habit];
+  const int idx = g_active_habit;
+
+  lv_obj_clean(lv_scr_act());
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 14, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 14, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 12, LV_PART_MAIN);
+
+  // Back row
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_habit_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← ZURÜCK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  // Kicker + title
+  lv_obj_t *kicker = lv_label_create(scr);
+  lv_label_set_text(kicker, "GEWOHNHEIT");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(scr);
+  lv_label_set_text(title, h->name);
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  // 12-week × 7-day heatmap grid
+  lv_obj_t *grid = lv_obj_create(scr);
+  lv_obj_remove_style_all(grid);
+  lv_obj_set_size(grid, LV_PCT(100), 230);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+  for (int w = 0; w < 12; w++) {
+    lv_obj_t *col = lv_obj_create(grid);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, 32, 230);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 3, LV_PART_MAIN);
+
+    for (int d = 0; d < 7; d++) {
+      int sample = h->history[w * 7 + d];
+      if (sample > 4) sample = 4;
+      lv_obj_t *cell = lv_obj_create(col);
+      lv_obj_remove_style_all(cell);
+      lv_obj_set_size(cell, 30, 30);
+      lv_obj_set_style_bg_color(cell, lv_color_hex(HEAT_COLORS[sample]), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_radius(cell, 2, LV_PART_MAIN);
+      lv_obj_set_style_border_color(cell, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+      lv_obj_set_style_border_width(cell, sample == 0 ? 1 : 0, LV_PART_MAIN);
+    }
+  }
+
+  // Legend
+  lv_obj_t *legend = lv_obj_create(scr);
+  lv_obj_remove_style_all(legend);
+  lv_obj_set_size(legend, LV_PCT(100), 30);
+  lv_obj_set_flex_flow(legend, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(legend, LV_FLEX_ALIGN_END,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(legend, 6, LV_PART_MAIN);
+
+  lv_obj_t *less = lv_label_create(legend);
+  lv_label_set_text(less, "WENIGER");
+  lv_obj_set_style_text_font(less, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(less, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(less, 2, LV_PART_MAIN);
+
+  for (int n = 0; n < 5; n++) {
+    lv_obj_t *swatch = lv_obj_create(legend);
+    lv_obj_remove_style_all(swatch);
+    lv_obj_set_size(swatch, 18, 18);
+    lv_obj_set_style_bg_color(swatch, lv_color_hex(HEAT_COLORS[n]), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(swatch, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(swatch, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(swatch, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+    lv_obj_set_style_border_width(swatch, n == 0 ? 1 : 0, LV_PART_MAIN);
+  }
+
+  lv_obj_t *more = lv_label_create(legend);
+  lv_label_set_text(more, "MEHR");
+  lv_obj_set_style_text_font(more, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(more, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(more, 2, LV_PART_MAIN);
+
+  // -- Inc/Dec controls + counter pill --
+  lv_obj_t *ctrl = lv_obj_create(scr);
+  lv_obj_remove_style_all(ctrl);
+  lv_obj_set_size(ctrl, LV_PCT(100), 80);
+  lv_obj_set_flex_flow(ctrl, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(ctrl, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(ctrl, 18, LV_PART_MAIN);
+
+  lv_obj_t *minus = lv_obj_create(ctrl);
+  lv_obj_remove_style_all(minus);
+  lv_obj_set_size(minus, 80, 70);
+  lv_obj_set_style_bg_color(minus, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(minus, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(minus, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(minus, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(minus, 2, LV_PART_MAIN);
+  lv_obj_add_flag(minus, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(minus, on_habit_decrement, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+  lv_obj_t *ml = lv_label_create(minus);
+  lv_label_set_text(ml, "−");
+  lv_obj_set_style_text_font(ml, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ml, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_center(ml);
+
+  lv_obj_t *count = lv_obj_create(ctrl);
+  lv_obj_remove_style_all(count);
+  lv_obj_set_size(count, 110, 70);
+  lv_obj_set_style_bg_color(count, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(count, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(count, 2, LV_PART_MAIN);
+  char nb[12]; snprintf(nb, sizeof(nb), "%u×", (unsigned)h->today_count);
+  lv_obj_t *cl = lv_label_create(count);
+  lv_label_set_text(cl, nb);
+  lv_obj_set_style_text_font(cl, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_center(cl);
+
+  lv_obj_t *plus = lv_obj_create(ctrl);
+  lv_obj_remove_style_all(plus);
+  lv_obj_set_size(plus, 80, 70);
+  lv_obj_set_style_bg_color(plus, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(plus, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(plus, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(plus, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(plus, 2, LV_PART_MAIN);
+  lv_obj_add_flag(plus, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(plus, on_habit_increment, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+  lv_obj_t *pl = lv_label_create(plus);
+  lv_label_set_text(pl, "+");
+  lv_obj_set_style_text_font(pl, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_center(pl);
+
+  // -- Stats: heute / gesamt / serie --
+  uint32_t total = 0;
+  int active_days = 0;
+  for (int i = 0; i < 84; i++) { total += h->history[i]; if (h->history[i] > 0) active_days++; }
+
+  lv_obj_t *stats = lv_obj_create(scr);
+  lv_obj_remove_style_all(stats);
+  lv_obj_set_size(stats, LV_PCT(100), 100);
+  lv_obj_set_flex_flow(stats, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(stats, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  static const char *kk[] = { "HEUTE", "GESAMT", "SERIE" };
+  char ss[3][24];
+  snprintf(ss[0], sizeof(ss[0]), "%u×",        (unsigned)h->today_count);
+  snprintf(ss[1], sizeof(ss[1]), "%u",         (unsigned)total);
+  snprintf(ss[2], sizeof(ss[2]), "%u",         (unsigned)h->streak);
+  static const char *bb[] = { "gemacht", "in 12 wo.", "tage am stück" };
+
+  for (int t = 0; t < 3; t++) {
+    lv_obj_t *card = lv_obj_create(stats);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, LV_PCT(31), 100);
+    lv_obj_set_style_bg_color(card, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *k = lv_label_create(card);
+    lv_label_set_text(k, kk[t]);
+    lv_obj_set_style_text_font(k, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(k, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(k, 2, LV_PART_MAIN);
+
+    lv_obj_t *v = lv_label_create(card);
+    lv_label_set_text(v, ss[t]);
+    lv_obj_set_style_text_font(v, &moki_fraunces_regular_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(v, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+    lv_obj_t *b = lv_label_create(card);
+    lv_label_set_text(b, bb[t]);
+    lv_obj_set_style_text_font(b, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(b, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(b, 1, LV_PART_MAIN);
+  }
 }
 
 // ----------------------------------------------------------------------------
