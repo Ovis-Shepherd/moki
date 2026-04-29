@@ -42,8 +42,6 @@ int temperature = 0;
 #define TOUCH_RST  9
 
 static TouchDrvGT911 touch;
-static lv_obj_t     *moki_label = NULL;
-static bool          tipping     = false;
 
 #define DISP_BUF_SIZE (epd_rotated_display_width() * epd_rotated_display_height())
 
@@ -58,9 +56,9 @@ static inline void check_err(enum EpdDrawError err) {
   }
 }
 
-// LVGL flush callback — converts 32-bit color to 8-bit greyscale into our
-// decode buffer; a periodic timer (flush_timer_cb) then rotates that buffer
-// into the epdiy framebuffer and triggers a partial refresh.
+// LVGL flush callback — converts each LVGL 32-bit pixel to a 4-bit greyscale
+// value (luminance) and writes it into a 4-bit-packed buffer (two pixels per
+// byte: low nibble = even x, high nibble = odd x).
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   if (disp_flush_enabled) {
     uint16_t       w   = lv_area_get_width(area);
@@ -68,11 +66,20 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
     lv_color32_t  *t32 = (lv_color32_t *)color_p;
 
     for (int i = 0; i < (w * h); i++) {
-      lv_color8_t ret;
-      LV_COLOR_SET_R8(ret, LV_COLOR_GET_R(*t32) >> 5);
-      LV_COLOR_SET_G8(ret, LV_COLOR_GET_G(*t32) >> 5);
-      LV_COLOR_SET_B8(ret, LV_COLOR_GET_B(*t32) >> 6);
-      decodebuffer[i] = ret.full;
+      uint8_t r = LV_COLOR_GET_R(*t32);
+      uint8_t g = LV_COLOR_GET_G(*t32);
+      uint8_t b = LV_COLOR_GET_B(*t32);
+      uint16_t y8 = (r * 299 + g * 587 + b * 114) / 1000;
+      if      (y8 <  80) y8 = 0;
+      else if (y8 > 175) y8 = 255;
+      uint8_t  gray4 = (uint8_t)(y8 >> 4) & 0x0F;
+
+      int byte_idx = i / 2;
+      if (i & 1) {
+        decodebuffer[byte_idx] |= gray4 << 4;
+      } else {
+        decodebuffer[byte_idx]  = gray4;
+      }
       t32++;
     }
   }
@@ -111,7 +118,8 @@ static void lv_port_disp_init(void) {
 
   lv_color_t *buf1 = (lv_color_t *)ps_calloc(sizeof(lv_color_t), DISP_BUF_SIZE);
   lv_color_t *buf2 = (lv_color_t *)ps_calloc(sizeof(lv_color_t), DISP_BUF_SIZE);
-  decodebuffer    = (uint8_t   *)ps_calloc(sizeof(uint8_t),    DISP_BUF_SIZE);
+  // 4-bit packed greyscale → DISP_BUF_SIZE / 2 bytes (2 pixels per byte).
+  decodebuffer    = (uint8_t   *)ps_calloc(sizeof(uint8_t),    DISP_BUF_SIZE / 2);
 
   if (!buf1 || !buf2 || !decodebuffer) {
     Serial.println(F("[lvgl] PSRAM alloc FAILED — display will not render"));
@@ -133,8 +141,7 @@ static void lv_port_disp_init(void) {
 
 // LVGL indev — read touch state from GT911. GT911 native is panel-landscape
 // (960×540); our display rotation is INVERTED_PORTRAIT (540×960). The mapping
-// below assumes 270° rotation between native and rotated coordinate frames.
-// For Stage 1c the screen-level click handler doesn't depend on exact coords.
+// is a 270° rotation between native and rotated coordinate frames.
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   int16_t tx[5], ty[5];
   if (touch.isPressed()) {
@@ -151,30 +158,269 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   data->state = LV_INDEV_STATE_RELEASED;
 }
 
-// Screen-level click handler — toggles the label text on every tap.
-static void on_screen_clicked(lv_event_t *e) {
-  tipping = !tipping;
-  lv_label_set_text(moki_label, tipping ? "moki tippt" : "moki alive");
-  Serial.printf("[touch] tap · label now: \"%s\"\n",
-                tipping ? "moki tippt" : "moki alive");
+// ----------------------------------------------------------------------------
+// Tap diagnostics — every interactive element prints to Serial when tapped so
+// we can validate hit-testing without wiring real navigation yet.
+// ----------------------------------------------------------------------------
+static void on_element_tapped(lv_event_t *e) {
+  const char *name = (const char *)lv_event_get_user_data(e);
+  Serial.printf("[tap] %s\n", name);
+}
+
+// LVGL 8.3 has no margin styles, so we drop in transparent spacers between
+// flex children to add vertical breathing room.
+static void add_spacer(lv_obj_t *parent, int height) {
+  lv_obj_t *sp = lv_obj_create(parent);
+  lv_obj_remove_style_all(sp);
+  lv_obj_set_size(sp, 1, height);
+  lv_obj_set_style_bg_opa(sp, LV_OPA_TRANSP, LV_PART_MAIN);
 }
 
 // ----------------------------------------------------------------------------
-// ui_entry — Stage 1c: clickable PAPER screen, INK label that toggles on tap.
-// Stage 2 will replace this with the real home screen.
+// build_status_bar — top strip: sync indicator left, battery + time right,
+// dashed bottom border per design DNA.
+// ----------------------------------------------------------------------------
+static lv_obj_t *build_status_bar(lv_obj_t *parent) {
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, LV_PCT(100), 38);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(bar, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(bar, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(bar, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(bar, 4, LV_PART_MAIN);
+  lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+  lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(bar, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *sync = lv_label_create(bar);
+  lv_label_set_text(sync, "SYNC · 12M");        // · = U+00B7
+  lv_obj_set_style_text_color(sync, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_font(sync, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sync, 2, LV_PART_MAIN);
+  lv_obj_add_flag(sync, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(sync, on_element_tapped, LV_EVENT_CLICKED, (void *)"sync");
+
+  lv_obj_t *right = lv_label_create(bar);
+  lv_label_set_text(right, "78  14:32");
+  lv_obj_set_style_text_color(right, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_font(right, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(right, 2, LV_PART_MAIN);
+
+  return bar;
+}
+
+// ----------------------------------------------------------------------------
+// build_dock — bottom 5-slot navigation: heim · tun · lesen · chat · karte.
+// Active item gets a 1.5px INK underline below its label.
+// ----------------------------------------------------------------------------
+static lv_obj_t *build_dock(lv_obj_t *parent) {
+  static const char *items[] = {"heim", "tun", "lesen", "chat", "karte"};
+  const int active_idx = 0;                  // home active
+
+  lv_obj_t *dock = lv_obj_create(parent);
+  lv_obj_remove_style_all(dock);
+  lv_obj_set_size(dock, LV_PCT(100), 60);
+  lv_obj_set_style_bg_color(dock, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(dock, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_side(dock, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(dock, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(dock, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_flex_flow(dock, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(dock, LV_FLEX_ALIGN_SPACE_AROUND,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  for (int i = 0; i < 5; i++) {
+    lv_obj_t *item = lv_obj_create(dock);
+    lv_obj_remove_style_all(item);
+    lv_obj_set_size(item, 90, 50);
+    lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(item, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(item, on_element_tapped,
+                        LV_EVENT_CLICKED, (void *)items[i]);
+
+    lv_obj_t *lbl = lv_label_create(item);
+    lv_label_set_text(lbl, items[i]);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(lbl, 1, LV_PART_MAIN);
+    bool active = (i == active_idx);
+    lv_obj_set_style_text_color(lbl,
+        lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+
+    if (active) {
+      add_spacer(item, 4);
+      // Underline the active item — 1.5px solid INK below the label.
+      lv_obj_t *underline = lv_obj_create(item);
+      lv_obj_remove_style_all(underline);
+      lv_obj_set_size(underline, 28, 2);
+      lv_obj_set_style_bg_color(underline, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(underline, LV_OPA_COVER, LV_PART_MAIN);
+    }
+  }
+
+  return dock;
+}
+
+// ----------------------------------------------------------------------------
+// build_home_content — the central column: date, title, pet, mood pill, tiles.
+// ----------------------------------------------------------------------------
+static void build_stat_tile(lv_obj_t *parent, const char *kicker,
+                            const char *value, const char *sub,
+                            const char *tap_id) {
+  lv_obj_t *tile = lv_obj_create(parent);
+  lv_obj_remove_style_all(tile);
+  lv_obj_set_size(tile, LV_PCT(31), 70);
+  lv_obj_set_style_bg_color(tile, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(tile, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(tile, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(tile, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tile, 6, LV_PART_MAIN);
+  lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(tile, on_element_tapped,
+                      LV_EVENT_CLICKED, (void *)tap_id);
+
+  lv_obj_t *k = lv_label_create(tile);
+  lv_label_set_text(k, kicker);
+  lv_obj_set_style_text_font(k, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(k, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(k, 2, LV_PART_MAIN);
+
+  lv_obj_t *v = lv_label_create(tile);
+  lv_label_set_text(v, value);
+  lv_obj_set_style_text_font(v, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(v, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  lv_obj_t *s = lv_label_create(tile);
+  lv_label_set_text(s, sub);
+  lv_obj_set_style_text_font(s, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(s, 1, LV_PART_MAIN);
+}
+
+static void build_home_content(lv_obj_t *parent) {
+  lv_obj_t *col = lv_obj_create(parent);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(col, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(col, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(col, 18, LV_PART_MAIN);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_flex_grow(col, 1);
+
+  // -- Date kicker --
+  lv_obj_t *kicker = lv_label_create(col);
+  lv_label_set_text(kicker, "DIENSTAG · 20. APRIL");
+  lv_obj_set_style_text_font(kicker, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+  lv_obj_set_style_align(kicker, LV_ALIGN_LEFT_MID, 0);
+
+  add_spacer(col, 4);
+  // -- Title (italic-ish, will become Fraunces in 2c) --
+  lv_obj_t *title = lv_label_create(col);
+  lv_label_set_text(title, "langsam, aber jeden tag.");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  add_spacer(col, 22);
+  // -- Pet placeholder (2b will replace with real Moki SVG) --
+  lv_obj_t *pet = lv_obj_create(col);
+  lv_obj_remove_style_all(pet);
+  lv_obj_set_size(pet, 130, 130);
+  lv_obj_set_style_bg_color(pet, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(pet, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(pet, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_add_flag(pet, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(pet, on_element_tapped, LV_EVENT_CLICKED, (void *)"moki");
+
+  add_spacer(col, 8);
+  lv_obj_t *pet_name = lv_label_create(col);
+  lv_label_set_text(pet_name, "moki");
+  lv_obj_set_style_text_font(pet_name, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pet_name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  lv_obj_t *pet_meta = lv_label_create(col);
+  lv_label_set_text(pet_meta, "TAG 14 · 3 IN FOLGE");
+  lv_obj_set_style_text_font(pet_meta, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pet_meta, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(pet_meta, 2, LV_PART_MAIN);
+  add_spacer(col, 18);
+
+  // -- Mood pill (dashed border, full-width) --
+  lv_obj_t *mood = lv_obj_create(col);
+  lv_obj_remove_style_all(mood);
+  lv_obj_set_size(mood, LV_PCT(100), 50);
+  lv_obj_set_style_bg_color(mood, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(mood, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(mood, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(mood, 1, LV_PART_MAIN);
+  // LVGL doesn't ship dashed borders; 1px solid LIGHT is the closest stylistic
+  // match for the dashed look until we draw a custom border pattern.
+  lv_obj_set_style_radius(mood, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(mood, 14, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(mood, 14, LV_PART_MAIN);
+  lv_obj_set_flex_flow(mood, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(mood, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(mood, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(mood, on_element_tapped, LV_EVENT_CLICKED, (void *)"mood");
+
+  lv_obj_t *mq = lv_label_create(mood);
+  lv_label_set_text(mq, "wie fuehlst du dich heute?");
+  lv_obj_set_style_text_font(mq, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(mq, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+
+  lv_obj_t *ma = lv_label_create(mood);
+  lv_label_set_text(ma, "TEILEN →");
+  lv_obj_set_style_text_font(ma, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ma, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(ma, 2, LV_PART_MAIN);
+
+  add_spacer(col, 12);
+  // -- Three stat tiles --
+  lv_obj_t *tiles = lv_obj_create(col);
+  lv_obj_remove_style_all(tiles);
+  lv_obj_set_size(tiles, LV_PCT(100), 76);
+  lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  build_stat_tile(tiles, "GEWOHN", "1/4", "heute",      "stat-gewohn");
+  build_stat_tile(tiles, "AUFGAB", "3",   "offen",      "stat-aufgab");
+  build_stat_tile(tiles, "NAH",    "3",   "in der naehe","stat-nah");
+}
+
+// ----------------------------------------------------------------------------
+// ui_entry — Stage 2a: home screen skeleton (status bar, content, dock).
 // ----------------------------------------------------------------------------
 static void ui_entry(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(scr, on_screen_clicked, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(scr, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-  moki_label = lv_label_create(scr);
-  lv_label_set_text(moki_label, "moki alive");
-  lv_obj_set_style_text_color(moki_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_text_font(moki_label, &lv_font_montserrat_28, LV_PART_MAIN);
-  lv_obj_align(moki_label, LV_ALIGN_CENTER, 0, 0);
+  build_status_bar(scr);
+  build_home_content(scr);
+  build_dock(scr);
 }
 
 // ----------------------------------------------------------------------------
@@ -209,10 +455,15 @@ void setup() {
   Serial.printf("[epd] orientation: %d × %d\n",
                 epd_rotated_display_width(), epd_rotated_display_height());
 
-  // Clear once on boot — wipes whatever was last persisted on the panel.
+  // Sync the high-level state with the panel: set HL framebuffer to all-white
+  // and push it via GC16 so subsequent transitions go through the proper LUT
+  // from a known-white starting point. Plain epd_clear() bypasses the HL
+  // state which leaves it inconsistent and dampens contrast on next update.
+  epd_hl_set_all_white(&hl);
   epd_poweron();
-  epd_clear();
+  epd_clear();                                                     // panel-level clear
   temperature = epd_ambient_temperature();
+  check_err(epd_hl_update_screen(&hl, MODE_GC16, temperature));    // syncs HL state
   epd_poweroff();
   Serial.printf("[epd] ambient: %d°C\n", temperature);
 
