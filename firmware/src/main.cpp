@@ -245,18 +245,32 @@ static void lv_port_disp_init(void) {
 // (960×540); our display rotation is INVERTED_PORTRAIT (540×960). The mapping
 // is a 270° rotation between native and rotated coordinate frames.
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+  static bool was_down = false;
   int16_t tx[5], ty[5];
   if (touch.isPressed()) {
     uint8_t n = touch.getPoint(tx, ty, 1);
     if (n > 0) {
       int16_t raw_x = tx[0];
       int16_t raw_y = ty[0];
+      // GT911 native frame already matches our INVERTED_PORTRAIT LVGL coords
+      // (540 × 960). No rotation needed — the swap I had in Stage 1c was
+      // accidental: it pushed coords out of bounds but happened to still
+      // hit a fullscreen-clickable handler.
+      int16_t lx = raw_x;
+      int16_t ly = raw_y;
+      // Edge-trigger diagnostic — print only the first sample of each press.
+      if (!was_down) {
+        Serial.printf("[touch] press raw(%d,%d) → lvgl(%d,%d)\n",
+                      raw_x, raw_y, lx, ly);
+        was_down = true;
+      }
       data->state   = LV_INDEV_STATE_PRESSED;
-      data->point.x = raw_y;                 // landscape→portrait swap
-      data->point.y = 960 - raw_x;
+      data->point.x = lx;
+      data->point.y = ly;
       return;
     }
   }
+  was_down = false;
   data->state = LV_INDEV_STATE_RELEASED;
 }
 
@@ -356,7 +370,7 @@ static lv_obj_t *create_moki_canvas(lv_obj_t *parent) {
 static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_t *bar = lv_obj_create(parent);
   lv_obj_remove_style_all(bar);
-  lv_obj_set_size(bar, LV_PCT(100), 38);
+  lv_obj_set_size(bar, LV_PCT(100), 48);
   lv_obj_set_style_bg_color(bar, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_pad_left(bar, 24, LV_PART_MAIN);
@@ -374,7 +388,7 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_t *sync = lv_label_create(bar);
   lv_label_set_text(sync, "SYNC · 12M");        // · = U+00B7
   lv_obj_set_style_text_color(sync, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_text_font(sync, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(sync, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sync, 2, LV_PART_MAIN);
   lv_obj_add_flag(sync, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(sync, on_element_tapped, LV_EVENT_CLICKED, (void *)"sync");
@@ -382,7 +396,7 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_t *right = lv_label_create(bar);
   lv_label_set_text(right, "78  14:32");
   lv_obj_set_style_text_color(right, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_text_font(right, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(right, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(right, 2, LV_PART_MAIN);
 
   return bar;
@@ -397,7 +411,7 @@ static lv_obj_t *build_dock(lv_obj_t *parent, int active_idx) {
 
   lv_obj_t *dock = lv_obj_create(parent);
   lv_obj_remove_style_all(dock);
-  lv_obj_set_size(dock, LV_PCT(100), 60);
+  lv_obj_set_size(dock, LV_PCT(100), 76);
   lv_obj_set_style_bg_color(dock, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(dock, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_side(dock, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
@@ -410,7 +424,7 @@ static lv_obj_t *build_dock(lv_obj_t *parent, int active_idx) {
   for (int i = 0; i < 5; i++) {
     lv_obj_t *item = lv_obj_create(dock);
     lv_obj_remove_style_all(item);
-    lv_obj_set_size(item, 90, 50);
+    lv_obj_set_size(item, 100, 64);
     lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(item, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(item, LV_FLEX_ALIGN_CENTER,
@@ -421,7 +435,7 @@ static lv_obj_t *build_dock(lv_obj_t *parent, int active_idx) {
 
     lv_obj_t *lbl = lv_label_create(item);
     lv_label_set_text(lbl, items[i]);
-    lv_obj_set_style_text_font(lbl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &moki_jetbrains_mono_28, LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(lbl, 1, LV_PART_MAIN);
     bool active = (i == active_idx);
     lv_obj_set_style_text_color(lbl,
@@ -449,7 +463,7 @@ static void build_stat_tile(lv_obj_t *parent, const char *kicker,
                             const char *tap_id) {
   lv_obj_t *tile = lv_obj_create(parent);
   lv_obj_remove_style_all(tile);
-  lv_obj_set_size(tile, LV_PCT(31), 90);
+  lv_obj_set_size(tile, LV_PCT(31), 110);
   lv_obj_set_style_bg_color(tile, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(tile, lv_color_hex(MOKI_MID), LV_PART_MAIN);
@@ -465,18 +479,18 @@ static void build_stat_tile(lv_obj_t *parent, const char *kicker,
 
   lv_obj_t *k = lv_label_create(tile);
   lv_label_set_text(k, kicker);
-  lv_obj_set_style_text_font(k, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(k, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(k, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(k, 2, LV_PART_MAIN);
 
   lv_obj_t *v = lv_label_create(tile);
   lv_label_set_text(v, value);
-  lv_obj_set_style_text_font(v, &moki_fraunces_regular_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(v, &moki_fraunces_regular_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(v, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
   lv_obj_t *s = lv_label_create(tile);
   lv_label_set_text(s, sub);
-  lv_obj_set_style_text_font(s, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(s, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(s, 1, LV_PART_MAIN);
 }
@@ -501,14 +515,14 @@ static void build_home_content(lv_obj_t *parent) {
   // -- Date kicker --
   lv_obj_t *kicker = lv_label_create(col);
   lv_label_set_text(kicker, "DIENSTAG · 20. APRIL");
-  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
 
   // -- Title (italic-ish, will become Fraunces in 2c) --
   lv_obj_t *title = lv_label_create(col);
   lv_label_set_text(title, "langsam, aber jeden tag.");
-  lv_obj_set_style_text_font(title, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
   // -- Moki pet — vector drawing via lv_canvas (Stage 2b) --
@@ -528,19 +542,19 @@ static void build_home_content(lv_obj_t *parent) {
 
   lv_obj_t *pet_name = lv_label_create(pet_pair);
   lv_label_set_text(pet_name, "moki");
-  lv_obj_set_style_text_font(pet_name, &moki_fraunces_regular_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(pet_name, &moki_fraunces_regular_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(pet_name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
   lv_obj_t *pet_meta = lv_label_create(pet_pair);
   lv_label_set_text(pet_meta, "TAG 14 · 3 IN FOLGE");
-  lv_obj_set_style_text_font(pet_meta, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(pet_meta, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(pet_meta, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(pet_meta, 2, LV_PART_MAIN);
 
   // -- Mood pill (dashed-style border, full-width) --
   lv_obj_t *mood = lv_obj_create(col);
   lv_obj_remove_style_all(mood);
-  lv_obj_set_size(mood, LV_PCT(100), 60);
+  lv_obj_set_size(mood, LV_PCT(100), 72);
   lv_obj_set_style_bg_color(mood, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(mood, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(mood, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
@@ -558,19 +572,19 @@ static void build_home_content(lv_obj_t *parent) {
 
   lv_obj_t *mq = lv_label_create(mood);
   lv_label_set_text(mq, "wie fühlst du dich heute?");
-  lv_obj_set_style_text_font(mq, &moki_fraunces_italic_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(mq, &moki_fraunces_italic_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(mq, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
 
   lv_obj_t *ma = lv_label_create(mood);
   lv_label_set_text(ma, "TEILEN →");
-  lv_obj_set_style_text_font(ma, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(ma, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(ma, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(ma, 2, LV_PART_MAIN);
 
   // -- Three stat tiles --
   lv_obj_t *tiles = lv_obj_create(col);
   lv_obj_remove_style_all(tiles);
-  lv_obj_set_size(tiles, LV_PCT(100), 95);
+  lv_obj_set_size(tiles, LV_PCT(100), 115);
   lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_SPACE_BETWEEN,
@@ -638,7 +652,7 @@ static void make_tab_button(lv_obj_t *parent, const char *label, bool active,
   lv_obj_t *btn = lv_obj_create(parent);
   lv_obj_remove_style_all(btn);
   lv_obj_set_flex_grow(btn, 1);
-  lv_obj_set_height(btn, 40);
+  lv_obj_set_height(btn, 50);
   lv_obj_set_style_bg_color(btn, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_radius(btn, 1, LV_PART_MAIN);
@@ -650,7 +664,7 @@ static void make_tab_button(lv_obj_t *parent, const char *label, bool active,
 
   lv_obj_t *lbl = lv_label_create(btn);
   lv_label_set_text(lbl, label);
-  lv_obj_set_style_text_font(lbl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(lbl, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(lbl,
       lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(lbl, 2, LV_PART_MAIN);
@@ -659,7 +673,7 @@ static void make_tab_button(lv_obj_t *parent, const char *label, bool active,
 static lv_obj_t *make_tab_bar(lv_obj_t *parent) {
   lv_obj_t *bar = lv_obj_create(parent);
   lv_obj_remove_style_all(bar);
-  lv_obj_set_size(bar, LV_PCT(100), 46);
+  lv_obj_set_size(bar, LV_PCT(100), 56);
   lv_obj_set_style_bg_color(bar, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(bar, lv_color_hex(MOKI_INK), LV_PART_MAIN);
@@ -698,7 +712,7 @@ static void build_todo_row(lv_obj_t *parent, const moki_todo_t *t) {
     lv_obj_t *check = lv_label_create(cb);
     lv_label_set_text(check, "✓");
     lv_obj_set_style_text_color(check, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
-    lv_obj_set_style_text_font(check, &moki_fraunces_regular_28, LV_PART_MAIN);
+    lv_obj_set_style_text_font(check, &moki_fraunces_regular_36, LV_PART_MAIN);
     lv_obj_center(check);
   }
 
@@ -711,7 +725,7 @@ static void build_todo_row(lv_obj_t *parent, const moki_todo_t *t) {
 
   lv_obj_t *title = lv_label_create(col);
   lv_label_set_text(title, t->title);
-  lv_obj_set_style_text_font(title, &moki_fraunces_regular_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(title, &moki_fraunces_regular_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(title,
       lv_color_hex(t->done ? MOKI_DARK : MOKI_INK), LV_PART_MAIN);
 
@@ -724,7 +738,7 @@ static void build_todo_row(lv_obj_t *parent, const moki_todo_t *t) {
            t->recurring ? "  ·  ↻ wöchentlich" : "");
   lv_obj_t *m = lv_label_create(col);
   lv_label_set_text(m, meta);
-  lv_obj_set_style_text_font(m, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(m, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(m, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(m, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_top(m, 3, LV_PART_MAIN);
@@ -768,7 +782,7 @@ static void build_do_content(lv_obj_t *parent) {
         if (!printed_done_header) {
           lv_obj_t *hdr = lv_label_create(body);
           lv_label_set_text(hdr, "ERLEDIGT");
-          lv_obj_set_style_text_font(hdr, &moki_jetbrains_mono_18, LV_PART_MAIN);
+          lv_obj_set_style_text_font(hdr, &moki_jetbrains_mono_22, LV_PART_MAIN);
           lv_obj_set_style_text_color(hdr, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
           lv_obj_set_style_text_letter_space(hdr, 3, LV_PART_MAIN);
           lv_obj_set_style_pad_top(hdr, 12, LV_PART_MAIN);
@@ -800,7 +814,7 @@ static void build_do_content(lv_obj_t *parent) {
 
       lv_obj_t *name = lv_label_create(txt);
       lv_label_set_text(name, h->name);
-      lv_obj_set_style_text_font(name, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_font(name, &moki_fraunces_regular_36, LV_PART_MAIN);
       lv_obj_set_style_text_color(name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
       char ser[32];
@@ -814,7 +828,7 @@ static void build_do_content(lv_obj_t *parent) {
       }
       lv_obj_t *s = lv_label_create(txt);
       lv_label_set_text(s, dots);
-      lv_obj_set_style_text_font(s, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_font(s, &moki_jetbrains_mono_22, LV_PART_MAIN);
       lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
       lv_obj_set_style_pad_top(s, 4, LV_PART_MAIN);
 
@@ -836,7 +850,7 @@ static void build_do_content(lv_obj_t *parent) {
       snprintf(cnt, sizeof(cnt), "%u×", (unsigned)h->today_count);
       lv_obj_t *cl = lv_label_create(pill);
       lv_label_set_text(cl, cnt);
-      lv_obj_set_style_text_font(cl, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_font(cl, &moki_fraunces_regular_36, LV_PART_MAIN);
       lv_obj_set_style_text_color(cl,
         lv_color_hex(h->today_count > 0 ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
     }
@@ -867,13 +881,13 @@ static void build_do_content(lv_obj_t *parent) {
 
       lv_obj_t *w = lv_label_create(day);
       lv_label_set_text(w, weekdays[i]);
-      lv_obj_set_style_text_font(w, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_font(w, &moki_jetbrains_mono_22, LV_PART_MAIN);
       lv_obj_set_style_text_color(w,
         lv_color_hex(active ? MOKI_LIGHT : MOKI_DARK), LV_PART_MAIN);
 
       lv_obj_t *d = lv_label_create(day);
       lv_label_set_text(d, dates[i]);
-      lv_obj_set_style_text_font(d, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_font(d, &moki_fraunces_regular_36, LV_PART_MAIN);
       lv_obj_set_style_text_color(d,
         lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
     }
@@ -881,7 +895,7 @@ static void build_do_content(lv_obj_t *parent) {
     // Upcoming events
     lv_obj_t *hdr = lv_label_create(body);
     lv_label_set_text(hdr, "KOMMEND");
-    lv_obj_set_style_text_font(hdr, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(hdr, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(hdr, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(hdr, 3, LV_PART_MAIN);
     lv_obj_set_style_pad_top(hdr, 12, LV_PART_MAIN);
@@ -904,7 +918,7 @@ static void build_do_content(lv_obj_t *parent) {
       snprintf(dh, sizeof(dh), "%s\n%s", dates[ev->day], ev->hour);
       lv_obj_t *date = lv_label_create(row);
       lv_label_set_text(date, dh);
-      lv_obj_set_style_text_font(date, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_font(date, &moki_jetbrains_mono_22, LV_PART_MAIN);
       lv_obj_set_style_text_color(date, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
       lv_obj_t *col2 = lv_obj_create(row);
@@ -914,7 +928,7 @@ static void build_do_content(lv_obj_t *parent) {
 
       lv_obj_t *t = lv_label_create(col2);
       lv_label_set_text(t, ev->title);
-      lv_obj_set_style_text_font(t, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
       lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
       char place_kind[64];
@@ -924,7 +938,7 @@ static void build_do_content(lv_obj_t *parent) {
       snprintf(place_kind, sizeof(place_kind), "%s · %s", ev->place, vis);
       lv_obj_t *p = lv_label_create(col2);
       lv_label_set_text(p, place_kind);
-      lv_obj_set_style_text_font(p, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_font(p, &moki_jetbrains_mono_22, LV_PART_MAIN);
       lv_obj_set_style_text_color(p, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
       lv_obj_set_style_pad_top(p, 3, LV_PART_MAIN);
     }
@@ -958,7 +972,7 @@ static void build_read_content(lv_obj_t *parent) {
   if (current_read_tab == READ_BOOK) {
     lv_obj_t *author = lv_label_create(col);
     lv_label_set_text(author, "HENRY DAVID THOREAU");
-    lv_obj_set_style_text_font(author, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(author, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(author, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(author, 3, LV_PART_MAIN);
     lv_obj_set_style_text_align(author, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -966,7 +980,7 @@ static void build_read_content(lv_obj_t *parent) {
 
     lv_obj_t *book = lv_label_create(col);
     lv_label_set_text(book, "Walden");
-    lv_obj_set_style_text_font(book, &moki_fraunces_italic_28, LV_PART_MAIN);
+    lv_obj_set_style_text_font(book, &moki_fraunces_italic_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(book, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_obj_set_style_text_align(book, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(book, LV_PCT(100));
@@ -977,7 +991,7 @@ static void build_read_content(lv_obj_t *parent) {
       "um nur den wesentlichen Tatsachen des Lebens ins Auge zu sehen, "
       "und zu lernen, was es zu lehren hatte — und nicht, wenn es zum "
       "Sterben käme, zu entdecken, dass ich nicht gelebt hatte.");
-    lv_obj_set_style_text_font(excerpt, &moki_fraunces_italic_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(excerpt, &moki_fraunces_italic_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(excerpt, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_label_set_long_mode(excerpt, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(excerpt, LV_PCT(100));
@@ -996,18 +1010,18 @@ static void build_read_content(lv_obj_t *parent) {
 
     lv_obj_t *prev = lv_label_create(nav);
     lv_label_set_text(prev, "← ZURÜCK");
-    lv_obj_set_style_text_font(prev, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(prev, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(prev, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(prev, 2, LV_PART_MAIN);
 
     lv_obj_t *page = lv_label_create(nav);
     lv_label_set_text(page, "42 / 312");
-    lv_obj_set_style_text_font(page, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(page, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(page, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
     lv_obj_t *next = lv_label_create(nav);
     lv_label_set_text(next, "WEITER →");
-    lv_obj_set_style_text_font(next, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(next, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(next, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(next, 2, LV_PART_MAIN);
   } else {
@@ -1016,7 +1030,7 @@ static void build_read_content(lv_obj_t *parent) {
     lv_label_set_text(stub, current_read_tab == READ_FEED
                               ? "feed kommt bald."
                               : "notizen kommen bald.");
-    lv_obj_set_style_text_font(stub, &moki_fraunces_italic_28, LV_PART_MAIN);
+    lv_obj_set_style_text_font(stub, &moki_fraunces_italic_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(stub, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_text_align(stub, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(stub, LV_PCT(100));
@@ -1035,7 +1049,7 @@ static void build_chats(void) {
   lv_obj_t *content = build_screen_chrome(lv_scr_act(), 3);
   lv_obj_t *l = lv_label_create(content);
   lv_label_set_text(l, "chats kommen bald.");
-  lv_obj_set_style_text_font(l, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(l, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_center(l);
 }
@@ -1047,7 +1061,7 @@ static void build_map(void) {
   lv_obj_t *content = build_screen_chrome(lv_scr_act(), 4);
   lv_obj_t *l = lv_label_create(content);
   lv_label_set_text(l, "karte kommt bald.");
-  lv_obj_set_style_text_font(l, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(l, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_center(l);
 }
@@ -1135,7 +1149,15 @@ void loop() {
   // LVGL ticker
   lv_timer_handler();
 
-  // Heartbeat once per second so we can correlate with the screen.
+  // Direct touch poll — bypasses LVGL to confirm raw hardware state.
+  static bool was_pressed = false;
+  bool now_pressed = touch.isPressed();
+  if (now_pressed != was_pressed) {
+    Serial.printf("[touch poll] state %d → %d\n", was_pressed, now_pressed);
+    was_pressed = now_pressed;
+  }
+
+  // Heartbeat once per second.
   static uint32_t last_beat = 0;
   uint32_t now = millis();
   if (now - last_beat >= 1000) {

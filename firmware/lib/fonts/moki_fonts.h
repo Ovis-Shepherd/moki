@@ -13,12 +13,16 @@
 extern "C" {
 #endif
 
+extern const lv_font_t moki_fraunces_italic_36;
 extern const lv_font_t moki_fraunces_italic_28;
-extern const lv_font_t moki_fraunces_italic_18;   // SemiBold weight, body
+extern const lv_font_t moki_fraunces_italic_22;   // SemiBold, body
+extern const lv_font_t moki_fraunces_italic_18;   // SemiBold, body
 extern const lv_font_t moki_fraunces_italic_16;
+extern const lv_font_t moki_fraunces_regular_36;
 extern const lv_font_t moki_fraunces_regular_28;
-extern const lv_font_t moki_jetbrains_mono_18;
+extern const lv_font_t moki_jetbrains_mono_28;
 extern const lv_font_t moki_jetbrains_mono_22;
+extern const lv_font_t moki_jetbrains_mono_18;
 
 #ifdef __cplusplus
 }
