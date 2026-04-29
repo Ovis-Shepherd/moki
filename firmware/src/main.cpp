@@ -20,6 +20,7 @@
 #include "sdkconfig.h"
 #include "lvgl.h"
 #include "TouchDrvGT911.hpp"
+#include "moki_fonts.h"
 
 // --- Moki palette (mirrors simulator exactly) -------------------------------
 #define MOKI_PAPER  0xE8E2D1
@@ -217,13 +218,9 @@ static lv_obj_t *create_moki_canvas(lv_obj_t *parent) {
   body.radius   = LV_RADIUS_CIRCLE;
   lv_canvas_draw_rect(cv, 44, 72, 112, 104, &body);
 
-  // ---- Belly (cx=50 cy=72 rx=14 ry=10, MID for E-Ink visibility) ----
-  lv_draw_rect_dsc_t belly;
-  lv_draw_rect_dsc_init(&belly);
-  belly.bg_color = lv_color_hex(MOKI_MID);
-  belly.bg_opa   = LV_OPA_COVER;
-  belly.radius   = LV_RADIUS_CIRCLE;
-  lv_canvas_draw_rect(cv, 72, 124, 56, 40, &belly);
+  // Belly skipped — under the disp_flush threshold any color other than INK
+  // reads as a "hole" cut into the body. Custom fonts come first (Stage 2c),
+  // we revisit the belly when we have alpha-blending working.
 
   // ---- Eyes (mood=calm: PAPER dots) ----
   lv_draw_rect_dsc_t eye;
@@ -276,7 +273,7 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_t *sync = lv_label_create(bar);
   lv_label_set_text(sync, "SYNC · 12M");        // · = U+00B7
   lv_obj_set_style_text_color(sync, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_text_font(sync, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(sync, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sync, 2, LV_PART_MAIN);
   lv_obj_add_flag(sync, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(sync, on_element_tapped, LV_EVENT_CLICKED, (void *)"sync");
@@ -284,7 +281,7 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_t *right = lv_label_create(bar);
   lv_label_set_text(right, "78  14:32");
   lv_obj_set_style_text_color(right, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_text_font(right, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(right, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(right, 2, LV_PART_MAIN);
 
   return bar;
@@ -324,7 +321,7 @@ static lv_obj_t *build_dock(lv_obj_t *parent) {
 
     lv_obj_t *lbl = lv_label_create(item);
     lv_label_set_text(lbl, items[i]);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(lbl, 1, LV_PART_MAIN);
     bool active = (i == active_idx);
     lv_obj_set_style_text_color(lbl,
@@ -368,18 +365,18 @@ static void build_stat_tile(lv_obj_t *parent, const char *kicker,
 
   lv_obj_t *k = lv_label_create(tile);
   lv_label_set_text(k, kicker);
-  lv_obj_set_style_text_font(k, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(k, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(k, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(k, 2, LV_PART_MAIN);
 
   lv_obj_t *v = lv_label_create(tile);
   lv_label_set_text(v, value);
-  lv_obj_set_style_text_font(v, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(v, &moki_fraunces_regular_28, LV_PART_MAIN);
   lv_obj_set_style_text_color(v, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
   lv_obj_t *s = lv_label_create(tile);
   lv_label_set_text(s, sub);
-  lv_obj_set_style_text_font(s, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(s, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(s, 1, LV_PART_MAIN);
 }
@@ -404,14 +401,14 @@ static void build_home_content(lv_obj_t *parent) {
   // -- Date kicker --
   lv_obj_t *kicker = lv_label_create(col);
   lv_label_set_text(kicker, "DIENSTAG · 20. APRIL");
-  lv_obj_set_style_text_font(kicker, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
 
   // -- Title (italic-ish, will become Fraunces in 2c) --
   lv_obj_t *title = lv_label_create(col);
   lv_label_set_text(title, "langsam, aber jeden tag.");
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_28, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
   // -- Moki pet — vector drawing via lv_canvas (Stage 2b) --
@@ -431,12 +428,12 @@ static void build_home_content(lv_obj_t *parent) {
 
   lv_obj_t *pet_name = lv_label_create(pet_pair);
   lv_label_set_text(pet_name, "moki");
-  lv_obj_set_style_text_font(pet_name, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_font(pet_name, &moki_fraunces_regular_28, LV_PART_MAIN);
   lv_obj_set_style_text_color(pet_name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
   lv_obj_t *pet_meta = lv_label_create(pet_pair);
   lv_label_set_text(pet_meta, "TAG 14 · 3 IN FOLGE");
-  lv_obj_set_style_text_font(pet_meta, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(pet_meta, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(pet_meta, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(pet_meta, 2, LV_PART_MAIN);
 
@@ -460,13 +457,13 @@ static void build_home_content(lv_obj_t *parent) {
   lv_obj_add_event_cb(mood, on_element_tapped, LV_EVENT_CLICKED, (void *)"mood");
 
   lv_obj_t *mq = lv_label_create(mood);
-  lv_label_set_text(mq, "wie fuehlst du dich heute?");
-  lv_obj_set_style_text_font(mq, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_label_set_text(mq, "wie fühlst du dich heute?");
+  lv_obj_set_style_text_font(mq, &moki_fraunces_italic_16, LV_PART_MAIN);
   lv_obj_set_style_text_color(mq, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
 
   lv_obj_t *ma = lv_label_create(mood);
   lv_label_set_text(ma, "TEILEN →");
-  lv_obj_set_style_text_font(ma, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_font(ma, &moki_jetbrains_mono_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(ma, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(ma, 2, LV_PART_MAIN);
 
@@ -480,7 +477,7 @@ static void build_home_content(lv_obj_t *parent) {
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   build_stat_tile(tiles, "GEWOHN", "1/4", "heute",      "stat-gewohn");
   build_stat_tile(tiles, "AUFGAB", "3",   "offen",      "stat-aufgab");
-  build_stat_tile(tiles, "NAH",    "3",   "in der naehe","stat-nah");
+  build_stat_tile(tiles, "NAH",    "3",   "in der nähe", "stat-nah");
 }
 
 // ----------------------------------------------------------------------------
