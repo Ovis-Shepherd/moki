@@ -85,6 +85,67 @@ static const moki_event_t SAMPLE_EVENTS[] = {
 };
 static const int SAMPLE_EVENTS_COUNT = sizeof(SAMPLE_EVENTS) / sizeof(SAMPLE_EVENTS[0]);
 
+// Chats — direct/group/public with optional reset cadence
+typedef struct {
+  const char *kind;     // direct/group/public
+  const char *name;
+  const char *last;
+  const char *ts;
+  uint8_t     unread;
+  const char *reset;    // ""/daily/weekly
+} moki_chat_t;
+static const moki_chat_t SAMPLE_CHATS[] = {
+  { "direct", "lina",          "magst du samstag tanzen?",       "vor 8 min",  1, ""       },
+  { "group",  "lesekreis",     "walden kap 4 bis freitag ok?",   "vor 2h",     0, "weekly" },
+  { "public", "#rhein-neckar", "jemand heute abend am neckar?",  "vor 45 min", 3, "daily"  },
+  { "public", "#bücher",       "— neu —",                        "still",      0, "weekly" },
+};
+static const int SAMPLE_CHATS_COUNT = sizeof(SAMPLE_CHATS) / sizeof(SAMPLE_CHATS[0]);
+
+// Nearby peers (for MAP "in der nähe" tab)
+typedef struct {
+  const char *name;
+  const char *dist;
+  const char *mood;       // simulator mood id (we just show label)
+  const char *last_heard;
+} moki_nearby_t;
+static const moki_nearby_t SAMPLE_NEARBY[] = {
+  { "lina", "~80 m",  "bierchen",    "im sync vor 3 min"  },
+  { "tom",  "~200 m", "spazieren",   "im sync vor 12 min" },
+  { "juno", "~450 m", "brettspiele", "im sync vor 2h"     },
+};
+static const int SAMPLE_NEARBY_COUNT = sizeof(SAMPLE_NEARBY) / sizeof(SAMPLE_NEARBY[0]);
+
+// Map places and friends-live (for MAP "karte" tab) — coords are 0..100 % of
+// the map area, mirroring the simulator's normalized coordinate system.
+typedef struct { float x; float y; const char *name; const char *kind; } moki_place_t;
+static const moki_place_t SAMPLE_PLACES[] = {
+  { 38, 42, "café frieda",     "saved" },
+  { 62, 30, "zuhause",         "home"  },
+  { 72, 58, "philosophenweg",  "saved" },
+  { 28, 68, "schwimmbad",      "saved" },
+};
+static const int SAMPLE_PLACES_COUNT = sizeof(SAMPLE_PLACES) / sizeof(SAMPLE_PLACES[0]);
+
+typedef struct { float x; float y; const char *name; const char *fresh; } moki_friend_live_t;
+static const moki_friend_live_t SAMPLE_FRIENDS_LIVE[] = {
+  { 44, 46, "lina", "3 min"  },
+  { 70, 62, "tom",  "12 min" },
+};
+static const int SAMPLE_FRIENDS_LIVE_COUNT =
+  sizeof(SAMPLE_FRIENDS_LIVE) / sizeof(SAMPLE_FRIENDS_LIVE[0]);
+
+static const char *chat_kind_glyph(const char *kind) {
+  if (!strcmp(kind,"direct")) return "◯";
+  if (!strcmp(kind,"group"))  return "◑";
+  return "◉";
+}
+static const char *chat_reset_phrase(const char *reset) {
+  if (!strcmp(reset,"daily"))  return "noch heute · dann leer";
+  if (!strcmp(reset,"weekly")) return "noch wenige tage · dann leer";
+  return "";
+}
+
 // Category visuals (from simulator)
 static const char *cat_label(const char *cat) {
   if (!strcmp(cat,"home"))   return "zuhause";
@@ -1043,27 +1104,323 @@ static void build_read(void) {
 }
 
 // ----------------------------------------------------------------------------
-// CHATS (stub — list comes in next iteration)
+// CHATS — list of conversations (direct/group/public + reset cadences)
 // ----------------------------------------------------------------------------
+static void build_chat_row(lv_obj_t *parent, const moki_chat_t *c) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_pad_top(row, 14, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(row, 14, LV_PART_MAIN);
+  lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_column(row, 14, LV_PART_MAIN);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(row, on_element_tapped, LV_EVENT_CLICKED, (void *)c->name);
+
+  // Kind glyph
+  lv_obj_t *g = lv_label_create(row);
+  lv_label_set_text(g, chat_kind_glyph(c->kind));
+  lv_obj_set_style_text_font(g, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(g, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  // Center column — name + last preview + (reset hint)
+  lv_obj_t *col = lv_obj_create(row);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_flex_grow(col, 1);
+  lv_obj_set_height(col, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+
+  lv_obj_t *name = lv_label_create(col);
+  lv_label_set_text(name, c->name);
+  lv_obj_set_style_text_font(name, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  lv_obj_t *last = lv_label_create(col);
+  lv_label_set_text(last, c->last);
+  lv_obj_set_style_text_font(last, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(last, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_label_set_long_mode(last, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(last, LV_PCT(100));
+  lv_obj_set_style_pad_top(last, 4, LV_PART_MAIN);
+
+  if (c->reset && c->reset[0]) {
+    lv_obj_t *r = lv_label_create(col);
+    lv_label_set_text(r, chat_reset_phrase(c->reset));
+    lv_obj_set_style_text_font(r, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(r, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(r, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(r, 4, LV_PART_MAIN);
+  }
+
+  // Right column — timestamp + unread badge
+  lv_obj_t *right = lv_obj_create(row);
+  lv_obj_remove_style_all(right);
+  lv_obj_set_flex_flow(right, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(right, LV_FLEX_ALIGN_END,
+                        LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+
+  lv_obj_t *ts = lv_label_create(right);
+  lv_label_set_text(ts, c->ts);
+  lv_obj_set_style_text_font(ts, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ts, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+
+  if (c->unread > 0) {
+    lv_obj_t *badge = lv_obj_create(right);
+    lv_obj_remove_style_all(badge);
+    lv_obj_set_size(badge, 36, 36);
+    lv_obj_set_style_bg_color(badge, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(badge, 6, LV_PART_MAIN);
+
+    char num[8]; snprintf(num, sizeof(num), "%u", (unsigned)c->unread);
+    lv_obj_t *n = lv_label_create(badge);
+    lv_label_set_text(n, num);
+    lv_obj_set_style_text_font(n, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(n, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_center(n);
+  }
+}
+
+static void build_chats_content(lv_obj_t *parent) {
+  lv_obj_t *col = lv_obj_create(parent);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_pad_left(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(col, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+
+  lv_obj_t *kicker = lv_label_create(col);
+  lv_label_set_text(kicker, "GESPRÄCHE");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(col);
+  lv_label_set_text(title, "ein kleiner kreis.");
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(title, 8, LV_PART_MAIN);
+
+  for (int i = 0; i < SAMPLE_CHATS_COUNT; i++) {
+    build_chat_row(col, &SAMPLE_CHATS[i]);
+  }
+}
+
 static void build_chats(void) {
   lv_obj_t *content = build_screen_chrome(lv_scr_act(), 3);
-  lv_obj_t *l = lv_label_create(content);
-  lv_label_set_text(l, "chats kommen bald.");
-  lv_obj_set_style_text_font(l, &moki_fraunces_italic_36, LV_PART_MAIN);
-  lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-  lv_obj_center(l);
+  build_chats_content(content);
 }
 
 // ----------------------------------------------------------------------------
-// MAP (stub — full stylized cartography next iteration)
+// MAP — stylized cartography + "in der nähe" peer list
 // ----------------------------------------------------------------------------
+static void build_map_canvas(lv_obj_t *parent) {
+  // Container with grid background and pin overlay. Map is sized to fit the
+  // remaining vertical space; LVGL's flex_grow handles the height.
+  lv_obj_t *map = lv_obj_create(parent);
+  lv_obj_remove_style_all(map);
+  lv_obj_set_size(map, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_flex_grow(map, 1);
+  lv_obj_set_style_bg_color(map, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(map, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(map, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(map, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(map, 2, LV_PART_MAIN);
+
+  // River line (Neckar, spiritually) — a wide MID rectangle approximating
+  // the curved path from the simulator. Keeps it simple without canvas.
+  lv_obj_t *river = lv_obj_create(map);
+  lv_obj_remove_style_all(river);
+  lv_obj_set_size(river, LV_PCT(120), 8);
+  lv_obj_align(river, LV_ALIGN_LEFT_MID, -20, 80);
+  lv_obj_set_style_bg_color(river, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(river, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(river, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+
+  // Place pins
+  for (int i = 0; i < SAMPLE_PLACES_COUNT; i++) {
+    const moki_place_t *p = &SAMPLE_PLACES[i];
+    lv_obj_t *pin = lv_obj_create(map);
+    lv_obj_remove_style_all(pin);
+    lv_obj_set_size(pin, 14, 14);
+    lv_obj_set_style_bg_color(pin, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(pin, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(pin, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(pin, 2, LV_PART_MAIN);
+    lv_obj_align(pin, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_pos(pin, (int)(p->x * 4.5f), (int)(p->y * 5.0f));
+
+    lv_obj_t *lbl = lv_label_create(map);
+    lv_label_set_text(lbl, p->name);
+    lv_obj_set_style_text_font(lbl, &moki_fraunces_italic_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lbl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(lbl, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(lbl, 4, LV_PART_MAIN);
+    lv_obj_set_pos(lbl, (int)(p->x * 4.5f) + 18, (int)(p->y * 5.0f) - 8);
+  }
+
+  // Friend-live pins
+  for (int i = 0; i < SAMPLE_FRIENDS_LIVE_COUNT; i++) {
+    const moki_friend_live_t *f = &SAMPLE_FRIENDS_LIVE[i];
+    lv_obj_t *pin = lv_obj_create(map);
+    lv_obj_remove_style_all(pin);
+    lv_obj_set_size(pin, 16, 16);
+    lv_obj_set_style_bg_color(pin, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(pin, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(pin, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_pos(pin, (int)(f->x * 4.5f), (int)(f->y * 5.0f));
+
+    char buf[32]; snprintf(buf, sizeof(buf), "%s · %s", f->name, f->fresh);
+    lv_obj_t *lbl = lv_label_create(map);
+    lv_label_set_text(lbl, buf);
+    lv_obj_set_style_text_font(lbl, &moki_fraunces_italic_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lbl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(lbl, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(lbl, 4, LV_PART_MAIN);
+    lv_obj_set_pos(lbl, (int)(f->x * 4.5f) + 22, (int)(f->y * 5.0f) - 8);
+  }
+
+  // Self pin (filled INK with PAPER ring) — center, slightly below middle
+  lv_obj_t *self_outer = lv_obj_create(map);
+  lv_obj_remove_style_all(self_outer);
+  lv_obj_set_size(self_outer, 22, 22);
+  lv_obj_set_style_bg_color(self_outer, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(self_outer, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(self_outer, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(self_outer, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(self_outer, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_align(self_outer, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_t *self_inner = lv_obj_create(self_outer);
+  lv_obj_remove_style_all(self_inner);
+  lv_obj_set_size(self_inner, 12, 12);
+  lv_obj_set_style_bg_color(self_inner, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(self_inner, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(self_inner, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_center(self_inner);
+}
+
+static void build_nearby_content(lv_obj_t *parent) {
+  for (int i = 0; i < SAMPLE_NEARBY_COUNT; i++) {
+    const moki_nearby_t *n = &SAMPLE_NEARBY[i];
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_top(row, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(row, 12, LV_PART_MAIN);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 14, LV_PART_MAIN);
+
+    // Avatar — circle with first letter
+    lv_obj_t *av = lv_obj_create(row);
+    lv_obj_remove_style_all(av);
+    lv_obj_set_size(av, 50, 50);
+    lv_obj_set_style_bg_color(av, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(av, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(av, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(av, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(av, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+
+    char first[2] = { n->name[0], 0 };
+    lv_obj_t *fl = lv_label_create(av);
+    lv_label_set_text(fl, first);
+    lv_obj_set_style_text_font(fl, &moki_fraunces_italic_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(fl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_center(fl);
+
+    // Text col
+    lv_obj_t *col = lv_obj_create(row);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_flex_grow(col, 1);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *name = lv_label_create(col);
+    lv_label_set_text(name, n->name);
+    lv_obj_set_style_text_font(name, &moki_fraunces_regular_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+    char mood_line[64];
+    snprintf(mood_line, sizeof(mood_line), "mag gerade %s", n->mood);
+    lv_obj_t *m = lv_label_create(col);
+    lv_label_set_text(m, mood_line);
+    lv_obj_set_style_text_font(m, &moki_fraunces_italic_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(m, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+
+    lv_obj_t *lh = lv_label_create(col);
+    lv_label_set_text(lh, n->last_heard);
+    lv_obj_set_style_text_font(lh, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lh, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(lh, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(lh, 4, LV_PART_MAIN);
+
+    lv_obj_t *dist = lv_label_create(row);
+    lv_label_set_text(dist, n->dist);
+    lv_obj_set_style_text_font(dist, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(dist, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  }
+}
+
+static void build_map_content(lv_obj_t *parent) {
+  lv_obj_t *col = lv_obj_create(parent);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_pad_left(col, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(col, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(col, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_grow(col, 1);
+
+  // Tab bar
+  lv_obj_t *bar = make_tab_bar(col);
+  make_tab_button(bar, "karte",       current_map_tab == MAP_MAP,    on_map_tab_clicked, MAP_MAP);
+  make_tab_button(bar, "in der nähe", current_map_tab == MAP_NEARBY, on_map_tab_clicked, MAP_NEARBY);
+
+  if (current_map_tab == MAP_MAP) {
+    // Header strip — heidelberg + share toggle
+    lv_obj_t *head = lv_obj_create(col);
+    lv_obj_remove_style_all(head);
+    lv_obj_set_size(head, LV_PCT(100), 36);
+    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *loc = lv_label_create(head);
+    lv_label_set_text(loc, "HEIDELBERG · ~1KM");
+    lv_obj_set_style_text_font(loc, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(loc, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(loc, 2, LV_PART_MAIN);
+
+    lv_obj_t *share = lv_label_create(head);
+    lv_label_set_text(share, "ICH · STÜNDLICH");
+    lv_obj_set_style_text_font(share, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(share, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(share, 2, LV_PART_MAIN);
+
+    build_map_canvas(col);
+  } else {
+    build_nearby_content(col);
+  }
+}
+
 static void build_map(void) {
   lv_obj_t *content = build_screen_chrome(lv_scr_act(), 4);
-  lv_obj_t *l = lv_label_create(content);
-  lv_label_set_text(l, "karte kommt bald.");
-  lv_obj_set_style_text_font(l, &moki_fraunces_italic_36, LV_PART_MAIN);
-  lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-  lv_obj_center(l);
+  build_map_content(content);
 }
 
 // ----------------------------------------------------------------------------
