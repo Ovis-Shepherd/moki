@@ -1,9 +1,9 @@
 // ============================================================================
-// MOKI · firmware · Stage 1ab — epdiy + LVGL on T5 E-Paper S3 Pro
+// MOKI · firmware · Stage 1c — epdiy + LVGL + GT911 touch
 // ============================================================================
-// Vendored from LILYGO's lvgl_test example, with our own ui_entry() that
-// renders the Moki palette: PAPER background, INK text, "moki alive" centered.
-// Serial heartbeat from Stage 0 stays so we can correlate with the screen.
+// Adds the GT911 capacitive touch driver (LILYGO SensorLib) and a screen-level
+// click handler that toggles the label between "moki alive" and "moki tippt".
+// Validates the full Display ↔ Touch loop on real hardware.
 // ============================================================================
 
 #include <Arduino.h>
@@ -19,6 +19,7 @@
 #include <epdiy.h>
 #include "sdkconfig.h"
 #include "lvgl.h"
+#include "TouchDrvGT911.hpp"
 
 // --- Moki palette (mirrors simulator exactly) -------------------------------
 #define MOKI_PAPER  0xE8E2D1
@@ -33,6 +34,16 @@
 
 EpdiyHighlevelState hl;
 int temperature = 0;
+
+// --- GT911 touch (T5 S3 Pro pins) -------------------------------------------
+#define TOUCH_SDA  39
+#define TOUCH_SCL  40
+#define TOUCH_IRQ  3
+#define TOUCH_RST  9
+
+static TouchDrvGT911 touch;
+static lv_obj_t     *moki_label = NULL;
+static bool          tipping     = false;
 
 #define DISP_BUF_SIZE (epd_rotated_display_width() * epd_rotated_display_height())
 
@@ -76,8 +87,11 @@ static void flush_timer_cb(lv_timer_t *t) {
   };
   epd_draw_rotated_image(render_area, decodebuffer, epd_hl_get_framebuffer(&hl));
   epd_poweron();
-  epd_hl_update_area(&hl, MODE_DU, epd_ambient_temperature(), render_area);
+  // MODE_GC16 = 16-level greyscale, slow but full-quality. Anti-aliased text
+  // needs the grey shades; MODE_DU collapses them inconsistently.
+  check_err(epd_hl_update_screen(&hl, MODE_GC16, epd_ambient_temperature()));
   epd_poweroff();
+  Serial.println(F("[epd] flush done (MODE_GC16)"));
   lv_timer_pause(flush_timer);
 }
 
@@ -117,19 +131,50 @@ static void lv_port_disp_init(void) {
   lv_disp_drv_register(&disp_drv);
 }
 
+// LVGL indev — read touch state from GT911. GT911 native is panel-landscape
+// (960×540); our display rotation is INVERTED_PORTRAIT (540×960). The mapping
+// below assumes 270° rotation between native and rotated coordinate frames.
+// For Stage 1c the screen-level click handler doesn't depend on exact coords.
+static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+  int16_t tx[5], ty[5];
+  if (touch.isPressed()) {
+    uint8_t n = touch.getPoint(tx, ty, 1);
+    if (n > 0) {
+      int16_t raw_x = tx[0];
+      int16_t raw_y = ty[0];
+      data->state   = LV_INDEV_STATE_PRESSED;
+      data->point.x = raw_y;                 // landscape→portrait swap
+      data->point.y = 960 - raw_x;
+      return;
+    }
+  }
+  data->state = LV_INDEV_STATE_RELEASED;
+}
+
+// Screen-level click handler — toggles the label text on every tap.
+static void on_screen_clicked(lv_event_t *e) {
+  tipping = !tipping;
+  lv_label_set_text(moki_label, tipping ? "moki tippt" : "moki alive");
+  Serial.printf("[touch] tap · label now: \"%s\"\n",
+                tipping ? "moki tippt" : "moki alive");
+}
+
 // ----------------------------------------------------------------------------
-// ui_entry — Stage 1ab: just one centered label so we know LVGL+epdiy live.
-// Stage 2 will replace this with the home screen.
+// ui_entry — Stage 1c: clickable PAPER screen, INK label that toggles on tap.
+// Stage 2 will replace this with the real home screen.
 // ----------------------------------------------------------------------------
 static void ui_entry(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(scr, on_screen_clicked, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *label = lv_label_create(scr);
-  lv_label_set_text(label, "moki alive");
-  lv_obj_set_style_text_color(label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+  moki_label = lv_label_create(scr);
+  lv_label_set_text(moki_label, "moki alive");
+  lv_obj_set_style_text_color(moki_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_font(moki_label, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_align(moki_label, LV_ALIGN_CENTER, 0, 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -174,6 +219,26 @@ void setup() {
   // LVGL on top.
   Serial.println(F("[lvgl] init"));
   lv_port_disp_init();
+
+  // GT911 touch — must come AFTER Wire.begin() above. The driver re-uses our
+  // bus; setPins handles the RST/INT timing dance that fixes the address at
+  // 0x5D. Failure here is non-fatal — we just lose touch input.
+  touch.setPins(TOUCH_RST, TOUCH_IRQ);
+  if (!touch.begin(Wire, GT911_SLAVE_ADDRESS_L, TOUCH_SDA, TOUCH_SCL)) {
+    Serial.println(F("[touch] GT911 init FAILED — check wiring"));
+  } else {
+    Serial.println(F("[touch] GT911 ready @ 0x5D"));
+    touch.setInterruptMode(LOW_LEVEL_QUERY);
+    touch.setMaxTouchPoint(1);
+
+    // LVGL pointer indev — only register if touch came up cleanly.
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type    = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = touch_read_cb;
+    lv_indev_drv_register(&indev_drv);
+    Serial.println(F("[lvgl] indev registered"));
+  }
 
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
