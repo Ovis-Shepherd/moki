@@ -50,10 +50,10 @@ static TouchDrvGT911 touch;
 // ============================================================================
 typedef struct { const char *name; uint8_t today_count; uint8_t streak; } moki_habit_t;
 typedef struct {
-  const char *title;
-  const char *cat;        // home/plants/work/self/social
-  const char *deadline;   // heute/morgen/diese woche/28. apr/...
-  bool recurring;         // weekly
+  char title[64];
+  char cat[16];          // home/plants/work/self/social
+  char deadline[24];     // heute/morgen/diese woche/28. apr/...
+  bool recurring;
   bool done;
 } moki_todo_t;
 typedef struct {
@@ -70,13 +70,26 @@ static const moki_habit_t SAMPLE_HABITS[] = {
 static const int SAMPLE_HABITS_COUNT = sizeof(SAMPLE_HABITS) / sizeof(SAMPLE_HABITS[0]);
 
 static const moki_todo_t SAMPLE_TODOS[] = {
-  { "Pflanzen gießen",    "plants", "morgen",      true,  false },
-  { "Lina zurückrufen",   "social", "heute",       false, false },
-  { "Steuerkram sortieren","work",  "diese woche", false, false },
-  { "zum arzt",           "self",   "28. apr",     false, false },
-  { "Küche wischen",      "home",   "",            true,  true  },
+  { "Pflanzen gießen",     "plants", "morgen",      true,  false },
+  { "Lina zurückrufen",    "social", "heute",       false, false },
+  { "Steuerkram sortieren","work",   "diese woche", false, false },
+  { "zum arzt",            "self",   "28. apr",     false, false },
+  { "Küche wischen",       "home",   "",            true,  true  },
 };
 static const int SAMPLE_TODOS_COUNT = sizeof(SAMPLE_TODOS) / sizeof(SAMPLE_TODOS[0]);
+
+// Runtime todos — compose-sheet save appends here. Initialized from
+// SAMPLE_TODOS in setup(). Persistence to LittleFS comes in Stage 3.
+#define MAX_TODOS 32
+static moki_todo_t g_todos[MAX_TODOS];
+static int g_todos_count = 0;
+
+static void state_init_todos(void) {
+  for (int i = 0; i < SAMPLE_TODOS_COUNT && i < MAX_TODOS; i++) {
+    g_todos[i] = SAMPLE_TODOS[i];                  // struct copy
+  }
+  g_todos_count = SAMPLE_TODOS_COUNT;
+}
 
 static const moki_event_t SAMPLE_EVENTS[] = {
   { 2, "19:00", "kochen mit lina",            "zuhause",     "private" },
@@ -183,6 +196,7 @@ static void build_do(void);
 static void build_read(void);
 static void build_chats(void);
 static void build_map(void);
+void open_compose_todo(void);
 
 static void on_dock_clicked(lv_event_t *e) {
   intptr_t idx = (intptr_t)lv_event_get_user_data(e);
@@ -204,6 +218,246 @@ static void on_read_tab_clicked(lv_event_t *e) {
 static void on_map_tab_clicked(lv_event_t *e) {
   current_map_tab = (map_tab_t)(intptr_t)lv_event_get_user_data(e);
   switch_screen(SCR_MAP);
+}
+
+// ============================================================================
+// Compose sheet — shared state + helpers (Stage 5-lite, todos only)
+// ============================================================================
+static char        g_compose_title[64]   = "";
+static char        g_compose_cat[16]     = "self";
+static char        g_compose_deadline[24]= "";
+static lv_obj_t   *g_compose_overlay     = NULL;
+static lv_obj_t   *g_compose_title_label = NULL;
+
+static void compose_close(void) {
+  if (g_compose_overlay) {
+    lv_obj_del(g_compose_overlay);
+    g_compose_overlay = NULL;
+    g_compose_title_label = NULL;
+  }
+}
+
+static void compose_save(void) {
+  if (g_compose_title[0] == 0)            return;
+  if (g_todos_count >= MAX_TODOS)         return;
+
+  moki_todo_t *t = &g_todos[g_todos_count++];
+  strncpy(t->title,    g_compose_title,    sizeof(t->title)-1);    t->title[sizeof(t->title)-1] = 0;
+  strncpy(t->cat,      g_compose_cat,      sizeof(t->cat)-1);      t->cat[sizeof(t->cat)-1] = 0;
+  strncpy(t->deadline, g_compose_deadline, sizeof(t->deadline)-1); t->deadline[sizeof(t->deadline)-1] = 0;
+  t->recurring = false;
+  t->done      = false;
+
+  Serial.printf("[compose] saved todo: '%s'\n", t->title);
+
+  g_compose_title[0]    = 0;
+  strcpy(g_compose_cat, "self");
+  g_compose_deadline[0] = 0;
+  compose_close();
+  switch_screen(SCR_DO);
+}
+
+static void key_event(const char *key) {
+  size_t len = strlen(g_compose_title);
+  if (!strcmp(key,"BACK")) {
+    if (len > 0) {
+      // walk back over a UTF-8 continuation byte if necessary
+      do { len--; } while (len > 0 && (((unsigned char)g_compose_title[len]) & 0xC0) == 0x80);
+      g_compose_title[len] = 0;
+    }
+  } else if (!strcmp(key,"SPACE")) {
+    if (len + 1 < sizeof(g_compose_title)) {
+      g_compose_title[len] = ' '; g_compose_title[len+1] = 0;
+    }
+  } else {
+    size_t klen = strlen(key);
+    if (len + klen + 1 < sizeof(g_compose_title)) {
+      memcpy(g_compose_title + len, key, klen);
+      g_compose_title[len + klen] = 0;
+    }
+  }
+  if (g_compose_title_label) {
+    lv_label_set_text(g_compose_title_label, g_compose_title[0] ? g_compose_title : "…");
+  }
+}
+
+static void on_key_clicked(lv_event_t *e) {
+  key_event((const char *)lv_event_get_user_data(e));
+}
+
+static void build_keyboard_row(lv_obj_t *parent, const char *const *keys, int n) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_PCT(100), 56);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row, 4, LV_PART_MAIN);
+
+  for (int i = 0; i < n; i++) {
+    lv_obj_t *btn = lv_obj_create(row);
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_size(btn, 48, 50);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 2, LV_PART_MAIN);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, on_key_clicked, LV_EVENT_CLICKED, (void *)keys[i]);
+
+    lv_obj_t *l = lv_label_create(btn);
+    lv_label_set_text(l, keys[i]);
+    lv_obj_set_style_text_font(l, &moki_fraunces_regular_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_center(l);
+  }
+}
+
+static void on_cancel_clicked(lv_event_t *e) {
+  g_compose_title[0] = 0;
+  compose_close();
+}
+static void on_save_clicked(lv_event_t *e) {
+  compose_save();
+}
+
+void open_compose_todo(void) {
+  if (g_compose_overlay) return;
+  g_compose_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(g_compose_overlay);
+  lv_obj_set_size(g_compose_overlay, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_color(g_compose_overlay, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(g_compose_overlay, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_flex_flow(g_compose_overlay, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(g_compose_overlay, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  // -- Header: abbrechen / titel / sichern --
+  lv_obj_t *hdr = lv_obj_create(g_compose_overlay);
+  lv_obj_remove_style_all(hdr);
+  lv_obj_set_size(hdr, LV_PCT(100), 56);
+  lv_obj_set_style_pad_left(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(hdr, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+  lv_obj_set_style_border_width(hdr, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *cancel = lv_label_create(hdr);
+  lv_label_set_text(cancel, "ABBRECHEN");
+  lv_obj_set_style_text_font(cancel, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cancel, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(cancel, 2, LV_PART_MAIN);
+  lv_obj_add_flag(cancel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(cancel, on_cancel_clicked, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *t = lv_label_create(hdr);
+  lv_label_set_text(t, "NEUE AUFGABE");
+  lv_obj_set_style_text_font(t, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(t, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(t, 3, LV_PART_MAIN);
+
+  lv_obj_t *save = lv_label_create(hdr);
+  lv_label_set_text(save, "SICHERN");
+  lv_obj_set_style_text_font(save, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(save, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(save, 2, LV_PART_MAIN);
+  lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(save, on_save_clicked, LV_EVENT_CLICKED, NULL);
+
+  // -- Body: title field + label "TITEL" --
+  lv_obj_t *body = lv_obj_create(g_compose_overlay);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_size(body, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_style_pad_left(body, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(body, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(body, 24, LV_PART_MAIN);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 12, LV_PART_MAIN);
+
+  lv_obj_t *kicker = lv_label_create(body);
+  lv_label_set_text(kicker, "TITEL");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  g_compose_title_label = lv_label_create(body);
+  lv_label_set_text(g_compose_title_label, "…");
+  lv_obj_set_style_text_font(g_compose_title_label, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(g_compose_title_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_side(g_compose_title_label, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(g_compose_title_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(g_compose_title_label, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(g_compose_title_label, 6, LV_PART_MAIN);
+  lv_obj_set_width(g_compose_title_label, LV_PCT(100));
+
+  // -- Keyboard --
+  lv_obj_t *kb = lv_obj_create(g_compose_overlay);
+  lv_obj_remove_style_all(kb);
+  lv_obj_set_size(kb, LV_PCT(100), 240);
+  lv_obj_set_style_bg_color(kb, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_side(kb, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+  lv_obj_set_style_border_color(kb, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(kb, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(kb, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(kb, 6, LV_PART_MAIN);
+  lv_obj_set_flex_flow(kb, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(kb, 4, LV_PART_MAIN);
+
+  static const char *row1[] = {"q","w","e","r","t","z","u","i","o","p"};
+  static const char *row2[] = {"a","s","d","f","g","h","j","k","l","ä"};
+  static const char *row3[] = {"y","x","c","v","b","n","m","ö","ü","ß"};
+  build_keyboard_row(kb, row1, 10);
+  build_keyboard_row(kb, row2, 10);
+  build_keyboard_row(kb, row3, 10);
+
+  // Bottom row — backspace + space
+  lv_obj_t *r4 = lv_obj_create(kb);
+  lv_obj_remove_style_all(r4);
+  lv_obj_set_size(r4, LV_PCT(100), 56);
+  lv_obj_set_flex_flow(r4, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(r4, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(r4, 6, LV_PART_MAIN);
+
+  lv_obj_t *back = lv_obj_create(r4);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, 110, 50);
+  lv_obj_set_style_bg_color(back, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(back, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(back, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(back, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(back, 2, LV_PART_MAIN);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_key_clicked, LV_EVENT_CLICKED, (void *)"BACK");
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← BACK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 1, LV_PART_MAIN);
+  lv_obj_center(bl);
+
+  lv_obj_t *space = lv_obj_create(r4);
+  lv_obj_remove_style_all(space);
+  lv_obj_set_size(space, 280, 50);
+  lv_obj_set_style_bg_color(space, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(space, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(space, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(space, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(space, 2, LV_PART_MAIN);
+  lv_obj_add_flag(space, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(space, on_key_clicked, LV_EVENT_CLICKED, (void *)"SPACE");
+  lv_obj_t *sl = lv_label_create(space);
+  lv_label_set_text(sl, "LEERZEICHEN");
+  lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sl, 2, LV_PART_MAIN);
+  lv_obj_center(sl);
 }
 
 #define DISP_BUF_SIZE (epd_rotated_display_width() * epd_rotated_display_height())
@@ -834,12 +1088,11 @@ static void build_do_content(lv_obj_t *parent) {
   if (current_do_tab == DO_TODOS) {
     // Open todos first, then "ERLEDIGT" header, then done todos
     bool printed_done_header = false;
-    // Open
-    for (int i = 0; i < SAMPLE_TODOS_COUNT; i++) {
-      if (!SAMPLE_TODOS[i].done) build_todo_row(body, &SAMPLE_TODOS[i]);
+    for (int i = 0; i < g_todos_count; i++) {
+      if (!g_todos[i].done) build_todo_row(body, &g_todos[i]);
     }
-    for (int i = 0; i < SAMPLE_TODOS_COUNT; i++) {
-      if (SAMPLE_TODOS[i].done) {
+    for (int i = 0; i < g_todos_count; i++) {
+      if (g_todos[i].done) {
         if (!printed_done_header) {
           lv_obj_t *hdr = lv_label_create(body);
           lv_label_set_text(hdr, "ERLEDIGT");
@@ -850,9 +1103,29 @@ static void build_do_content(lv_obj_t *parent) {
           lv_obj_set_style_pad_bottom(hdr, 4, LV_PART_MAIN);
           printed_done_header = true;
         }
-        build_todo_row(body, &SAMPLE_TODOS[i]);
+        build_todo_row(body, &g_todos[i]);
       }
     }
+
+    // "+ neue aufgabe" button
+    lv_obj_t *add = lv_obj_create(body);
+    lv_obj_remove_style_all(add);
+    lv_obj_set_size(add, LV_PCT(100), 56);
+    lv_obj_set_style_border_color(add, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(add, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(add, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(add, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(add, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(add, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(add, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(add, [](lv_event_t *){ open_compose_todo(); },
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *plus = lv_label_create(add);
+    lv_label_set_text(plus, "+ NEUE AUFGABE");
+    lv_obj_set_style_text_font(plus, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(plus, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(plus, 3, LV_PART_MAIN);
   } else if (current_do_tab == DO_HABITS) {
     for (int i = 0; i < SAMPLE_HABITS_COUNT; i++) {
       const moki_habit_t *h = &SAMPLE_HABITS[i];
@@ -1498,6 +1771,7 @@ void setup() {
     Serial.println(F("[lvgl] indev registered"));
   }
 
+  state_init_todos();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
