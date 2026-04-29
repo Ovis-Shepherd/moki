@@ -44,6 +44,107 @@ int temperature = 0;
 
 static TouchDrvGT911 touch;
 
+// ============================================================================
+// Sample state (in-RAM only — Stage 3 Persistence will move this to NVS/LittleFS)
+// Mirrors simulator's createInitialState (simulator.jsx lines 69-238).
+// ============================================================================
+typedef struct { const char *name; uint8_t today_count; uint8_t streak; } moki_habit_t;
+typedef struct {
+  const char *title;
+  const char *cat;        // home/plants/work/self/social
+  const char *deadline;   // heute/morgen/diese woche/28. apr/...
+  bool recurring;         // weekly
+  bool done;
+} moki_todo_t;
+typedef struct {
+  uint8_t day; const char *hour; const char *title; const char *place;
+  const char *kind;       // private/friends/public
+} moki_event_t;
+
+static const moki_habit_t SAMPLE_HABITS[] = {
+  { "Lesen · 10 min", 1, 4 },
+  { "Spaziergang",    2, 7 },
+  { "Wasser",         3, 2 },
+  { "Tagebuch",       0, 0 },
+};
+static const int SAMPLE_HABITS_COUNT = sizeof(SAMPLE_HABITS) / sizeof(SAMPLE_HABITS[0]);
+
+static const moki_todo_t SAMPLE_TODOS[] = {
+  { "Pflanzen gießen",    "plants", "morgen",      true,  false },
+  { "Lina zurückrufen",   "social", "heute",       false, false },
+  { "Steuerkram sortieren","work",  "diese woche", false, false },
+  { "zum arzt",           "self",   "28. apr",     false, false },
+  { "Küche wischen",      "home",   "",            true,  true  },
+};
+static const int SAMPLE_TODOS_COUNT = sizeof(SAMPLE_TODOS) / sizeof(SAMPLE_TODOS[0]);
+
+static const moki_event_t SAMPLE_EVENTS[] = {
+  { 2, "19:00", "kochen mit lina",            "zuhause",     "private" },
+  { 3, "10:00", "spaziergang philosophenweg", "heidelberg",  "friends" },
+  { 5, "20:30", "lesekreis · walden",         "café frieda", "public"  },
+};
+static const int SAMPLE_EVENTS_COUNT = sizeof(SAMPLE_EVENTS) / sizeof(SAMPLE_EVENTS[0]);
+
+// Category visuals (from simulator)
+static const char *cat_label(const char *cat) {
+  if (!strcmp(cat,"home"))   return "zuhause";
+  if (!strcmp(cat,"plants")) return "pflanzen";
+  if (!strcmp(cat,"work"))   return "arbeit";
+  if (!strcmp(cat,"self"))   return "selbst";
+  if (!strcmp(cat,"social")) return "freund_innen";
+  return cat;
+}
+static const char *cat_mark(const char *cat) {
+  if (!strcmp(cat,"home"))   return "◯";
+  if (!strcmp(cat,"plants")) return "◐";
+  if (!strcmp(cat,"work"))   return "◑";
+  if (!strcmp(cat,"self"))   return "◉";
+  if (!strcmp(cat,"social")) return "◈";
+  return "·";
+}
+
+// ============================================================================
+// Screen IDs + nav
+// ============================================================================
+typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP } screen_id_t;
+typedef enum { DO_HABITS = 0, DO_TODOS, DO_CALENDAR } do_tab_t;
+typedef enum { READ_BOOK = 0, READ_FEED, READ_NOTES } read_tab_t;
+typedef enum { MAP_MAP   = 0, MAP_NEARBY }            map_tab_t;
+
+static screen_id_t current_screen  = SCR_HOME;
+static do_tab_t    current_do_tab  = DO_TODOS;
+static read_tab_t  current_read_tab = READ_BOOK;
+static map_tab_t   current_map_tab = MAP_MAP;
+
+static void switch_screen(screen_id_t to);
+static void build_home(void);
+static void build_do(void);
+static void build_read(void);
+static void build_chats(void);
+static void build_map(void);
+
+static void on_dock_clicked(lv_event_t *e) {
+  intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+  static const screen_id_t mapping[] = { SCR_HOME, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP };
+  if (idx >= 0 && idx < 5) {
+    Serial.printf("[nav] dock → screen %d\n", (int)mapping[idx]);
+    switch_screen(mapping[idx]);
+  }
+}
+
+static void on_do_tab_clicked(lv_event_t *e) {
+  current_do_tab = (do_tab_t)(intptr_t)lv_event_get_user_data(e);
+  switch_screen(SCR_DO);
+}
+static void on_read_tab_clicked(lv_event_t *e) {
+  current_read_tab = (read_tab_t)(intptr_t)lv_event_get_user_data(e);
+  switch_screen(SCR_READ);
+}
+static void on_map_tab_clicked(lv_event_t *e) {
+  current_map_tab = (map_tab_t)(intptr_t)lv_event_get_user_data(e);
+  switch_screen(SCR_MAP);
+}
+
 #define DISP_BUF_SIZE (epd_rotated_display_width() * epd_rotated_display_height())
 
 // LVGL plumbing — render-then-flush pattern from LILYGO lvgl_test, kept as-is
@@ -291,9 +392,8 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
 // build_dock — bottom 5-slot navigation: heim · tun · lesen · chat · karte.
 // Active item gets a 1.5px INK underline below its label.
 // ----------------------------------------------------------------------------
-static lv_obj_t *build_dock(lv_obj_t *parent) {
+static lv_obj_t *build_dock(lv_obj_t *parent, int active_idx) {
   static const char *items[] = {"heim", "tun", "lesen", "chat", "karte"};
-  const int active_idx = 0;                  // home active
 
   lv_obj_t *dock = lv_obj_create(parent);
   lv_obj_remove_style_all(dock);
@@ -316,8 +416,8 @@ static lv_obj_t *build_dock(lv_obj_t *parent) {
     lv_obj_set_flex_align(item, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(item, on_element_tapped,
-                        LV_EVENT_CLICKED, (void *)items[i]);
+    lv_obj_add_event_cb(item, on_dock_clicked,
+                        LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
     lv_obj_t *lbl = lv_label_create(item);
     lv_label_set_text(lbl, items[i]);
@@ -481,10 +581,11 @@ static void build_home_content(lv_obj_t *parent) {
 }
 
 // ----------------------------------------------------------------------------
-// ui_entry — Stage 2a: home screen skeleton (status bar, content, dock).
+// build_screen_chrome — paints the screen background, status-bar at top, dock
+// at bottom. Returns the middle content container (LV_PCT 100/grow=1) for
+// the per-screen builder to fill.
 // ----------------------------------------------------------------------------
-static void ui_entry(void) {
-  lv_obj_t *scr = lv_scr_act();
+static lv_obj_t *build_screen_chrome(lv_obj_t *scr, int active_dock_idx) {
   lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
@@ -493,8 +594,469 @@ static void ui_entry(void) {
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
   build_status_bar(scr);
-  build_home_content(scr);
-  build_dock(scr);
+
+  lv_obj_t *content = lv_obj_create(scr);
+  lv_obj_remove_style_all(content);
+  lv_obj_set_size(content, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_color(content, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(content, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_flex_grow(content, 1);
+
+  build_dock(scr, active_dock_idx);
+
+  return content;
+}
+
+// ----------------------------------------------------------------------------
+// switch_screen — clears current and rebuilds the requested one.
+// ----------------------------------------------------------------------------
+static void switch_screen(screen_id_t to) {
+  lv_obj_clean(lv_scr_act());
+  current_screen = to;
+  switch (to) {
+    case SCR_HOME: build_home();  break;
+    case SCR_DO:   build_do();    break;
+    case SCR_READ: build_read();  break;
+    case SCR_CHAT: build_chats(); break;
+    case SCR_MAP:  build_map();   break;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// HOME screen — date kicker, italic title, pet, mood pill, three stat tiles.
+// ----------------------------------------------------------------------------
+static void build_home(void) {
+  lv_obj_t *content = build_screen_chrome(lv_scr_act(), 0);
+  build_home_content(content);
+}
+
+// ----------------------------------------------------------------------------
+// Reusable helpers for screens with tabs
+// ----------------------------------------------------------------------------
+static void make_tab_button(lv_obj_t *parent, const char *label, bool active,
+                            lv_event_cb_t cb, intptr_t tab_idx) {
+  lv_obj_t *btn = lv_obj_create(parent);
+  lv_obj_remove_style_all(btn);
+  lv_obj_set_flex_grow(btn, 1);
+  lv_obj_set_height(btn, 40);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)tab_idx);
+
+  lv_obj_t *lbl = lv_label_create(btn);
+  lv_label_set_text(lbl, label);
+  lv_obj_set_style_text_font(lbl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(lbl,
+      lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(lbl, 2, LV_PART_MAIN);
+}
+
+static lv_obj_t *make_tab_bar(lv_obj_t *parent) {
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, LV_PCT(100), 46);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(bar, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(bar, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+  return bar;
+}
+
+// ----------------------------------------------------------------------------
+// DO screen — gewohnheiten | aufgaben | kalender
+// ----------------------------------------------------------------------------
+static void build_todo_row(lv_obj_t *parent, const moki_todo_t *t) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_pad_top(row, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(row, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_column(row, 10, LV_PART_MAIN);
+
+  // Checkbox
+  lv_obj_t *cb = lv_obj_create(row);
+  lv_obj_remove_style_all(cb);
+  lv_obj_set_size(cb, 22, 22);
+  lv_obj_set_style_border_color(cb, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(cb, 2, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(cb, lv_color_hex(t->done ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(cb, LV_OPA_COVER, LV_PART_MAIN);
+  if (t->done) {
+    lv_obj_t *check = lv_label_create(cb);
+    lv_label_set_text(check, "✓");
+    lv_obj_set_style_text_color(check, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_text_font(check, &moki_fraunces_regular_28, LV_PART_MAIN);
+    lv_obj_center(check);
+  }
+
+  // Text column
+  lv_obj_t *col = lv_obj_create(row);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_flex_grow(col, 1);
+  lv_obj_set_height(col, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+
+  lv_obj_t *title = lv_label_create(col);
+  lv_label_set_text(title, t->title);
+  lv_obj_set_style_text_font(title, &moki_fraunces_regular_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title,
+      lv_color_hex(t->done ? MOKI_DARK : MOKI_INK), LV_PART_MAIN);
+
+  // Meta line: cat-mark + cat-label + bis deadline + ↻ wiederkehrend
+  char meta[96];
+  snprintf(meta, sizeof(meta), "%s %s%s%s%s",
+           cat_mark(t->cat), cat_label(t->cat),
+           (t->deadline && t->deadline[0]) ? "  ·  bis " : "",
+           (t->deadline && t->deadline[0]) ? t->deadline : "",
+           t->recurring ? "  ·  ↻ wöchentlich" : "");
+  lv_obj_t *m = lv_label_create(col);
+  lv_label_set_text(m, meta);
+  lv_obj_set_style_text_font(m, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(m, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(m, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(m, 3, LV_PART_MAIN);
+}
+
+static void build_do_content(lv_obj_t *parent) {
+  lv_obj_t *col = lv_obj_create(parent);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_pad_left(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(col, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_grow(col, 1);
+
+  // Tab bar
+  lv_obj_t *bar = make_tab_bar(col);
+  make_tab_button(bar, "gewohnheiten", current_do_tab == DO_HABITS,   on_do_tab_clicked, DO_HABITS);
+  make_tab_button(bar, "aufgaben",     current_do_tab == DO_TODOS,    on_do_tab_clicked, DO_TODOS);
+  make_tab_button(bar, "kalender",     current_do_tab == DO_CALENDAR, on_do_tab_clicked, DO_CALENDAR);
+
+  // Tab content
+  lv_obj_t *body = lv_obj_create(col);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_size(body, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 0, LV_PART_MAIN);
+
+  if (current_do_tab == DO_TODOS) {
+    // Open todos first, then "ERLEDIGT" header, then done todos
+    bool printed_done_header = false;
+    // Open
+    for (int i = 0; i < SAMPLE_TODOS_COUNT; i++) {
+      if (!SAMPLE_TODOS[i].done) build_todo_row(body, &SAMPLE_TODOS[i]);
+    }
+    for (int i = 0; i < SAMPLE_TODOS_COUNT; i++) {
+      if (SAMPLE_TODOS[i].done) {
+        if (!printed_done_header) {
+          lv_obj_t *hdr = lv_label_create(body);
+          lv_label_set_text(hdr, "ERLEDIGT");
+          lv_obj_set_style_text_font(hdr, &moki_jetbrains_mono_18, LV_PART_MAIN);
+          lv_obj_set_style_text_color(hdr, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+          lv_obj_set_style_text_letter_space(hdr, 3, LV_PART_MAIN);
+          lv_obj_set_style_pad_top(hdr, 12, LV_PART_MAIN);
+          lv_obj_set_style_pad_bottom(hdr, 4, LV_PART_MAIN);
+          printed_done_header = true;
+        }
+        build_todo_row(body, &SAMPLE_TODOS[i]);
+      }
+    }
+  } else if (current_do_tab == DO_HABITS) {
+    for (int i = 0; i < SAMPLE_HABITS_COUNT; i++) {
+      const moki_habit_t *h = &SAMPLE_HABITS[i];
+      lv_obj_t *row = lv_obj_create(body);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_style_pad_top(row, 10, LV_PART_MAIN);
+      lv_obj_set_style_pad_bottom(row, 10, LV_PART_MAIN);
+      lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+      lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+      lv_obj_t *txt = lv_obj_create(row);
+      lv_obj_remove_style_all(txt);
+      lv_obj_set_flex_grow(txt, 1);
+      lv_obj_set_flex_flow(txt, LV_FLEX_FLOW_COLUMN);
+
+      lv_obj_t *name = lv_label_create(txt);
+      lv_label_set_text(name, h->name);
+      lv_obj_set_style_text_font(name, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+      char ser[32];
+      snprintf(ser, sizeof(ser), "%s",
+               h->streak > 0 ? "•••○○" : "noch keine serie");
+      // Render streak as filled/empty dots — quick approximation
+      char dots[16] = {0};
+      int filled = h->streak > 5 ? 5 : (int)h->streak;
+      for (int d = 0; d < 5; d++) {
+        strcat(dots, d < filled ? "● " : "○ ");
+      }
+      lv_obj_t *s = lv_label_create(txt);
+      lv_label_set_text(s, dots);
+      lv_obj_set_style_text_font(s, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_pad_top(s, 4, LV_PART_MAIN);
+
+      // Count badge
+      lv_obj_t *pill = lv_obj_create(row);
+      lv_obj_remove_style_all(pill);
+      lv_obj_set_size(pill, 70, 44);
+      lv_obj_set_style_bg_color(pill,
+        lv_color_hex(h->today_count > 0 ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(pill, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(pill, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(pill, 2, LV_PART_MAIN);
+      lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(pill, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+      char cnt[8];
+      snprintf(cnt, sizeof(cnt), "%u×", (unsigned)h->today_count);
+      lv_obj_t *cl = lv_label_create(pill);
+      lv_label_set_text(cl, cnt);
+      lv_obj_set_style_text_font(cl, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(cl,
+        lv_color_hex(h->today_count > 0 ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+    }
+  } else { // DO_CALENDAR
+    static const char *dates[] = {"19","20","21","22","23","24","25"};
+    static const char *weekdays[] = {"M","D","M","D","F","S","S"};
+    int today = 2;
+
+    // Week strip
+    lv_obj_t *week = lv_obj_create(body);
+    lv_obj_remove_style_all(week);
+    lv_obj_set_size(week, LV_PCT(100), 60);
+    lv_obj_set_flex_flow(week, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(week, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    for (int i = 0; i < 7; i++) {
+      lv_obj_t *day = lv_obj_create(week);
+      lv_obj_remove_style_all(day);
+      lv_obj_set_size(day, 38, 60);
+      lv_obj_set_flex_flow(day, LV_FLEX_FLOW_COLUMN);
+      lv_obj_set_flex_align(day, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      bool active = (i == today);
+      lv_obj_set_style_bg_color(day,
+        lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(day, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_radius(day, 2, LV_PART_MAIN);
+
+      lv_obj_t *w = lv_label_create(day);
+      lv_label_set_text(w, weekdays[i]);
+      lv_obj_set_style_text_font(w, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(w,
+        lv_color_hex(active ? MOKI_LIGHT : MOKI_DARK), LV_PART_MAIN);
+
+      lv_obj_t *d = lv_label_create(day);
+      lv_label_set_text(d, dates[i]);
+      lv_obj_set_style_text_font(d, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(d,
+        lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+    }
+
+    // Upcoming events
+    lv_obj_t *hdr = lv_label_create(body);
+    lv_label_set_text(hdr, "KOMMEND");
+    lv_obj_set_style_text_font(hdr, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(hdr, 3, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(hdr, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(hdr, 4, LV_PART_MAIN);
+
+    for (int i = 0; i < SAMPLE_EVENTS_COUNT; i++) {
+      const moki_event_t *ev = &SAMPLE_EVENTS[i];
+      lv_obj_t *row = lv_obj_create(body);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_style_pad_top(row, 8, LV_PART_MAIN);
+      lv_obj_set_style_pad_bottom(row, 8, LV_PART_MAIN);
+      lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+      lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+      lv_obj_set_style_pad_column(row, 12, LV_PART_MAIN);
+
+      char dh[16];
+      snprintf(dh, sizeof(dh), "%s\n%s", dates[ev->day], ev->hour);
+      lv_obj_t *date = lv_label_create(row);
+      lv_label_set_text(date, dh);
+      lv_obj_set_style_text_font(date, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(date, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+      lv_obj_t *col2 = lv_obj_create(row);
+      lv_obj_remove_style_all(col2);
+      lv_obj_set_flex_grow(col2, 1);
+      lv_obj_set_flex_flow(col2, LV_FLEX_FLOW_COLUMN);
+
+      lv_obj_t *t = lv_label_create(col2);
+      lv_label_set_text(t, ev->title);
+      lv_obj_set_style_text_font(t, &moki_fraunces_regular_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+      char place_kind[64];
+      const char *vis = !strcmp(ev->kind,"public") ? "öffentlich"
+                       : !strcmp(ev->kind,"friends") ? "freund_innen"
+                       : "privat";
+      snprintf(place_kind, sizeof(place_kind), "%s · %s", ev->place, vis);
+      lv_obj_t *p = lv_label_create(col2);
+      lv_label_set_text(p, place_kind);
+      lv_obj_set_style_text_font(p, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(p, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_pad_top(p, 3, LV_PART_MAIN);
+    }
+  }
+}
+
+static void build_do(void) {
+  lv_obj_t *content = build_screen_chrome(lv_scr_act(), 1);
+  build_do_content(content);
+}
+
+// ----------------------------------------------------------------------------
+// READ screen — buch | feed | notizen (book tab populated, others stubbed)
+// ----------------------------------------------------------------------------
+static void build_read_content(lv_obj_t *parent) {
+  lv_obj_t *col = lv_obj_create(parent);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_pad_left(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(col, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(col, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+
+  lv_obj_t *bar = make_tab_bar(col);
+  make_tab_button(bar, "buch",    current_read_tab == READ_BOOK,  on_read_tab_clicked, READ_BOOK);
+  make_tab_button(bar, "feed",    current_read_tab == READ_FEED,  on_read_tab_clicked, READ_FEED);
+  make_tab_button(bar, "notizen", current_read_tab == READ_NOTES, on_read_tab_clicked, READ_NOTES);
+
+  if (current_read_tab == READ_BOOK) {
+    lv_obj_t *author = lv_label_create(col);
+    lv_label_set_text(author, "HENRY DAVID THOREAU");
+    lv_obj_set_style_text_font(author, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(author, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(author, 3, LV_PART_MAIN);
+    lv_obj_set_style_text_align(author, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(author, LV_PCT(100));
+
+    lv_obj_t *book = lv_label_create(col);
+    lv_label_set_text(book, "Walden");
+    lv_obj_set_style_text_font(book, &moki_fraunces_italic_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(book, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_align(book, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(book, LV_PCT(100));
+
+    lv_obj_t *excerpt = lv_label_create(col);
+    lv_label_set_text(excerpt,
+      "Ich ging in die Wälder, weil ich mit Bedacht leben wollte, "
+      "um nur den wesentlichen Tatsachen des Lebens ins Auge zu sehen, "
+      "und zu lernen, was es zu lehren hatte — und nicht, wenn es zum "
+      "Sterben käme, zu entdecken, dass ich nicht gelebt hatte.");
+    lv_obj_set_style_text_font(excerpt, &moki_fraunces_italic_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(excerpt, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_label_set_long_mode(excerpt, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(excerpt, LV_PCT(100));
+    lv_obj_set_style_text_line_space(excerpt, 6, LV_PART_MAIN);
+
+    // Page nav
+    lv_obj_t *nav = lv_obj_create(col);
+    lv_obj_remove_style_all(nav);
+    lv_obj_set_size(nav, LV_PCT(100), 40);
+    lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+    lv_obj_set_style_border_color(nav, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+    lv_obj_set_style_border_width(nav, 1, LV_PART_MAIN);
+
+    lv_obj_t *prev = lv_label_create(nav);
+    lv_label_set_text(prev, "← ZURÜCK");
+    lv_obj_set_style_text_font(prev, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(prev, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(prev, 2, LV_PART_MAIN);
+
+    lv_obj_t *page = lv_label_create(nav);
+    lv_label_set_text(page, "42 / 312");
+    lv_obj_set_style_text_font(page, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(page, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+    lv_obj_t *next = lv_label_create(nav);
+    lv_label_set_text(next, "WEITER →");
+    lv_obj_set_style_text_font(next, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(next, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(next, 2, LV_PART_MAIN);
+  } else {
+    // FEED + NOTES stubs
+    lv_obj_t *stub = lv_label_create(col);
+    lv_label_set_text(stub, current_read_tab == READ_FEED
+                              ? "feed kommt bald."
+                              : "notizen kommen bald.");
+    lv_obj_set_style_text_font(stub, &moki_fraunces_italic_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(stub, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_align(stub, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(stub, LV_PCT(100));
+  }
+}
+
+static void build_read(void) {
+  lv_obj_t *content = build_screen_chrome(lv_scr_act(), 2);
+  build_read_content(content);
+}
+
+// ----------------------------------------------------------------------------
+// CHATS (stub — list comes in next iteration)
+// ----------------------------------------------------------------------------
+static void build_chats(void) {
+  lv_obj_t *content = build_screen_chrome(lv_scr_act(), 3);
+  lv_obj_t *l = lv_label_create(content);
+  lv_label_set_text(l, "chats kommen bald.");
+  lv_obj_set_style_text_font(l, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_center(l);
+}
+
+// ----------------------------------------------------------------------------
+// MAP (stub — full stylized cartography next iteration)
+// ----------------------------------------------------------------------------
+static void build_map(void) {
+  lv_obj_t *content = build_screen_chrome(lv_scr_act(), 4);
+  lv_obj_t *l = lv_label_create(content);
+  lv_label_set_text(l, "karte kommt bald.");
+  lv_obj_set_style_text_font(l, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_center(l);
+}
+
+// ----------------------------------------------------------------------------
+// ui_entry — initial render: home screen.
+// ----------------------------------------------------------------------------
+static void ui_entry(void) {
+  switch_screen(SCR_HOME);
 }
 
 // ----------------------------------------------------------------------------
