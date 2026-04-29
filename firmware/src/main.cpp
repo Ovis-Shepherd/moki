@@ -271,6 +271,54 @@ static const int MOOD_COUNT = sizeof(MOOD_PRESETS) / sizeof(MOOD_PRESETS[0]);
 
 static char g_active_mood[16] = "";  // empty = no mood shared
 
+// ----------------------------------------------------------------------------
+// Notes (Stage 6) — stored in NVS as a single blob with a fixed layout.
+// Body is inline 1024 bytes — sufficient for short journal entries; very long
+// notes get truncated. LittleFS migration is a future polish step.
+// ----------------------------------------------------------------------------
+typedef struct {
+  char     title[64];
+  char     body[1024];
+  char     templ[16];          // blank/diary/recipe/list/idea
+  char     folder[24];         // tagebuch/küche/gelesen/ideen/""
+  char     visibility[16];     // private/friends/public
+  bool     pinned;
+  uint32_t updated_at;         // millis() at last edit (relative; resets on boot)
+} moki_note_t;
+
+#define MAX_NOTES 16
+#define NOTES_SCHEMA_V 1
+static moki_note_t g_notes[MAX_NOTES];
+static int g_notes_count = 0;
+
+typedef struct { const char *id; const char *label; const char *body; } moki_note_template_t;
+static const moki_note_template_t NOTE_TEMPLATES[] = {
+  { "blank",  "leer",     "" },
+  { "diary",  "tagebuch", "# [datum]\n\n## war gut\n- \n\n## gelernt\n- \n\n## dankbar\n- " },
+  { "recipe", "rezept",   "# [name]\n\n*für [personen]*\n\n## zutaten\n- \n\n## zubereitung\n1. \n\n## notiz\n- " },
+  { "list",   "liste",    "# [titel]\n\n- \n- \n- " },
+  { "idea",   "idee",     "# [idee]\n\n> gedanke\n\n## warum\n\n## nächste schritte\n- " },
+};
+static const int NOTE_TEMPLATE_COUNT = sizeof(NOTE_TEMPLATES) / sizeof(NOTE_TEMPLATES[0]);
+
+static void state_init_notes(void) {
+  // Sample content — Walden gedanken + miso-ramen + dienstag tagebuch
+  static const moki_note_t SAMPLE[] = {
+    { "Walden · Gedanken",
+      "# Walden\n\n> „Die meisten Menschen führen ein Leben stiller Verzweiflung.\"\n\n## was bleibt hängen\n- einfachheit als politische handlung\n- der **wald** als spiegel, nicht als flucht\n\n## nächste kapitel\n- kap. 4 bis freitag",
+      "idea", "gelesen", "private", true, 0 },
+    { "Miso-Ramen · einfach",
+      "# miso-ramen\n\n*abends, für 2 personen*\n\n## zutaten\n- 400g ramen-nudeln\n- 3 el weißes miso\n- 1 l brühe\n- 2 lauchzwiebeln\n- 1 ei pro person\n\n## zubereitung\n1. eier 7 min kochen, kalt abschrecken\n2. brühe erhitzen, miso einrühren (**nicht kochen**)\n3. nudeln separat garen\n4. alles in schalen schichten",
+      "recipe", "küche", "friends", false, 0 },
+    { "dienstag",
+      "# dienstag · 20. april\n\n## war gut\n- lange am neckar gesessen\n- lina hat gelacht\n\n## gelernt\n- ich kann langsamer lesen\n\n## dankbar\n- für den kaffee heute morgen",
+      "diary", "tagebuch", "private", false, 0 },
+  };
+  int n = (int)(sizeof(SAMPLE) / sizeof(SAMPLE[0]));
+  for (int i = 0; i < n && i < MAX_NOTES; i++) g_notes[i] = SAMPLE[i];
+  g_notes_count = n;
+}
+
 static const char *chat_kind_glyph(const char *kind) {
   if (!strcmp(kind,"direct")) return "◯";
   if (!strcmp(kind,"group"))  return "◑";
@@ -303,7 +351,9 @@ static const char *cat_mark(const char *cat) {
 // ============================================================================
 // Screen IDs + nav
 // ============================================================================
-typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP, SCR_MOOD, SCR_PROFILE } screen_id_t;
+typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
+               SCR_MOOD, SCR_PROFILE,
+               SCR_NOTE_NEW, SCR_NOTE_EDIT } screen_id_t;
 typedef enum { DO_HABITS = 0, DO_TODOS, DO_CALENDAR } do_tab_t;
 typedef enum { READ_BOOK = 0, READ_FEED, READ_NOTES } read_tab_t;
 typedef enum { MAP_MAP   = 0, MAP_NEARBY }            map_tab_t;
@@ -321,11 +371,57 @@ static void build_chats(void);
 static void build_map(void);
 static void build_mood(void);
 static void build_profile(void);
+static void build_note_new(void);
+static void build_note_edit(void);
 static void on_mood_pill_clicked(lv_event_t *e);
 static void on_profile_clicked(lv_event_t *e);
 static void on_back_home(lv_event_t *e);
+static void on_note_open(lv_event_t *e);
+static void on_note_new(lv_event_t *e);
+static void on_template_picked(lv_event_t *e);
+static void on_note_back_to_read(lv_event_t *e);
+static void on_note_pin_toggle(lv_event_t *e);
+static void on_note_delete(lv_event_t *e);
+static void on_note_mode_toggle(lv_event_t *e);
 void open_compose_todo(void);
 void open_compose_habit(void);
+
+// Active note + edit-mode state
+static int g_active_note   = -1;          // index into g_notes
+static bool g_note_write   = false;       // false = read mode, true = write mode
+static char g_note_title_buf[64];
+static char g_note_body_buf[1024];
+static lv_obj_t *g_note_title_label = NULL;
+static lv_obj_t *g_note_body_label  = NULL;
+
+static void state_save_notes(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt("notes_v", NOTES_SCHEMA_V);
+  g_prefs.putUInt("notes_n", (uint32_t)g_notes_count);
+  if (g_notes_count > 0)
+    g_prefs.putBytes("notes", g_notes, sizeof(moki_note_t) * g_notes_count);
+  else
+    g_prefs.remove("notes");
+  g_prefs.end();
+  Serial.printf("[persist] saved %d notes\n", g_notes_count);
+}
+static void state_load_notes(void) {
+  g_prefs.begin("moki", true);
+  uint32_t v = g_prefs.getUInt("notes_v", 0);
+  uint32_t n = g_prefs.getUInt("notes_n", 0xFFFFFFFFu);
+  if (v == NOTES_SCHEMA_V && n != 0xFFFFFFFFu && n <= MAX_NOTES) {
+    g_notes_count = (int)n;
+    if (g_notes_count > 0)
+      g_prefs.getBytes("notes", g_notes, sizeof(moki_note_t) * g_notes_count);
+    g_prefs.end();
+    Serial.printf("[persist] loaded %d notes (v%u)\n", g_notes_count, v);
+  } else {
+    g_prefs.end();
+    Serial.println(F("[persist] notes empty — bootstrapping"));
+    state_init_notes();
+    state_save_notes();
+  }
+}
 
 static void state_save_mood(void) {
   g_prefs.begin("moki", false);
@@ -1164,8 +1260,10 @@ static void switch_screen(screen_id_t to) {
     case SCR_READ:    build_read();    break;
     case SCR_CHAT:    build_chats();   break;
     case SCR_MAP:     build_map();     break;
-    case SCR_MOOD:    build_mood();    break;
-    case SCR_PROFILE: build_profile(); break;
+    case SCR_MOOD:     build_mood();     break;
+    case SCR_PROFILE:  build_profile();  break;
+    case SCR_NOTE_NEW: build_note_new(); break;
+    case SCR_NOTE_EDIT:build_note_edit();break;
   }
 }
 
@@ -1677,16 +1775,74 @@ static void build_read_content(lv_obj_t *parent) {
     lv_obj_set_style_text_font(next, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(next, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(next, 2, LV_PART_MAIN);
-  } else {
-    // FEED + NOTES stubs
+  } else if (current_read_tab == READ_FEED) {
     lv_obj_t *stub = lv_label_create(col);
-    lv_label_set_text(stub, current_read_tab == READ_FEED
-                              ? "feed kommt bald."
-                              : "notizen kommen bald.");
+    lv_label_set_text(stub, "feed kommt bald.");
     lv_obj_set_style_text_font(stub, &moki_fraunces_italic_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(stub, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_text_align(stub, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(stub, LV_PCT(100));
+  } else { // READ_NOTES
+    // Pinned-first ordering
+    int order[MAX_NOTES]; int o = 0;
+    for (int i = 0; i < g_notes_count; i++) if (g_notes[i].pinned) order[o++] = i;
+    for (int i = 0; i < g_notes_count; i++) if (!g_notes[i].pinned) order[o++] = i;
+
+    for (int oi = 0; oi < o; oi++) {
+      int i = order[oi];
+      const moki_note_t *nt = &g_notes[i];
+      lv_obj_t *row = lv_obj_create(col);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_style_pad_top(row, 12, LV_PART_MAIN);
+      lv_obj_set_style_pad_bottom(row, 12, LV_PART_MAIN);
+      lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+      lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, on_note_open, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+      char title[80];
+      snprintf(title, sizeof(title), "%s%s", nt->pinned ? "* " : "", nt->title);
+      lv_obj_t *t = lv_label_create(row);
+      lv_label_set_text(t, title);
+      lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
+      lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+      lv_obj_set_width(t, LV_PCT(100));
+
+      char meta[64];
+      snprintf(meta, sizeof(meta), "%s · %s",
+               nt->folder[0] ? nt->folder : "—",
+               !strcmp(nt->visibility,"public") ? "öffentlich"
+               : !strcmp(nt->visibility,"friends") ? "freund_innen"
+               : "privat");
+      lv_obj_t *m = lv_label_create(row);
+      lv_label_set_text(m, meta);
+      lv_obj_set_style_text_font(m, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(m, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(m, 1, LV_PART_MAIN);
+      lv_obj_set_style_pad_top(m, 4, LV_PART_MAIN);
+    }
+
+    // + neue notiz
+    lv_obj_t *add = lv_obj_create(col);
+    lv_obj_remove_style_all(add);
+    lv_obj_set_size(add, LV_PCT(100), 56);
+    lv_obj_set_style_border_color(add, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(add, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(add, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(add, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(add, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(add, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(add, on_note_new, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *plus = lv_label_create(add);
+    lv_label_set_text(plus, "+ NEUE NOTIZ");
+    lv_obj_set_style_text_font(plus, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(plus, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(plus, 3, LV_PART_MAIN);
   }
 }
 
@@ -2436,6 +2592,421 @@ static void build_map(void) {
   build_map_content(content);
 }
 
+// ============================================================================
+// Notes — template picker + read/write editor
+// ============================================================================
+static void on_note_open(lv_event_t *e) {
+  g_active_note = (int)(intptr_t)lv_event_get_user_data(e);
+  if (g_active_note >= 0 && g_active_note < g_notes_count) {
+    strncpy(g_note_title_buf, g_notes[g_active_note].title, sizeof(g_note_title_buf)-1);
+    g_note_title_buf[sizeof(g_note_title_buf)-1] = 0;
+    strncpy(g_note_body_buf, g_notes[g_active_note].body, sizeof(g_note_body_buf)-1);
+    g_note_body_buf[sizeof(g_note_body_buf)-1] = 0;
+    g_note_write = false;
+    switch_screen(SCR_NOTE_EDIT);
+  }
+}
+static void on_note_new(lv_event_t *e) {
+  switch_screen(SCR_NOTE_NEW);
+}
+static void on_note_back_to_read(lv_event_t *e) {
+  // Persist active note title/body before leaving
+  if (g_active_note >= 0 && g_active_note < g_notes_count) {
+    strncpy(g_notes[g_active_note].title, g_note_title_buf,
+            sizeof(g_notes[g_active_note].title)-1);
+    g_notes[g_active_note].title[sizeof(g_notes[g_active_note].title)-1] = 0;
+    strncpy(g_notes[g_active_note].body, g_note_body_buf,
+            sizeof(g_notes[g_active_note].body)-1);
+    g_notes[g_active_note].body[sizeof(g_notes[g_active_note].body)-1] = 0;
+    state_save_notes();
+  }
+  g_active_note = -1;
+  current_read_tab = READ_NOTES;
+  switch_screen(SCR_READ);
+}
+static void on_template_picked(lv_event_t *e) {
+  const char *tid = (const char *)lv_event_get_user_data(e);
+  if (g_notes_count >= MAX_NOTES) return;
+  // Find template
+  const moki_note_template_t *tpl = NULL;
+  for (int i = 0; i < NOTE_TEMPLATE_COUNT; i++)
+    if (!strcmp(NOTE_TEMPLATES[i].id, tid)) { tpl = &NOTE_TEMPLATES[i]; break; }
+  if (!tpl) return;
+  moki_note_t *nt = &g_notes[g_notes_count++];
+  strcpy(nt->title, "neu");
+  strncpy(nt->body, tpl->body, sizeof(nt->body)-1); nt->body[sizeof(nt->body)-1] = 0;
+  strncpy(nt->templ, tpl->id, sizeof(nt->templ)-1); nt->templ[sizeof(nt->templ)-1] = 0;
+  nt->folder[0] = 0;
+  strcpy(nt->visibility, "private");
+  nt->pinned = false;
+  nt->updated_at = millis();
+  state_save_notes();
+  // Open new note in edit mode
+  g_active_note = g_notes_count - 1;
+  strncpy(g_note_title_buf, nt->title, sizeof(g_note_title_buf)-1);
+  g_note_title_buf[sizeof(g_note_title_buf)-1] = 0;
+  strncpy(g_note_body_buf, nt->body, sizeof(g_note_body_buf)-1);
+  g_note_body_buf[sizeof(g_note_body_buf)-1] = 0;
+  g_note_write = true;
+  switch_screen(SCR_NOTE_EDIT);
+}
+static void on_note_pin_toggle(lv_event_t *e) {
+  if (g_active_note < 0 || g_active_note >= g_notes_count) return;
+  g_notes[g_active_note].pinned = !g_notes[g_active_note].pinned;
+  state_save_notes();
+  switch_screen(SCR_NOTE_EDIT);
+}
+static void on_note_delete(lv_event_t *e) {
+  if (g_active_note < 0 || g_active_note >= g_notes_count) return;
+  for (int i = g_active_note; i < g_notes_count - 1; i++)
+    g_notes[i] = g_notes[i+1];
+  g_notes_count--;
+  state_save_notes();
+  g_active_note = -1;
+  current_read_tab = READ_NOTES;
+  switch_screen(SCR_READ);
+}
+static void on_note_mode_toggle(lv_event_t *e) {
+  g_note_write = !g_note_write;
+  switch_screen(SCR_NOTE_EDIT);
+}
+
+// Rough markdown line renderer — appends labels for each line into a column.
+// Subset: # H1, ## H2, ### H3, - bullet, > quote, --- divider, plain text.
+static void render_markdown_into(lv_obj_t *parent, const char *text) {
+  String src = text ? String(text) : String("");
+  int from = 0;
+  while (from <= src.length()) {
+    int nl = src.indexOf('\n', from);
+    String line = (nl < 0) ? src.substring(from) : src.substring(from, nl);
+    from = (nl < 0) ? src.length() + 1 : nl + 1;
+
+    if (line.length() == 0) {
+      lv_obj_t *sp = lv_obj_create(parent);
+      lv_obj_remove_style_all(sp);
+      lv_obj_set_size(sp, 1, 8);
+      lv_obj_set_style_bg_opa(sp, LV_OPA_TRANSP, LV_PART_MAIN);
+      continue;
+    }
+
+    if (line == "---") {
+      lv_obj_t *hr = lv_obj_create(parent);
+      lv_obj_remove_style_all(hr);
+      lv_obj_set_size(hr, LV_PCT(100), 1);
+      lv_obj_set_style_bg_color(hr, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, LV_PART_MAIN);
+      continue;
+    }
+
+    const lv_font_t *font = &moki_fraunces_italic_22;
+    const char *txt = line.c_str();
+    int color = MOKI_INK;
+    if (line.startsWith("# ")) {
+      font = &moki_fraunces_italic_36;
+      txt = line.c_str() + 2;
+    } else if (line.startsWith("## ")) {
+      font = &moki_fraunces_regular_36;
+      txt = line.c_str() + 3;
+    } else if (line.startsWith("### ")) {
+      font = &moki_fraunces_italic_28;
+      txt = line.c_str() + 4;
+    } else if (line.startsWith("- ")) {
+      // bullet rendered with ASCII fallback (• missing in JB Mono)
+      font = &moki_fraunces_italic_22;
+      String bullet = String("·  ") + line.substring(2);
+      lv_obj_t *l = lv_label_create(parent);
+      lv_label_set_text(l, bullet.c_str());
+      lv_obj_set_style_text_font(l, font, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_width(l, LV_PCT(100));
+      lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+      continue;
+    } else if (line.startsWith("> ")) {
+      font = &moki_fraunces_italic_22;
+      txt = line.c_str() + 2;
+      color = MOKI_DARK;
+    }
+
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_width(l, LV_PCT(100));
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+  }
+}
+
+static void build_note_new(void) {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 14, LV_PART_MAIN);
+
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_note_back_to_read, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← ZURÜCK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  lv_obj_t *kicker = lv_label_create(scr);
+  lv_label_set_text(kicker, "VORLAGE");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(scr);
+  lv_label_set_text(title, "wie soll sie beginnen?");
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  // Template chips — full-width rows for readable labels
+  for (int i = 0; i < NOTE_TEMPLATE_COUNT; i++) {
+    const moki_note_template_t *tpl = &NOTE_TEMPLATES[i];
+    lv_obj_t *row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 70);
+    lv_obj_set_style_bg_color(row, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(row, 18, LV_PART_MAIN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, on_template_picked, LV_EVENT_CLICKED, (void *)tpl->id);
+
+    lv_obj_t *l = lv_label_create(row);
+    lv_label_set_text(l, tpl->label);
+    lv_obj_set_style_text_font(l, &moki_fraunces_regular_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  }
+}
+
+// Forward — keyboard callback shared with note editor
+static void note_key_event(const char *key);
+static void on_note_key_clicked(lv_event_t *e) {
+  note_key_event((const char *)lv_event_get_user_data(e));
+}
+
+static void build_note_edit(void) {
+  if (g_active_note < 0 || g_active_note >= g_notes_count) {
+    switch_screen(SCR_READ); return;
+  }
+
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+
+  // Header strip — back / mode toggle / pin / delete
+  lv_obj_t *hdr = lv_obj_create(scr);
+  lv_obj_remove_style_all(hdr);
+  lv_obj_set_size(hdr, LV_PCT(100), 56);
+  lv_obj_set_style_bg_color(hdr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(hdr, 20, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(hdr, 20, LV_PART_MAIN);
+  lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(hdr, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+  lv_obj_set_style_border_width(hdr, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  auto make_btn = [](lv_obj_t *parent, const char *text, lv_event_cb_t cb) {
+    lv_obj_t *b = lv_label_create(parent);
+    lv_label_set_text(b, text);
+    lv_obj_set_style_text_font(b, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(b, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(b, 2, LV_PART_MAIN);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    return b;
+  };
+  make_btn(hdr, "ZURÜCK", on_note_back_to_read);
+  make_btn(hdr, g_notes[g_active_note].pinned ? "ANGEPINNT" : "ANPINNEN", on_note_pin_toggle);
+  make_btn(hdr, g_note_write ? "LESEN" : "SCHREIBEN", on_note_mode_toggle);
+  make_btn(hdr, "LÖSCHEN", on_note_delete);
+
+  // Title — always editable inline; for now plain label of buf
+  lv_obj_t *title_box = lv_obj_create(scr);
+  lv_obj_remove_style_all(title_box);
+  lv_obj_set_size(title_box, LV_PCT(100), 64);
+  lv_obj_set_style_pad_left(title_box, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(title_box, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(title_box, 12, LV_PART_MAIN);
+
+  g_note_title_label = lv_label_create(title_box);
+  lv_label_set_text(g_note_title_label, g_note_title_buf);
+  lv_obj_set_style_text_font(g_note_title_label, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(g_note_title_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  // Body — read mode renders markdown, write mode shows raw + keyboard
+  lv_obj_t *body = lv_obj_create(scr);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_width(body, LV_PCT(100));
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_style_pad_left(body, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(body, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(body, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(body, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 4, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(body, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_OFF);
+
+  if (!g_note_write) {
+    render_markdown_into(body, g_note_body_buf);
+  } else {
+    g_note_body_label = lv_label_create(body);
+    lv_label_set_text(g_note_body_label, g_note_body_buf);
+    lv_obj_set_style_text_font(g_note_body_label, &moki_fraunces_italic_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_note_body_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_width(g_note_body_label, LV_PCT(100));
+    lv_label_set_long_mode(g_note_body_label, LV_LABEL_LONG_WRAP);
+
+    // Format toolbar — H1 / H2 / bullet / quote / divider / newline
+    lv_obj_t *tools = lv_obj_create(scr);
+    lv_obj_remove_style_all(tools);
+    lv_obj_set_size(tools, LV_PCT(100), 50);
+    lv_obj_set_style_bg_color(tools, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tools, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_side(tools, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tools, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+    lv_obj_set_style_border_width(tools, 1, LV_PART_MAIN);
+    lv_obj_set_flex_flow(tools, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tools, LV_FLEX_ALIGN_SPACE_AROUND,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    auto add_tool = [&](const char *txt, const char *kk) {
+      lv_obj_t *b = lv_label_create(tools);
+      lv_label_set_text(b, txt);
+      lv_obj_set_style_text_font(b, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(b, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(b, on_note_key_clicked, LV_EVENT_CLICKED, (void *)kk);
+    };
+    add_tool("H1",  "TOOL_H1");
+    add_tool("H2",  "TOOL_H2");
+    add_tool("LIST", "TOOL_BUL");
+    add_tool("QUOT", "TOOL_QUO");
+    add_tool("HR",   "TOOL_HR");
+    add_tool("NEU",  "TOOL_NL");
+
+    // Keyboard
+    lv_obj_t *kb = lv_obj_create(scr);
+    lv_obj_remove_style_all(kb);
+    lv_obj_set_size(kb, LV_PCT(100), 240);
+    lv_obj_set_style_bg_color(kb, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(kb, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(kb, 6, LV_PART_MAIN);
+    lv_obj_set_flex_flow(kb, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(kb, 4, LV_PART_MAIN);
+
+    static const char *r1[] = {"q","w","e","r","t","z","u","i","o","p"};
+    static const char *r2[] = {"a","s","d","f","g","h","j","k","l","ä"};
+    static const char *r3[] = {"y","x","c","v","b","n","m","ö","ü","ß"};
+    auto build_row_local = [&](const char *const *keys) {
+      lv_obj_t *row = lv_obj_create(kb);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), 56);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_set_style_pad_column(row, 4, LV_PART_MAIN);
+      for (int i = 0; i < 10; i++) {
+        lv_obj_t *btn = lv_obj_create(row);
+        lv_obj_remove_style_all(btn);
+        lv_obj_set_size(btn, 48, 50);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(btn, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+        lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(btn, 2, LV_PART_MAIN);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(btn, on_note_key_clicked, LV_EVENT_CLICKED, (void *)keys[i]);
+        lv_obj_t *l = lv_label_create(btn);
+        lv_label_set_text(l, keys[i]);
+        lv_obj_set_style_text_font(l, &moki_fraunces_regular_36, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+        lv_obj_center(l);
+      }
+    };
+    build_row_local(r1); build_row_local(r2); build_row_local(r3);
+
+    lv_obj_t *r4 = lv_obj_create(kb);
+    lv_obj_remove_style_all(r4);
+    lv_obj_set_size(r4, LV_PCT(100), 56);
+    lv_obj_set_flex_flow(r4, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(r4, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(r4, 6, LV_PART_MAIN);
+
+    auto big_btn = [&](const char *txt, const char *kk, int w) {
+      lv_obj_t *btn = lv_obj_create(r4);
+      lv_obj_remove_style_all(btn);
+      lv_obj_set_size(btn, w, 50);
+      lv_obj_set_style_bg_color(btn, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(btn, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(btn, 2, LV_PART_MAIN);
+      lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(btn, on_note_key_clicked, LV_EVENT_CLICKED, (void *)kk);
+      lv_obj_t *l = lv_label_create(btn);
+      lv_label_set_text(l, txt);
+      lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_center(l);
+    };
+    big_btn("ENTF", "BACK", 80);
+    big_btn("LEERZEICHEN", "SPACE", 280);
+    big_btn(".", ".", 60);
+  }
+}
+
+static void note_key_event(const char *key) {
+  size_t len = strlen(g_note_body_buf);
+  auto append = [&](const char *s) {
+    size_t klen = strlen(s);
+    size_t cur = strlen(g_note_body_buf);
+    if (cur + klen + 1 < sizeof(g_note_body_buf)) {
+      memcpy(g_note_body_buf + cur, s, klen);
+      g_note_body_buf[cur + klen] = 0;
+    }
+  };
+  if (!strcmp(key, "BACK")) {
+    if (len > 0) {
+      do { len--; } while (len > 0 && (((unsigned char)g_note_body_buf[len]) & 0xC0) == 0x80);
+      g_note_body_buf[len] = 0;
+    }
+  } else if (!strcmp(key, "SPACE")) append(" ");
+  else if (!strcmp(key, "TOOL_H1"))  append("\n# ");
+  else if (!strcmp(key, "TOOL_H2"))  append("\n## ");
+  else if (!strcmp(key, "TOOL_BUL")) append("\n- ");
+  else if (!strcmp(key, "TOOL_QUO")) append("\n> ");
+  else if (!strcmp(key, "TOOL_HR"))  append("\n---\n");
+  else if (!strcmp(key, "TOOL_NL"))  append("\n");
+  else append(key);
+
+  if (g_note_body_label)
+    lv_label_set_text(g_note_body_label, g_note_body_buf);
+}
+
 // ----------------------------------------------------------------------------
 // ui_entry — initial render: home screen.
 // ----------------------------------------------------------------------------
@@ -2522,6 +3093,7 @@ void setup() {
   state_load_todos();
   state_load_habits();
   state_load_mood();
+  state_load_notes();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
