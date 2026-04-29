@@ -683,6 +683,21 @@ static void lv_port_disp_init(void) {
   lv_disp_drv_register(&disp_drv);
 }
 
+// ----------------------------------------------------------------------------
+// Synthetic touch — driven by Serial commands so a host can drive UI tests.
+// 'tap X Y' / 'long X Y' set these volatiles; loop() releases on a timer.
+// ----------------------------------------------------------------------------
+static volatile bool    synth_pressed = false;
+static volatile int16_t synth_x       = 0;
+static volatile int16_t synth_y       = 0;
+static volatile uint32_t synth_release_at_ms = 0;
+
+static void synth_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+  data->state   = synth_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  data->point.x = synth_x;
+  data->point.y = synth_y;
+}
+
 // LVGL indev — read touch state from GT911. GT911 native is panel-landscape
 // (960×540); our display rotation is INVERTED_PORTRAIT (540×960). The mapping
 // is a 270° rotation between native and rotated coordinate frames.
@@ -2203,15 +2218,80 @@ void setup() {
     Serial.println(F("[lvgl] indev registered"));
   }
 
+  // Synthetic indev — host-driven via Serial commands (tap X Y / long X Y).
+  static lv_indev_drv_t synth_drv;
+  lv_indev_drv_init(&synth_drv);
+  synth_drv.type    = LV_INDEV_TYPE_POINTER;
+  synth_drv.read_cb = synth_read_cb;
+  lv_indev_drv_register(&synth_drv);
+  Serial.println(F("[lvgl] synth indev registered"));
+
   state_load_todos();
   state_load_habits();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
 
+// ----------------------------------------------------------------------------
+// Serial command parser — host can drive UI tests by sending lines:
+//   tap X Y            — synthetic 300ms press at (X,Y)
+//   long X Y           — synthetic 700ms long-press at (X,Y)
+//   dump               — print current screen + heap snapshot
+// ----------------------------------------------------------------------------
+static void emit_synth_tap(int16_t x, int16_t y, uint32_t hold_ms) {
+  synth_x = x;
+  synth_y = y;
+  synth_pressed = true;
+  synth_release_at_ms = millis() + hold_ms;
+  Serial.printf("[synth] press (%d,%d) hold=%lums\n",
+                x, y, (unsigned long)hold_ms);
+}
+
+static String g_serial_buf;
+static void poll_serial(void) {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      String line = g_serial_buf;
+      g_serial_buf = "";
+      line.trim();
+      if (line.length() == 0) continue;
+
+      if (line.startsWith("tap ") || line.startsWith("long ")) {
+        bool is_long = line.startsWith("long ");
+        int p1 = line.indexOf(' ');
+        int p2 = line.indexOf(' ', p1 + 1);
+        if (p1 > 0 && p2 > p1) {
+          int x = line.substring(p1 + 1, p2).toInt();
+          int y = line.substring(p2 + 1).toInt();
+          emit_synth_tap((int16_t)x, (int16_t)y, is_long ? 700 : 300);
+        }
+      } else if (line == "dump") {
+        Serial.printf("[dump] screen=%d heap=%u psram=%u todos=%d habits=%d\n",
+                      (int)current_screen,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getFreePsram(),
+                      g_todos_count, g_habits_count);
+      }
+    } else if (g_serial_buf.length() < 64) {
+      g_serial_buf += c;
+    }
+  }
+
+  // Auto-release synth press after hold timer expires.
+  if (synth_pressed && (int32_t)(millis() - synth_release_at_ms) >= 0) {
+    synth_pressed = false;
+    Serial.printf("[synth] release\n");
+  }
+}
+
 void loop() {
   // LVGL ticker
   lv_timer_handler();
+
+  // Host-driven synthetic touch + diagnostic commands
+  poll_serial();
 
   // Direct touch poll — bypasses LVGL to confirm raw hardware state.
   static bool was_pressed = false;
