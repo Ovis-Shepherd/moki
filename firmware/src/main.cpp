@@ -177,6 +177,81 @@ static void add_spacer(lv_obj_t *parent, int height) {
 }
 
 // ----------------------------------------------------------------------------
+// Moki pet — translated from simulator.jsx lines 270-365. SVG viewBox is
+// 0..100; we scale by 2.0 onto a 200×200 canvas. Ellipses become rounded
+// rectangles with LV_RADIUS_CIRCLE (LVGL 8.3 has no native ellipse).
+//
+// E-Ink palette tweak: belly uses MID (not DARK) — DARK snaps to pure black
+// under the disp_flush threshold, which makes it disappear into the INK body.
+// MID stays in the mid-grey range and reads as a subtle accent. Shadow is
+// skipped (LIGHT also snaps to white and was invisible).
+// ----------------------------------------------------------------------------
+#define MOKI_PET_SIZE 200
+static lv_color_t moki_pet_buf[MOKI_PET_SIZE * MOKI_PET_SIZE];
+
+static lv_obj_t *create_moki_canvas(lv_obj_t *parent) {
+  lv_obj_t *cv = lv_canvas_create(parent);
+  lv_canvas_set_buffer(cv, moki_pet_buf, MOKI_PET_SIZE, MOKI_PET_SIZE,
+                       LV_IMG_CF_TRUE_COLOR);
+  lv_canvas_fill_bg(cv, lv_color_hex(MOKI_PAPER), LV_OPA_COVER);
+
+  // ---- Ears (tufted variant) ----
+  lv_draw_rect_dsc_t ear;
+  lv_draw_rect_dsc_init(&ear);
+  ear.bg_color = lv_color_hex(MOKI_INK);
+  ear.bg_opa   = LV_OPA_COVER;
+
+  // Left ear : Bezier path "M 28 42 Q 24 24 34 26 Q 36 36 36 44 Z" → polygon
+  lv_point_t ear_left[] = { {56,84}, {48,48}, {68,52}, {72,88} };
+  lv_canvas_draw_polygon(cv, ear_left, 4, &ear);
+
+  // Right ear : mirrored
+  lv_point_t ear_right[] = { {144,84}, {152,48}, {132,52}, {128,88} };
+  lv_canvas_draw_polygon(cv, ear_right, 4, &ear);
+
+  // ---- Body (ellipse cx=50 cy=62 rx=28 ry=26, fill=INK) ----
+  lv_draw_rect_dsc_t body;
+  lv_draw_rect_dsc_init(&body);
+  body.bg_color = lv_color_hex(MOKI_INK);
+  body.bg_opa   = LV_OPA_COVER;
+  body.radius   = LV_RADIUS_CIRCLE;
+  lv_canvas_draw_rect(cv, 44, 72, 112, 104, &body);
+
+  // ---- Belly (cx=50 cy=72 rx=14 ry=10, MID for E-Ink visibility) ----
+  lv_draw_rect_dsc_t belly;
+  lv_draw_rect_dsc_init(&belly);
+  belly.bg_color = lv_color_hex(MOKI_MID);
+  belly.bg_opa   = LV_OPA_COVER;
+  belly.radius   = LV_RADIUS_CIRCLE;
+  lv_canvas_draw_rect(cv, 72, 124, 56, 40, &belly);
+
+  // ---- Eyes (mood=calm: PAPER dots) ----
+  lv_draw_rect_dsc_t eye;
+  lv_draw_rect_dsc_init(&eye);
+  eye.bg_color = lv_color_hex(MOKI_PAPER);
+  eye.bg_opa   = LV_OPA_COVER;
+  eye.radius   = LV_RADIUS_CIRCLE;
+  lv_canvas_draw_rect(cv,  80, 114, 10, 10, &eye);
+  lv_canvas_draw_rect(cv, 110, 114, 10, 10, &eye);
+
+  // ---- Mouth (path "M 47 70 Q 50 72 53 70" → polyline in PAPER) ----
+  lv_draw_line_dsc_t mouth;
+  lv_draw_line_dsc_init(&mouth);
+  mouth.color = lv_color_hex(MOKI_PAPER);
+  mouth.width = 3;
+  mouth.round_start = 1;
+  mouth.round_end   = 1;
+  lv_point_t mp[] = { {94,140}, {100,144}, {106,140} };
+  lv_canvas_draw_line(cv, mp, 3, &mouth);
+
+  // ---- Paws (ellipses cx=40,60 cy=86 rx=6 ry=3.5, fill=INK) ----
+  lv_canvas_draw_rect(cv,  68, 165, 24, 14, &body);
+  lv_canvas_draw_rect(cv, 108, 165, 24, 14, &body);
+
+  return cv;
+}
+
+// ----------------------------------------------------------------------------
 // build_status_bar — top strip: sync indicator left, battery + time right,
 // dashed bottom border per design DNA.
 // ----------------------------------------------------------------------------
@@ -277,7 +352,7 @@ static void build_stat_tile(lv_obj_t *parent, const char *kicker,
                             const char *tap_id) {
   lv_obj_t *tile = lv_obj_create(parent);
   lv_obj_remove_style_all(tile);
-  lv_obj_set_size(tile, LV_PCT(31), 70);
+  lv_obj_set_size(tile, LV_PCT(31), 90);
   lv_obj_set_style_bg_color(tile, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(tile, lv_color_hex(MOKI_MID), LV_PART_MAIN);
@@ -312,14 +387,17 @@ static void build_stat_tile(lv_obj_t *parent, const char *kicker,
 static void build_home_content(lv_obj_t *parent) {
   lv_obj_t *col = lv_obj_create(parent);
   lv_obj_remove_style_all(col);
-  lv_obj_set_size(col, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
   lv_obj_set_style_bg_color(col, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(col, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_pad_left(col, 28, LV_PART_MAIN);
   lv_obj_set_style_pad_right(col, 28, LV_PART_MAIN);
-  lv_obj_set_style_pad_top(col, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(col, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(col, 12, LV_PART_MAIN);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START,
+  // SPACE_AROUND distributes children evenly across the available height —
+  // no clustering at the top, no big empty stretch above the dock.
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_SPACE_AROUND,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_flex_grow(col, 1);
 
@@ -329,43 +407,43 @@ static void build_home_content(lv_obj_t *parent) {
   lv_obj_set_style_text_font(kicker, &lv_font_montserrat_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
-  lv_obj_set_style_align(kicker, LV_ALIGN_LEFT_MID, 0);
 
-  add_spacer(col, 4);
   // -- Title (italic-ish, will become Fraunces in 2c) --
   lv_obj_t *title = lv_label_create(col);
   lv_label_set_text(title, "langsam, aber jeden tag.");
   lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
-  add_spacer(col, 22);
-  // -- Pet placeholder (2b will replace with real Moki SVG) --
-  lv_obj_t *pet = lv_obj_create(col);
-  lv_obj_remove_style_all(pet);
-  lv_obj_set_size(pet, 130, 130);
-  lv_obj_set_style_bg_color(pet, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(pet, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_radius(pet, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  // -- Moki pet — vector drawing via lv_canvas (Stage 2b) --
+  lv_obj_t *pet = create_moki_canvas(col);
+  lv_obj_set_size(pet, MOKI_PET_SIZE, MOKI_PET_SIZE);
   lv_obj_add_flag(pet, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(pet, on_element_tapped, LV_EVENT_CLICKED, (void *)"moki");
 
-  add_spacer(col, 8);
-  lv_obj_t *pet_name = lv_label_create(col);
+  // -- Pet name + meta as a single tight pair (their own column) --
+  lv_obj_t *pet_pair = lv_obj_create(col);
+  lv_obj_remove_style_all(pet_pair);
+  lv_obj_set_size(pet_pair, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(pet_pair, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(pet_pair, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(pet_pair, 4, LV_PART_MAIN);
+
+  lv_obj_t *pet_name = lv_label_create(pet_pair);
   lv_label_set_text(pet_name, "moki");
   lv_obj_set_style_text_font(pet_name, &lv_font_montserrat_28, LV_PART_MAIN);
   lv_obj_set_style_text_color(pet_name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
-  lv_obj_t *pet_meta = lv_label_create(col);
+  lv_obj_t *pet_meta = lv_label_create(pet_pair);
   lv_label_set_text(pet_meta, "TAG 14 · 3 IN FOLGE");
   lv_obj_set_style_text_font(pet_meta, &lv_font_montserrat_18, LV_PART_MAIN);
   lv_obj_set_style_text_color(pet_meta, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(pet_meta, 2, LV_PART_MAIN);
-  add_spacer(col, 18);
 
-  // -- Mood pill (dashed border, full-width) --
+  // -- Mood pill (dashed-style border, full-width) --
   lv_obj_t *mood = lv_obj_create(col);
   lv_obj_remove_style_all(mood);
-  lv_obj_set_size(mood, LV_PCT(100), 50);
+  lv_obj_set_size(mood, LV_PCT(100), 60);
   lv_obj_set_style_bg_color(mood, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(mood, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(mood, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
@@ -392,11 +470,10 @@ static void build_home_content(lv_obj_t *parent) {
   lv_obj_set_style_text_color(ma, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(ma, 2, LV_PART_MAIN);
 
-  add_spacer(col, 12);
   // -- Three stat tiles --
   lv_obj_t *tiles = lv_obj_create(col);
   lv_obj_remove_style_all(tiles);
-  lv_obj_set_size(tiles, LV_PCT(100), 76);
+  lv_obj_set_size(tiles, LV_PCT(100), 95);
   lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_SPACE_BETWEEN,
