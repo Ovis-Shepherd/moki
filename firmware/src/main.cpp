@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <Preferences.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -89,6 +90,39 @@ static void state_init_todos(void) {
     g_todos[i] = SAMPLE_TODOS[i];                  // struct copy
   }
   g_todos_count = SAMPLE_TODOS_COUNT;
+}
+
+// NVS-backed persistence (Arduino Preferences wrapper). Namespace = "moki".
+static Preferences g_prefs;
+
+static void state_save_todos(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt("todos_n", (uint32_t)g_todos_count);
+  if (g_todos_count > 0) {
+    g_prefs.putBytes("todos", g_todos, sizeof(moki_todo_t) * g_todos_count);
+  } else {
+    g_prefs.remove("todos");
+  }
+  g_prefs.end();
+  Serial.printf("[persist] saved %d todos to NVS\n", g_todos_count);
+}
+
+static void state_load_todos(void) {
+  g_prefs.begin("moki", true);                     // read-only
+  uint32_t n = g_prefs.getUInt("todos_n", 0xFFFFFFFFu);
+  if (n != 0xFFFFFFFFu && n <= MAX_TODOS) {
+    g_todos_count = (int)n;
+    if (g_todos_count > 0) {
+      g_prefs.getBytes("todos", g_todos, sizeof(moki_todo_t) * g_todos_count);
+    }
+    g_prefs.end();
+    Serial.printf("[persist] loaded %d todos from NVS\n", g_todos_count);
+  } else {
+    g_prefs.end();
+    Serial.println(F("[persist] NVS empty — bootstrapping with sample data"));
+    state_init_todos();
+    state_save_todos();
+  }
 }
 
 static const moki_event_t SAMPLE_EVENTS[] = {
@@ -249,6 +283,7 @@ static void compose_save(void) {
   t->done      = false;
 
   Serial.printf("[compose] saved todo: '%s'\n", t->title);
+  state_save_todos();
 
   g_compose_title[0]    = 0;
   strcpy(g_compose_cat, "self");
@@ -1002,7 +1037,17 @@ static lv_obj_t *make_tab_bar(lv_obj_t *parent) {
 // ----------------------------------------------------------------------------
 // DO screen — gewohnheiten | aufgaben | kalender
 // ----------------------------------------------------------------------------
-static void build_todo_row(lv_obj_t *parent, const moki_todo_t *t) {
+static void on_todo_toggle(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= g_todos_count) return;
+  g_todos[idx].done = !g_todos[idx].done;
+  Serial.printf("[todo] toggle #%d → done=%d\n", idx, g_todos[idx].done);
+  state_save_todos();
+  switch_screen(SCR_DO);
+}
+
+static void build_todo_row(lv_obj_t *parent, int idx) {
+  const moki_todo_t *t = &g_todos[idx];
   lv_obj_t *row = lv_obj_create(parent);
   lv_obj_remove_style_all(row);
   lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
@@ -1015,14 +1060,16 @@ static void build_todo_row(lv_obj_t *parent, const moki_todo_t *t) {
   lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
   lv_obj_set_style_pad_column(row, 10, LV_PART_MAIN);
 
-  // Checkbox
+  // Checkbox — tap toggles done state
   lv_obj_t *cb = lv_obj_create(row);
   lv_obj_remove_style_all(cb);
-  lv_obj_set_size(cb, 22, 22);
+  lv_obj_set_size(cb, 32, 32);                     // bigger hit-target
   lv_obj_set_style_border_color(cb, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_border_width(cb, 2, LV_PART_MAIN);
   lv_obj_set_style_bg_color(cb, lv_color_hex(t->done ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(cb, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_flag(cb, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(cb, on_todo_toggle, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
   if (t->done) {
     lv_obj_t *check = lv_label_create(cb);
     lv_label_set_text(check, "✓");
@@ -1089,7 +1136,7 @@ static void build_do_content(lv_obj_t *parent) {
     // Open todos first, then "ERLEDIGT" header, then done todos
     bool printed_done_header = false;
     for (int i = 0; i < g_todos_count; i++) {
-      if (!g_todos[i].done) build_todo_row(body, &g_todos[i]);
+      if (!g_todos[i].done) build_todo_row(body, i);
     }
     for (int i = 0; i < g_todos_count; i++) {
       if (g_todos[i].done) {
@@ -1103,7 +1150,7 @@ static void build_do_content(lv_obj_t *parent) {
           lv_obj_set_style_pad_bottom(hdr, 4, LV_PART_MAIN);
           printed_done_header = true;
         }
-        build_todo_row(body, &g_todos[i]);
+        build_todo_row(body, i);
       }
     }
 
@@ -1771,7 +1818,7 @@ void setup() {
     Serial.println(F("[lvgl] indev registered"));
   }
 
-  state_init_todos();
+  state_load_todos();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
