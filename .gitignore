@@ -1,0 +1,10 @@
+.DS_Store
+firmware/.pio/
+firmware/.pioenvs/
+firmware/.piolibdeps/
+firmware/.vscode/
+firmware/.cache/
+firmware/build/
+*.elf
+*.bin
+*.map
