@@ -478,9 +478,10 @@ static const char *LORA_PRESET_LABELS[LORA_PRESET_COUNT] = {
 // SCHEMA POLICY:
 //   - v1: initial layout (sync_interval through lora_tx_armed)
 //   - v2: + lora_preset (uint8) appended
+//   - v3: + mesh_channel_name + mesh_channel_psk_b64 (MeshCore channel)
 //   Bump SETTINGS_SCHEMA_V whenever a field is reordered/removed/changed type.
 //   Pure appends keep the version (size-based partial-load handles them).
-#define SETTINGS_SCHEMA_V 2
+#define SETTINGS_SCHEMA_V 3
 typedef struct {
   uint8_t  sync_interval_min;     // 5 / 15 / 30 / 60
   char     share_default[8];      // off / hourly / live
@@ -488,9 +489,17 @@ typedef struct {
   char     bio[80];
   bool     lora_tx_armed;         // false = RX-only (safe without antenna)
   uint8_t  lora_preset;           // LORA_PRESET_*
+  char     mesh_channel_name[16]; // MeshCore group-channel label (UI only)
+  char     mesh_channel_psk_b64[28]; // Base64 16-byte PSK + NUL — 22+1 padded
 } moki_settings_t;
-static moki_settings_t g_settings = { 30, "hourly", "levin", "liest langsam. läuft lieber.", false,
-                                      LORA_PRESET_MESHCORE_NARROW };
+// Default uses MeshCore's well-known public PSK so out-of-the-box two Mokis
+// can talk to each other (and any other MeshCore-Public participant).
+static moki_settings_t g_settings = {
+  30, "hourly", "levin", "liest langsam. läuft lieber.", false,
+  LORA_PRESET_MESHCORE_NARROW,
+  "moki",
+  "izOH6cXN6mrJ5e26oRXNcg=="
+};
 
 // LoRa-Chat ring buffer of recent messages.
 // Body is stored as raw bytes (may contain non-printable / non-NUL-terminated).
@@ -537,6 +546,14 @@ extern "C" {
   void moki_mesh_init(void);
   void moki_mesh_loop(void);
   bool moki_mesh_send(const char *sender_name, const char *text);
+}
+
+// Settings accessors for moki_mesh.cpp (so it doesn't need the full struct).
+extern "C" const char *moki_settings_get_channel_name() {
+  return g_settings.mesh_channel_name;
+}
+extern "C" const char *moki_settings_get_channel_psk() {
+  return g_settings.mesh_channel_psk_b64;
 }
 
 static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
@@ -5090,6 +5107,34 @@ static void poll_serial(void) {
         } else {
           Serial.println(F("[rtc] not ready"));
         }
+      } else if (line.startsWith("set_channel ")) {
+        String name = line.substring(12);
+        name.trim();
+        if (name.length() == 0 || name.length() >= sizeof(g_settings.mesh_channel_name)) {
+          Serial.println(F("[mesh] channel name 1..15 chars"));
+        } else {
+          strncpy(g_settings.mesh_channel_name, name.c_str(),
+                  sizeof(g_settings.mesh_channel_name) - 1);
+          g_settings.mesh_channel_name[sizeof(g_settings.mesh_channel_name) - 1] = 0;
+          state_save_settings();
+          Serial.printf("[mesh] channel name='%s' (effective on next boot)\n",
+                        g_settings.mesh_channel_name);
+        }
+      } else if (line.startsWith("set_psk ")) {
+        String psk = line.substring(8);
+        psk.trim();
+        if (psk.length() != 24) {
+          Serial.println(F("[mesh] PSK must be 24-char Base64 (16 bytes raw)"));
+        } else {
+          strncpy(g_settings.mesh_channel_psk_b64, psk.c_str(),
+                  sizeof(g_settings.mesh_channel_psk_b64) - 1);
+          g_settings.mesh_channel_psk_b64[sizeof(g_settings.mesh_channel_psk_b64) - 1] = 0;
+          state_save_settings();
+          Serial.println(F("[mesh] PSK saved (effective on next boot)"));
+        }
+      } else if (line == "channel") {
+        Serial.printf("[mesh] channel='%s' psk='%s'\n",
+                      g_settings.mesh_channel_name, g_settings.mesh_channel_psk_b64);
       } else if (line == "rtc_raw") {
         // Diagnostic: dump all 11 PCF85063 registers (0x00..0x0A) raw.
         Wire.beginTransmission(PCF85063_SLAVE_ADDRESS);

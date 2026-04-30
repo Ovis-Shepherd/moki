@@ -36,13 +36,13 @@ extern "C" void moki_lora_push_msg_external(const char *from, const char *text, 
 // Identity secret from Stage 3c (in main.cpp).
 extern uint8_t g_identity_secret[32];
 
-// MeshCore Public-Group PSK — bekannter Standard, alle MeshCore-User nutzen.
-#define MOKI_PUBLIC_PSK   "izOH6cXN6mrJ5e26oRXNcg=="
-
-// Moki private channel — placeholder PSK. Lucas can later set via settings.
-// For now, derived from the device identity so two Mokis with the same
-// identity (paired) end up on the same private channel.
-#define MOKI_PRIVATE_LABEL "moki"
+// Settings exposed by main.cpp (extern so we can read channel name + PSK).
+struct moki_settings_t;
+extern struct moki_settings_t g_settings;
+// Direct field accessors via extern "C" wrappers in main.cpp (avoids needing
+// the full struct layout here — keeps moki_mesh.cpp decoupled).
+extern "C" const char *moki_settings_get_channel_name();
+extern "C" const char *moki_settings_get_channel_psk();
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -133,12 +133,24 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   }
 
   // The channel-message hook — what we actually care about right now.
-  // mesh::GroupChannel doesn't expose a name; we just label by route mode.
+  // MeshCore wire format: "<sender>: <body>" — we split here so the chat-
+  // detail bubbles show sender + text separately, like a real chat client.
   void onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t timestamp, const char *text) override {
     Serial.printf("[mesh] channel msg (%s, %d hops): %s\n",
                   pkt->isRouteDirect() ? "direct" : "flood",
                   pkt->path_len, text);
-    moki_lora_push_msg_external("ch·moki", text, 0);
+    const char *colon = strstr(text, ": ");
+    if (colon && (colon - text) < 23) {
+      // Split sender (up to 23 chars) and body.
+      char sender[24];
+      size_t name_len = colon - text;
+      if (name_len >= sizeof(sender)) name_len = sizeof(sender) - 1;
+      memcpy(sender, text, name_len);
+      sender[name_len] = 0;
+      moki_lora_push_msg_external(sender, colon + 2, 0);
+    } else {
+      moki_lora_push_msg_external("mesh", text, 0);
+    }
   }
 
 public:
@@ -157,10 +169,13 @@ public:
     // pubkey across reboots.
     self_id = mesh::LocalIdentity(&seed_rng);
 
-    // Add the default Moki channel.
-    _moki_channel = addChannel(MOKI_PRIVATE_LABEL, MOKI_PUBLIC_PSK);
+    // Channel from settings (user-configurable name + Base64 PSK).
+    const char *name = moki_settings_get_channel_name();
+    const char *psk  = moki_settings_get_channel_psk();
+    _moki_channel = addChannel(name, psk);
 
-    Serial.printf("[mesh] identity set, channel '%s' ready\n", MOKI_PRIVATE_LABEL);
+    Serial.printf("[mesh] identity set, channel '%s' (%s)\n",
+                  name, _moki_channel ? "ok" : "FAILED");
   }
 
   // Returns true if message was queued for transmission.
