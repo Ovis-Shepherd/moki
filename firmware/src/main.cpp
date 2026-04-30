@@ -389,6 +389,74 @@ typedef struct {
 
 #define MAX_NOTES 16
 #define NOTES_SCHEMA_V 1
+
+// ============================================================================
+// M5-Lite — Pageable Book Reader
+// ============================================================================
+// One embedded sample (Walden chapter excerpt) + char-based pagination.
+// Real EPUB parser will land in M5-Full when we wire up microSD.
+//
+// Pagination is character-based (CHARS_PER_PAGE) with word-boundary trimming
+// so we don't split mid-word. ~1400 chars fits comfortably on the 4.7"
+// screen with our Fraunces 22pt italic body.
+#define BOOK_CHARS_PER_PAGE 1400
+static const char MOKI_BOOK_TEXT[] PROGMEM =
+  "Ich ging in die Wälder, weil ich mit Bedacht leben wollte, "
+  "um nur den wesentlichen Tatsachen des Lebens ins Auge zu sehen, "
+  "und zu lernen, was es zu lehren hatte — und nicht, wenn es zum "
+  "Sterben käme, zu entdecken, dass ich nicht gelebt hatte.\n\n"
+
+  "Ich wollte nicht das leben, was nicht Leben war; das Leben ist so "
+  "kostbar; auch wollte ich nicht entsagen, es sei denn, dass es "
+  "durchaus nötig wäre. Ich wollte tief leben und alles Mark des "
+  "Lebens aussaugen, so kraftvoll und spartanisch leben, dass alles, "
+  "was nicht Leben war, in die Flucht geschlagen würde, eine Schneise "
+  "schlagen und kurz halten, das Leben in eine Ecke treiben und "
+  "auf seine niedrigsten Begriffe reduzieren.\n\n"
+
+  "Wenn es sich als gemein erweisen sollte, dann eben das ganze und "
+  "echte Gemeine herauszufinden und seine Gemeinheit der Welt zu "
+  "verkünden; oder, wenn es erhaben wäre, es aus eigener Erfahrung zu "
+  "wissen und einen wahren Bericht davon in meinem nächsten Ausflug "
+  "geben zu können.\n\n"
+
+  "Denn die meisten Menschen, scheint es mir, sind in einem seltsamen "
+  "Zweifel über das Leben, ob es vom Teufel oder von Gott ist, und "
+  "haben etwas vorschnell gefolgert, dass es das Hauptziel des "
+  "Menschen hier sei, 'Gott zu verherrlichen und sich seiner für "
+  "immer zu erfreuen'.\n\n"
+
+  "Trotzdem leben wir gemein, wie Ameisen; obwohl die Sage sagt, "
+  "wir wären schon vor langer Zeit in Menschen verwandelt worden; "
+  "wie Pygmäen kämpfen wir mit Kranichen; es ist Fehler über Fehler, "
+  "und Flicken über Flicken, und unsere beste Tugend hat einen "
+  "Anlass aus überflüssigem und vermeidbarem Elend.\n\n"
+
+  "Unser Leben wird in Kleinigkeiten zerstreut. Ein ehrlicher Mann "
+  "hat kaum nötig, mehr als seine zehn Finger zu zählen, oder in "
+  "extremen Fällen kann er seine zehn Zehen hinzufügen und den Rest "
+  "in einer Pauschale zusammenwerfen. Einfachheit, Einfachheit, "
+  "Einfachheit! Ich sage, lass deine Geschäfte zwei oder drei sein, "
+  "nicht hundert oder tausend; statt einer Million zähle ein halbes "
+  "Dutzend, und führe deine Rechnung auf deinem Daumennagel.\n\n"
+
+  "Inmitten dieses bewegten und stürmischen und doch nervösen "
+  "neunzehnten Jahrhunderts, in dem wir leben, gibt es niemals "
+  "weniger als drei Mahlzeiten am Tag, und sie sind absolut "
+  "notwendig; und wenn die Verdauung schlecht ist, fehlt uns dann "
+  "immer noch der Appetit darauf? Statt drei Mahlzeiten am Tag, "
+  "wenn nötig, iss nur eine; statt hundert Gerichte, fünf; und "
+  "reduziere andere Dinge im selben Verhältnis.\n\n"
+
+  "Unser Leben ist wie eine Deutsche Konföderation, deren "
+  "Bestandteile aus winzigen, sich ständig verändernden Staaten "
+  "bestehen, deren Grenzen kein einziger Deutscher von Augenblick "
+  "zu Augenblick aufzeigen kann. Die Nation selbst, mit all ihren "
+  "sogenannten inneren Verbesserungen, die übrigens äußerlich und "
+  "oberflächlich sind, ist genau eine solche unhandliche und "
+  "übermäßig gewachsene Einrichtung.";
+#define BOOK_PAGE_KEY "book_p"
+static int g_book_page = 0;
 static moki_note_t g_notes[MAX_NOTES];
 static int g_notes_count = 0;
 
@@ -682,6 +750,20 @@ static void state_save_settings(void) {
   g_prefs.end();
   Serial.println(F("[persist] saved settings"));
 }
+// ── M5-Lite: Reader pagination state ──────────────────────────────────────
+// Saved in NVS as a uint32 under "book_p" so Lucas's last-read page persists
+// across reboots. One book for now; multi-book index lands in M5-Full.
+static void state_save_book_page(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt(BOOK_PAGE_KEY, (uint32_t)g_book_page);
+  g_prefs.end();
+}
+static void state_load_book_page(void) {
+  g_prefs.begin("moki", true);
+  g_book_page = (int)g_prefs.getUInt(BOOK_PAGE_KEY, 0);
+  g_prefs.end();
+}
+
 // ── Mesh-Identity (32-byte secret) ───────────────────────────────────────
 // Holds a per-device 32-byte secret. Used as:
 //   - PSK material for Moki↔Moki encrypted chat (AES-128 derived from first 16B)
@@ -2349,6 +2431,13 @@ static void build_read_content(lv_obj_t *parent) {
   make_tab_button(bar, "notizen", current_read_tab == READ_NOTES, on_read_tab_clicked, READ_NOTES);
 
   if (current_read_tab == READ_BOOK) {
+    // Total pages computed from PROGMEM string length.
+    size_t total = strlen_P(MOKI_BOOK_TEXT);
+    int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
+    if (total_pages < 1) total_pages = 1;
+    if (g_book_page >= total_pages) g_book_page = total_pages - 1;
+    if (g_book_page < 0) g_book_page = 0;
+
     lv_obj_t *author = lv_label_create(col);
     lv_label_set_text(author, "HENRY DAVID THOREAU");
     lv_obj_set_style_text_font(author, &moki_jetbrains_mono_22, LV_PART_MAIN);
@@ -2364,45 +2453,82 @@ static void build_read_content(lv_obj_t *parent) {
     lv_obj_set_style_text_align(book, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(book, LV_PCT(100));
 
+    // Extract current page slice into a stack buffer.
+    static char page_buf[BOOK_CHARS_PER_PAGE + 8];
+    size_t start = g_book_page * BOOK_CHARS_PER_PAGE;
+    size_t want  = BOOK_CHARS_PER_PAGE;
+    if (start + want > total) want = total - start;
+    memcpy_P(page_buf, MOKI_BOOK_TEXT + start, want);
+    page_buf[want] = 0;
+    // Trim back to last whitespace so we don't split mid-word — only when
+    // we're not on the final page.
+    if (g_book_page < total_pages - 1) {
+      for (int i = (int)want - 1; i > (int)want - 80 && i > 0; i--) {
+        if (page_buf[i] == ' ' || page_buf[i] == '\n') {
+          page_buf[i] = 0;
+          break;
+        }
+      }
+    }
+
     lv_obj_t *excerpt = lv_label_create(col);
-    lv_label_set_text(excerpt,
-      "Ich ging in die Wälder, weil ich mit Bedacht leben wollte, "
-      "um nur den wesentlichen Tatsachen des Lebens ins Auge zu sehen, "
-      "und zu lernen, was es zu lehren hatte — und nicht, wenn es zum "
-      "Sterben käme, zu entdecken, dass ich nicht gelebt hatte.");
+    lv_label_set_text(excerpt, page_buf);
     lv_obj_set_style_text_font(excerpt, &moki_fraunces_italic_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(excerpt, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_color(excerpt, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_label_set_long_mode(excerpt, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(excerpt, LV_PCT(100));
+    lv_obj_set_flex_grow(excerpt, 1);
     lv_obj_set_style_text_line_space(excerpt, 6, LV_PART_MAIN);
 
-    // Page nav
+    // Page nav with click handlers.
     lv_obj_t *nav = lv_obj_create(col);
     lv_obj_remove_style_all(nav);
-    lv_obj_set_size(nav, LV_PCT(100), 40);
+    lv_obj_set_size(nav, LV_PCT(100), 50);
     lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(nav, LV_FLEX_ALIGN_SPACE_BETWEEN,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
     lv_obj_set_style_border_color(nav, lv_color_hex(MOKI_MID), LV_PART_MAIN);
     lv_obj_set_style_border_width(nav, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(nav, 8, LV_PART_MAIN);
+
+    static auto on_book_prev = [](lv_event_t *e) {
+      if (g_book_page > 0) { g_book_page--; state_save_book_page(); switch_screen(SCR_READ); }
+    };
+    static auto on_book_next = [](lv_event_t *e) {
+      size_t total = strlen_P(MOKI_BOOK_TEXT);
+      int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
+      if (g_book_page < total_pages - 1) { g_book_page++; state_save_book_page(); switch_screen(SCR_READ); }
+    };
 
     lv_obj_t *prev = lv_label_create(nav);
     lv_label_set_text(prev, "← ZURÜCK");
     lv_obj_set_style_text_font(prev, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(prev, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_color(prev,
+        lv_color_hex(g_book_page > 0 ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(prev, 2, LV_PART_MAIN);
+    if (g_book_page > 0) {
+      lv_obj_add_flag(prev, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(prev, on_book_prev, LV_EVENT_CLICKED, NULL);
+    }
 
+    char pagebuf[20];
+    snprintf(pagebuf, sizeof(pagebuf), "%d / %d", g_book_page + 1, total_pages);
     lv_obj_t *page = lv_label_create(nav);
-    lv_label_set_text(page, "42 / 312");
+    lv_label_set_text(page, pagebuf);
     lv_obj_set_style_text_font(page, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(page, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_color(page, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
 
     lv_obj_t *next = lv_label_create(nav);
     lv_label_set_text(next, "WEITER →");
     lv_obj_set_style_text_font(next, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(next, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_color(next,
+        lv_color_hex(g_book_page < total_pages - 1 ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(next, 2, LV_PART_MAIN);
+    if (g_book_page < total_pages - 1) {
+      lv_obj_add_flag(next, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(next, on_book_next, LV_EVENT_CLICKED, NULL);
+    }
   } else if (current_read_tab == READ_FEED) {
     lv_obj_t *stub = lv_label_create(col);
     lv_label_set_text(stub, "feed kommt bald.");
@@ -4918,6 +5044,7 @@ void setup() {
   state_load_settings();
   state_load_events();
   state_load_identity();
+  state_load_book_page();
   lora_persist_load();   // restore last LORA_MSG_CAP messages from disk
 
   lora_init();   // safe RX-only by default
