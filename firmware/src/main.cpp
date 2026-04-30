@@ -1111,16 +1111,28 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
+  // Sync countdown derived from uptime + configured interval.
+  uint32_t uptime_min = millis() / 60000UL;
+  uint32_t since      = uptime_min % g_settings.sync_interval_min;
+  uint32_t left       = g_settings.sync_interval_min - since;
+  char syncbuf[24];
+  snprintf(syncbuf, sizeof(syncbuf), "SYNC · %luM", (unsigned long)left);
   lv_obj_t *sync = lv_label_create(bar);
-  lv_label_set_text(sync, "SYNC · 12M");        // · = U+00B7
+  lv_label_set_text(sync, syncbuf);
   lv_obj_set_style_text_color(sync, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_text_font(sync, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sync, 2, LV_PART_MAIN);
   lv_obj_add_flag(sync, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(sync, on_element_tapped, LV_EVENT_CLICKED, (void *)"sync");
 
+  // Right cluster — battery (placeholder 78) + uptime in HH:MM
+  uint32_t hh = uptime_min / 60;
+  uint32_t mm = uptime_min % 60;
+  char rightbuf[24];
+  snprintf(rightbuf, sizeof(rightbuf), "78  %02lu:%02lu",
+           (unsigned long)(hh % 24), (unsigned long)mm);
   lv_obj_t *right = lv_label_create(bar);
-  lv_label_set_text(right, "78  14:32");
+  lv_label_set_text(right, rightbuf);
   lv_obj_set_style_text_color(right, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_text_font(right, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(right, 2, LV_PART_MAIN);
@@ -1964,10 +1976,56 @@ static void build_read_content(lv_obj_t *parent) {
     lv_obj_set_style_text_align(stub, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(stub, LV_PCT(100));
   } else { // READ_NOTES
-    // Pinned-first ordering
+    // Folder filter chips
+    static char g_notes_folder_filter[24] = "";    // empty = all
+    static const char *FOLDERS[] = {"", "tagebuch", "küche", "gelesen", "ideen"};
+    static const char *FOLDER_LBL[] = {"alle", "tagebuch", "küche", "gelesen", "ideen"};
+
+    lv_obj_t *fstrip = lv_obj_create(col);
+    lv_obj_remove_style_all(fstrip);
+    lv_obj_set_size(fstrip, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(fstrip, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(fstrip, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(fstrip, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(fstrip, 8, LV_PART_MAIN);
+
+    static auto on_folder_cb = [](lv_event_t *e) {
+      const char *id = (const char *)lv_event_get_user_data(e);
+      strncpy(g_notes_folder_filter, id, sizeof(g_notes_folder_filter)-1);
+      g_notes_folder_filter[sizeof(g_notes_folder_filter)-1] = 0;
+      switch_screen(SCR_READ);
+    };
+    for (int i = 0; i < 5; i++) {
+      bool active = !strcmp(g_notes_folder_filter, FOLDERS[i]);
+      lv_obj_t *c = lv_obj_create(fstrip);
+      lv_obj_remove_style_all(c);
+      lv_obj_set_size(c, LV_SIZE_CONTENT, 36);
+      lv_obj_set_style_bg_color(c, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(c, lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+      lv_obj_set_style_pad_left(c, 10, LV_PART_MAIN);
+      lv_obj_set_style_pad_right(c, 10, LV_PART_MAIN);
+      lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(c, on_folder_cb, LV_EVENT_CLICKED, (void *)FOLDERS[i]);
+      lv_obj_t *l = lv_label_create(c);
+      lv_label_set_text(l, FOLDER_LBL[i]);
+      lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l, lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+    }
+
+    // Pinned-first ordering with folder filter applied
     int order[MAX_NOTES]; int o = 0;
-    for (int i = 0; i < g_notes_count; i++) if (g_notes[i].pinned) order[o++] = i;
-    for (int i = 0; i < g_notes_count; i++) if (!g_notes[i].pinned) order[o++] = i;
+    auto matches = [&](int i) {
+      if (g_notes_folder_filter[0] == 0) return true;
+      return strcmp(g_notes[i].folder, g_notes_folder_filter) == 0;
+    };
+    for (int i = 0; i < g_notes_count; i++) if (g_notes[i].pinned && matches(i)) order[o++] = i;
+    for (int i = 0; i < g_notes_count; i++) if (!g_notes[i].pinned && matches(i)) order[o++] = i;
 
     for (int oi = 0; oi < o; oi++) {
       int i = order[oi];
@@ -2309,10 +2367,53 @@ static void build_habit_detail(void) {
   lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
-  // 12-week × 7-day heatmap grid
-  lv_obj_t *grid = lv_obj_create(scr);
+  // Month labels (rough, last cell = today)
+  lv_obj_t *months = lv_obj_create(scr);
+  lv_obj_remove_style_all(months);
+  lv_obj_set_size(months, LV_PCT(100), 24);
+  lv_obj_set_flex_flow(months, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(months, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_left(months, 38, LV_PART_MAIN);  // align with grid
+  static const char *MONTHS[] = { "FEB", "MÄR", "APR" };
+  for (int m = 0; m < 3; m++) {
+    lv_obj_t *l = lv_label_create(months);
+    lv_label_set_text(l, MONTHS[m]);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 2, LV_PART_MAIN);
+  }
+
+  // 12-week × 7-day heatmap grid (with weekday labels on the left)
+  lv_obj_t *gridrow = lv_obj_create(scr);
+  lv_obj_remove_style_all(gridrow);
+  lv_obj_set_size(gridrow, LV_PCT(100), 230);
+  lv_obj_set_flex_flow(gridrow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(gridrow, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_column(gridrow, 6, LV_PART_MAIN);
+
+  // Weekday column
+  lv_obj_t *wcol = lv_obj_create(gridrow);
+  lv_obj_remove_style_all(wcol);
+  lv_obj_set_size(wcol, 32, 230);
+  lv_obj_set_flex_flow(wcol, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(wcol, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  static const char *WD[] = { "MO", "DI", "MI", "DO", "FR", "SA", "SO" };
+  for (int d = 0; d < 7; d++) {
+    lv_obj_t *l = lv_label_create(wcol);
+    lv_label_set_text(l, WD[d]);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+  }
+
+  // Heatmap grid
+  lv_obj_t *grid = lv_obj_create(gridrow);
   lv_obj_remove_style_all(grid);
-  lv_obj_set_size(grid, LV_PCT(100), 230);
+  lv_obj_set_flex_grow(grid, 1);
+  lv_obj_set_height(grid, 230);
   lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_BETWEEN,
                         LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -2320,7 +2421,7 @@ static void build_habit_detail(void) {
   for (int w = 0; w < 12; w++) {
     lv_obj_t *col = lv_obj_create(grid);
     lv_obj_remove_style_all(col);
-    lv_obj_set_size(col, 32, 230);
+    lv_obj_set_size(col, 28, 230);
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(col, 3, LV_PART_MAIN);
 
@@ -2329,7 +2430,7 @@ static void build_habit_detail(void) {
       if (sample > 4) sample = 4;
       lv_obj_t *cell = lv_obj_create(col);
       lv_obj_remove_style_all(cell);
-      lv_obj_set_size(cell, 30, 30);
+      lv_obj_set_size(cell, 26, 26);
       lv_obj_set_style_bg_color(cell, lv_color_hex(HEAT_COLORS[sample]), LV_PART_MAIN);
       lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, LV_PART_MAIN);
       lv_obj_set_style_radius(cell, 2, LV_PART_MAIN);
@@ -2781,10 +2882,29 @@ static void build_map_content(lv_obj_t *parent) {
     lv_obj_set_style_text_letter_space(loc, 2, LV_PART_MAIN);
 
     lv_obj_t *share = lv_label_create(head);
-    lv_label_set_text(share, "ICH · STÜNDLICH");
+    char buf[32];
+    const char *cur = g_settings.share_default;
+    const char *cur_label = !strcmp(cur,"off")    ? "AUS"
+                          : !strcmp(cur,"hourly") ? "STÜNDLICH"
+                                                  : "LIVE";
+    snprintf(buf, sizeof(buf), "ICH · %s", cur_label);
+    lv_label_set_text(share, buf);
     lv_obj_set_style_text_font(share, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(share, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_obj_set_style_text_letter_space(share, 2, LV_PART_MAIN);
+    lv_obj_add_flag(share, LV_OBJ_FLAG_CLICKABLE);
+    static auto cycle_share_cb = [](lv_event_t *) {
+      const char *cur = g_settings.share_default;
+      const char *next = !strcmp(cur,"off")    ? "hourly"
+                       : !strcmp(cur,"hourly") ? "live"
+                                               : "off";
+      strncpy(g_settings.share_default, next, sizeof(g_settings.share_default)-1);
+      g_settings.share_default[sizeof(g_settings.share_default)-1] = 0;
+      state_save_settings();
+      show_toast("STANDORT-FREIGABE GEWECHSELT");
+      switch_screen(SCR_MAP);
+    };
+    lv_obj_add_event_cb(share, cycle_share_cb, LV_EVENT_CLICKED, NULL);
 
     build_map_canvas(col);
   } else {
