@@ -1656,6 +1656,19 @@ static void on_habit_back(lv_event_t *e) {
   switch_screen(SCR_DO);
 }
 
+static void on_habit_delete(lv_event_t *e) {
+  if (g_active_habit < 0 || g_active_habit >= g_habits_count) return;
+  Serial.printf("[habit] delete #%d '%s'\n", g_active_habit, g_habits[g_active_habit].name);
+  for (int i = g_active_habit; i < g_habits_count - 1; i++)
+    g_habits[i] = g_habits[i+1];
+  g_habits_count--;
+  state_save_habits();
+  show_toast("GEWOHNHEIT GELÖSCHT");
+  g_active_habit = -1;
+  current_do_tab = DO_HABITS;
+  switch_screen(SCR_DO);
+}
+
 static void build_todo_row(lv_obj_t *parent, int idx) {
   const moki_todo_t *t = &g_todos[idx];
   lv_obj_t *row = lv_obj_create(parent);
@@ -2433,17 +2446,29 @@ static void build_habit_detail(void) {
   lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(scr, 12, LV_PART_MAIN);
 
-  // Back row
-  lv_obj_t *back = lv_obj_create(scr);
-  lv_obj_remove_style_all(back);
-  lv_obj_set_size(back, LV_PCT(100), 36);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(back, on_habit_back, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *bl = lv_label_create(back);
+  // Header row — back left, delete right
+  lv_obj_t *header = lv_obj_create(scr);
+  lv_obj_remove_style_all(header);
+  lv_obj_set_size(header, LV_PCT(100), 36);
+  lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *bl = lv_label_create(header);
   lv_label_set_text(bl, "← ZURÜCK");
   lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+  lv_obj_add_flag(bl, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(bl, on_habit_back, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *del = lv_label_create(header);
+  lv_label_set_text(del, "LÖSCHEN");
+  lv_obj_set_style_text_font(del, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(del, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(del, 2, LV_PART_MAIN);
+  lv_obj_add_flag(del, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(del, on_habit_delete, LV_EVENT_CLICKED, NULL);
 
   // Kicker + title
   lv_obj_t *kicker = lv_label_create(scr);

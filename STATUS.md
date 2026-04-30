@@ -1,8 +1,8 @@
 # Moki — Aktueller Stand
 
-**Letztes Update:** 2026-04-30 (Nacht-Session)
+**Letztes Update:** 2026-04-30 (Nacht-Session, autonom)
 **Hardware:** 1× LILYGO T5 E-Paper S3 Pro (zweites Gerät noch nicht geflasht)
-**Repo-Stand:** 22+ Commits, von Stage 0 bis Settings + Closed-Loop-Debug
+**Repo-Stand:** 28 Commits, von Stage 0 bis Settings + Calendar-Event-Compose + Habit-Delete
 
 > Lebendes Dokument. Was hier steht, läuft auf der Hardware. Brief = `spec/MOKI.md`.
 
@@ -63,6 +63,7 @@ Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop
 - Month-Labels (FEB/MÄR/APR) + Weekday-Labels (MO/DI/MI/DO/FR/SA/SO)
 - Inline +/− Controls + Count-Pill
 - 3 Stat-Cards: heute / gesamt (12 Wo.) / serie
+- Header: ZURÜCK ←  ·  LÖSCHEN (mit Toast-Bestätigung)
 
 **Aufgaben:**
 - Liste mit Checkbox, Title, Cat-Mark (H/P/W/S/F), Deadline, Recurring
@@ -77,7 +78,8 @@ Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop
 **Kalender:**
 - Wochen-Strip Mo–So mit today-Highlight
 - Liste „kommend" mit Datum/Zeit/Title/Place/Visibility
-- Read-only (Sample-Daten)
+- "+ NEUER TERMIN" → Compose-Sheet (Title-Field für Termin-Name)
+- Persistiert in NVS (`events`)
 
 ### READ / Lesen (3 Tabs)
 
@@ -157,6 +159,7 @@ Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop
 | `todos`, `todos_n` | flat blob | User-erstellte + Sample-Todos |
 | `habits`, `habits_n`, `habits_v` (=2) | flat blob | Habits inkl. history[84] |
 | `notes`, `notes_n`, `notes_v` (=1) | flat blob | Notes mit body, template, folder, pinned |
+| `events`, `events_n` | flat blob | Calendar events mit day/hour/title/place/kind |
 | `mood` | string | active mood preset id |
 | `settings` | flat blob | sync_interval, share_default, handle, bio |
 
