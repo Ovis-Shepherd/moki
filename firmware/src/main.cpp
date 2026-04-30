@@ -468,8 +468,10 @@ static compose_kind_t g_compose_kind     = COMPOSE_TODO;
 static char        g_compose_title[64]   = "";
 static char        g_compose_cat[16]     = "self";
 static char        g_compose_deadline[24]= "";
+static bool        g_compose_recurring   = false;
 static lv_obj_t   *g_compose_overlay     = NULL;
 static lv_obj_t   *g_compose_title_label = NULL;
+static void        build_compose_overlay(void);
 
 static void compose_close(void) {
   if (g_compose_overlay) {
@@ -488,7 +490,7 @@ static void compose_save(void) {
     strncpy(t->title,    g_compose_title,    sizeof(t->title)-1);    t->title[sizeof(t->title)-1] = 0;
     strncpy(t->cat,      g_compose_cat,      sizeof(t->cat)-1);      t->cat[sizeof(t->cat)-1] = 0;
     strncpy(t->deadline, g_compose_deadline, sizeof(t->deadline)-1); t->deadline[sizeof(t->deadline)-1] = 0;
-    t->recurring = false;
+    t->recurring = g_compose_recurring;
     t->done      = false;
     Serial.printf("[compose] saved todo: '%s'\n", t->title);
     state_save_todos();
@@ -505,6 +507,7 @@ static void compose_save(void) {
   g_compose_title[0]    = 0;
   strcpy(g_compose_cat, "self");
   g_compose_deadline[0] = 0;
+  g_compose_recurring   = false;
   compose_close();
   // Re-arm the DO screen so we pick the right tab
   current_do_tab = (g_compose_kind == COMPOSE_TODO) ? DO_TODOS : DO_HABITS;
@@ -575,6 +578,23 @@ static void on_cancel_clicked(lv_event_t *e) {
 static void on_save_clicked(lv_event_t *e) {
   compose_save();
 }
+static void on_cat_chip_clicked(lv_event_t *e) {
+  const char *id = (const char *)lv_event_get_user_data(e);
+  strncpy(g_compose_cat, id, sizeof(g_compose_cat)-1);
+  g_compose_cat[sizeof(g_compose_cat)-1] = 0;
+  build_compose_overlay();   // re-render to flip chip styles
+}
+static void on_dl_chip_clicked(lv_event_t *e) {
+  const char *id = (const char *)lv_event_get_user_data(e);
+  if (!strcmp(id, "")) g_compose_deadline[0] = 0;
+  else { strncpy(g_compose_deadline, id, sizeof(g_compose_deadline)-1);
+         g_compose_deadline[sizeof(g_compose_deadline)-1] = 0; }
+  build_compose_overlay();
+}
+static void on_rec_chip_clicked(lv_event_t *e) {
+  g_compose_recurring = (bool)(intptr_t)lv_event_get_user_data(e);
+  build_compose_overlay();
+}
 
 static void build_compose_overlay(void);
 
@@ -582,7 +602,10 @@ void open_compose_todo(void)  { g_compose_kind = COMPOSE_TODO;  build_compose_ov
 void open_compose_habit(void) { g_compose_kind = COMPOSE_HABIT; build_compose_overlay(); }
 
 static void build_compose_overlay(void) {
-  if (g_compose_overlay) return;
+  if (g_compose_overlay) {
+    lv_obj_del(g_compose_overlay);
+    g_compose_overlay = NULL;
+  }
   g_compose_overlay = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(g_compose_overlay);
   lv_obj_set_size(g_compose_overlay, LV_PCT(100), LV_PCT(100));
@@ -645,7 +668,7 @@ static void build_compose_overlay(void) {
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
 
   g_compose_title_label = lv_label_create(body);
-  lv_label_set_text(g_compose_title_label, "…");
+  lv_label_set_text(g_compose_title_label, g_compose_title[0] ? g_compose_title : "…");
   lv_obj_set_style_text_font(g_compose_title_label, &moki_fraunces_regular_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(g_compose_title_label, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_border_side(g_compose_title_label, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
@@ -653,6 +676,72 @@ static void build_compose_overlay(void) {
   lv_obj_set_style_border_width(g_compose_title_label, 2, LV_PART_MAIN);
   lv_obj_set_style_pad_bottom(g_compose_title_label, 6, LV_PART_MAIN);
   lv_obj_set_width(g_compose_title_label, LV_PCT(100));
+
+  // -- Chips (todo only): category, deadline, recurring --
+  if (g_compose_kind == COMPOSE_TODO) {
+    auto add_label = [&](const char *t) {
+      lv_obj_t *l = lv_label_create(body);
+      lv_label_set_text(l, t);
+      lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(l, 3, LV_PART_MAIN);
+      lv_obj_set_style_pad_top(l, 4, LV_PART_MAIN);
+    };
+    auto chip_strip = [&](lv_obj_t *parent) {
+      lv_obj_t *strip = lv_obj_create(parent);
+      lv_obj_remove_style_all(strip);
+      lv_obj_set_size(strip, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_flex_flow(strip, LV_FLEX_FLOW_ROW_WRAP);
+      lv_obj_set_style_pad_row(strip, 6, LV_PART_MAIN);
+      lv_obj_set_style_pad_column(strip, 6, LV_PART_MAIN);
+      return strip;
+    };
+    auto make_chip = [&](lv_obj_t *strip, const char *label, bool active,
+                         lv_event_cb_t cb, const void *udata) {
+      lv_obj_t *c = lv_obj_create(strip);
+      lv_obj_remove_style_all(c);
+      lv_obj_set_size(c, LV_SIZE_CONTENT, 38);
+      lv_obj_set_style_bg_color(c, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(c, lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+      lv_obj_set_style_pad_left(c, 12, LV_PART_MAIN);
+      lv_obj_set_style_pad_right(c, 12, LV_PART_MAIN);
+      lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(c, cb, LV_EVENT_CLICKED, (void *)udata);
+      lv_obj_t *l = lv_label_create(c);
+      lv_label_set_text(l, label);
+      lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l,
+          lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+    };
+
+    add_label("KATEGORIE");
+    lv_obj_t *cs = chip_strip(body);
+    static const char *CAT_IDS[]    = {"home","plants","work","self","social"};
+    static const char *CAT_LABELS[] = {"zuhause","pflanzen","arbeit","selbst","freund_innen"};
+    for (int i = 0; i < 5; i++)
+      make_chip(cs, CAT_LABELS[i], !strcmp(g_compose_cat, CAT_IDS[i]),
+                on_cat_chip_clicked, CAT_IDS[i]);
+
+    add_label("BIS WANN");
+    lv_obj_t *ds = chip_strip(body);
+    static const char *DL_IDS[]    = {"heute","morgen","diese woche",""};
+    static const char *DL_LABELS[] = {"heute","morgen","diese woche","ohne"};
+    for (int i = 0; i < 4; i++)
+      make_chip(ds, DL_LABELS[i], !strcmp(g_compose_deadline, DL_IDS[i]),
+                on_dl_chip_clicked, DL_IDS[i]);
+
+    add_label("WIEDERHOLT");
+    lv_obj_t *rs = chip_strip(body);
+    make_chip(rs, "einmalig",     !g_compose_recurring, on_rec_chip_clicked, (void *)0);
+    make_chip(rs, "wöchentlich",   g_compose_recurring, on_rec_chip_clicked, (void *)1);
+  }
 
   // -- Keyboard --
   lv_obj_t *kb = lv_obj_create(g_compose_overlay);
