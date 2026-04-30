@@ -356,7 +356,36 @@ static const char *cat_mark(const char *cat) {
 typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
                SCR_MOOD, SCR_PROFILE,
                SCR_NOTE_NEW, SCR_NOTE_EDIT,
-               SCR_CHAT_DETAIL } screen_id_t;
+               SCR_CHAT_DETAIL,
+               SCR_SETTINGS } screen_id_t;
+
+// Settings (persistent)
+typedef struct {
+  uint8_t  sync_interval_min;     // 5 / 15 / 30 / 60
+  char     share_default[8];      // off / hourly / live
+  char     handle[32];            // user handle
+  char     bio[80];
+} moki_settings_t;
+static moki_settings_t g_settings = { 30, "hourly", "levin", "liest langsam. läuft lieber." };
+
+static void state_save_settings(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putBytes("settings", &g_settings, sizeof(g_settings));
+  g_prefs.end();
+  Serial.println(F("[persist] saved settings"));
+}
+static void state_load_settings(void) {
+  g_prefs.begin("moki", true);
+  size_t got = g_prefs.getBytes("settings", &g_settings, sizeof(g_settings));
+  g_prefs.end();
+  if (got == sizeof(g_settings)) {
+    Serial.printf("[persist] loaded settings (sync=%u handle='%s')\n",
+                  (unsigned)g_settings.sync_interval_min, g_settings.handle);
+  } else {
+    Serial.println(F("[persist] settings empty — using defaults"));
+    state_save_settings();
+  }
+}
 typedef enum { DO_HABITS = 0, DO_TODOS, DO_CALENDAR } do_tab_t;
 typedef enum { READ_BOOK = 0, READ_FEED, READ_NOTES } read_tab_t;
 typedef enum { MAP_MAP   = 0, MAP_NEARBY }            map_tab_t;
@@ -379,6 +408,7 @@ static void build_note_edit(void);
 static void on_mood_pill_clicked(lv_event_t *e);
 static void on_profile_clicked(lv_event_t *e);
 static void on_back_home(lv_event_t *e);
+static void show_toast(const char *text);
 static void on_note_open(lv_event_t *e);
 static void on_note_new(lv_event_t *e);
 static void on_template_picked(lv_event_t *e);
@@ -497,6 +527,7 @@ static void compose_save(void) {
     t->done      = false;
     Serial.printf("[compose] saved todo: '%s'\n", t->title);
     state_save_todos();
+    show_toast("AUFGABE GESPEICHERT");
   } else { // COMPOSE_HABIT
     if (g_habits_count >= MAX_HABITS) return;
     moki_habit_t *h = &g_habits[g_habits_count++];
@@ -505,6 +536,7 @@ static void compose_save(void) {
     h->streak      = 0;
     Serial.printf("[compose] saved habit: '%s'\n", h->name);
     state_save_habits();
+    show_toast("GEWOHNHEIT GESPEICHERT");
   }
 
   g_compose_title[0]    = 0;
@@ -1369,12 +1401,40 @@ static void switch_screen(screen_id_t to) {
     case SCR_PROFILE:  build_profile();  break;
     case SCR_NOTE_NEW: build_note_new(); break;
     case SCR_NOTE_EDIT:build_note_edit();break;
-    case SCR_CHAT_DETAIL:
-      // Build chat detail (declared later)
-      extern void build_chat_detail(void);
-      build_chat_detail();
-      break;
+    case SCR_CHAT_DETAIL: { extern void build_chat_detail(void); build_chat_detail(); break; }
+    case SCR_SETTINGS:    { extern void build_settings(void);    build_settings();    break; }
   }
+}
+
+// ----------------------------------------------------------------------------
+// Toast — bottom overlay that fades in via partial epd update.
+// Simple LVGL approach: an obj on lv_layer_top() with an auto-delete timer.
+// ----------------------------------------------------------------------------
+static lv_obj_t *g_toast = NULL;
+static lv_timer_t *g_toast_timer = NULL;
+static void toast_kill_cb(lv_timer_t *t) {
+  if (g_toast) { lv_obj_del(g_toast); g_toast = NULL; }
+  if (g_toast_timer) { lv_timer_del(g_toast_timer); g_toast_timer = NULL; }
+}
+static void show_toast(const char *text) {
+  if (g_toast) { lv_obj_del(g_toast); g_toast = NULL; }
+  if (g_toast_timer) { lv_timer_del(g_toast_timer); g_toast_timer = NULL; }
+
+  g_toast = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(g_toast);
+  lv_obj_set_size(g_toast, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(g_toast, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(g_toast, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(g_toast, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(g_toast, 12, LV_PART_MAIN);
+  lv_obj_align(g_toast, LV_ALIGN_BOTTOM_MID, 0, -100);
+  lv_obj_t *l = lv_label_create(g_toast);
+  lv_label_set_text(l, text);
+  lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(l, 2, LV_PART_MAIN);
+  g_toast_timer = lv_timer_create(toast_kill_cb, 2500, NULL);
+  lv_timer_set_repeat_count(g_toast_timer, 1);
 }
 
 static int g_active_chat = -1;
@@ -1396,6 +1456,7 @@ static void on_mood_picked(lv_event_t *e) {
   g_active_mood[sizeof(g_active_mood)-1] = 0;
   state_save_mood();
   switch_screen(SCR_HOME);
+  show_toast("STIMMUNG GETEILT");
 }
 static void on_mood_clear(lv_event_t *e) {
   g_active_mood[0] = 0;
@@ -2111,7 +2172,7 @@ static void build_profile(void) {
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
 
   lv_obj_t *title = lv_label_create(scr);
-  lv_label_set_text(title, "levin");
+  lv_label_set_text(title, g_settings.handle);
   lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
@@ -2122,7 +2183,7 @@ static void build_profile(void) {
   lv_obj_set_style_text_letter_space(handle, 2, LV_PART_MAIN);
 
   lv_obj_t *bio = lv_label_create(scr);
-  lv_label_set_text(bio, "liest langsam. läuft lieber.");
+  lv_label_set_text(bio, g_settings.bio);
   lv_obj_set_style_text_font(bio, &moki_fraunces_italic_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(bio, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_width(bio, LV_PCT(100));
@@ -2166,6 +2227,28 @@ static void build_profile(void) {
     lv_obj_set_style_text_font(v, &moki_fraunces_regular_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(v, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   }
+
+  // Settings link
+  lv_obj_t *settings = lv_obj_create(scr);
+  lv_obj_remove_style_all(settings);
+  lv_obj_set_size(settings, LV_PCT(100), 56);
+  lv_obj_set_style_border_color(settings, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(settings, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(settings, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(settings, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(settings, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(settings, LV_OBJ_FLAG_CLICKABLE);
+  static auto open_settings_cb = [](lv_event_t *) {
+    Serial.println(F("[nav] open settings"));
+    switch_screen(SCR_SETTINGS);
+  };
+  lv_obj_add_event_cb(settings, open_settings_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *sl = lv_label_create(settings);
+  lv_label_set_text(sl, "EINSTELLUNGEN →");
+  lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
 }
 
 // ----------------------------------------------------------------------------
@@ -3130,6 +3213,157 @@ static void note_key_event(const char *key) {
 }
 
 // ============================================================================
+// SETTINGS — sync interval, share-mode default
+// ============================================================================
+static void on_settings_back(lv_event_t *e) { switch_screen(SCR_PROFILE); }
+static void on_sync_interval_picked(lv_event_t *e) {
+  g_settings.sync_interval_min = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+  state_save_settings();
+  show_toast("EINSTELLUNG GESPEICHERT");
+  switch_screen(SCR_SETTINGS);
+}
+static void on_share_default_picked(lv_event_t *e) {
+  const char *s = (const char *)lv_event_get_user_data(e);
+  strncpy(g_settings.share_default, s, sizeof(g_settings.share_default)-1);
+  g_settings.share_default[sizeof(g_settings.share_default)-1] = 0;
+  state_save_settings();
+  show_toast("EINSTELLUNG GESPEICHERT");
+  switch_screen(SCR_SETTINGS);
+}
+
+void build_settings(void) {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 14, LV_PART_MAIN);
+
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_settings_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← ZURÜCK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  lv_obj_t *kicker = lv_label_create(scr);
+  lv_label_set_text(kicker, "EINSTELLUNGEN");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(scr);
+  lv_label_set_text(title, "wie soll moki sich verhalten?");
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_width(title, LV_PCT(100));
+  lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+
+  // Sync interval picker
+  lv_obj_t *sl = lv_label_create(scr);
+  lv_label_set_text(sl, "SYNC-INTERVALL");
+  lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
+
+  lv_obj_t *sync_strip = lv_obj_create(scr);
+  lv_obj_remove_style_all(sync_strip);
+  lv_obj_set_size(sync_strip, LV_PCT(100), 50);
+  lv_obj_set_flex_flow(sync_strip, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(sync_strip, 8, LV_PART_MAIN);
+
+  static const uint8_t INTERVALS[] = { 5, 15, 30, 60 };
+  static const char *INTERVAL_LABELS[] = { "5 MIN", "15 MIN", "30 MIN", "60 MIN" };
+  for (int i = 0; i < 4; i++) {
+    bool active = (g_settings.sync_interval_min == INTERVALS[i]);
+    lv_obj_t *c = lv_obj_create(sync_strip);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_flex_grow(c, 1);
+    lv_obj_set_style_bg_color(c, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(c, lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(c, on_sync_interval_picked, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)INTERVALS[i]);
+    lv_obj_t *l = lv_label_create(c);
+    lv_label_set_text(l, INTERVAL_LABELS[i]);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l,
+        lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 2, LV_PART_MAIN);
+  }
+
+  lv_obj_t *hint = lv_label_create(scr);
+  uint8_t iv = g_settings.sync_interval_min;
+  const char *bat_hint = iv ==  5 ? "ca. 3 tage akku" :
+                          iv == 15 ? "ca. 1 woche akku" :
+                          iv == 30 ? "ca. 2-4 wochen akku" :
+                                     "ca. 4-6 wochen akku";
+  char hint_buf[80];
+  snprintf(hint_buf, sizeof(hint_buf), "%s · slow tech ist absicht.", bat_hint);
+  lv_label_set_text(hint, hint_buf);
+  lv_obj_set_style_text_font(hint, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hint, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_width(hint, LV_PCT(100));
+  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+
+  // Share default
+  lv_obj_t *sl2 = lv_label_create(scr);
+  lv_label_set_text(sl2, "STANDORT-FREIGABE");
+  lv_obj_set_style_text_font(sl2, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl2, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sl2, 3, LV_PART_MAIN);
+
+  lv_obj_t *share_strip = lv_obj_create(scr);
+  lv_obj_remove_style_all(share_strip);
+  lv_obj_set_size(share_strip, LV_PCT(100), 50);
+  lv_obj_set_flex_flow(share_strip, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(share_strip, 8, LV_PART_MAIN);
+
+  static const char *SHARE_IDS[] = { "off", "hourly", "live" };
+  static const char *SHARE_LABELS[] = { "AUS", "STÜNDLICH", "LIVE" };
+  for (int i = 0; i < 3; i++) {
+    bool active = !strcmp(g_settings.share_default, SHARE_IDS[i]);
+    lv_obj_t *c = lv_obj_create(share_strip);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_flex_grow(c, 1);
+    lv_obj_set_style_bg_color(c, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(c, lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(c, on_share_default_picked, LV_EVENT_CLICKED, (void *)SHARE_IDS[i]);
+    lv_obj_t *l = lv_label_create(c);
+    lv_label_set_text(l, SHARE_LABELS[i]);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 2, LV_PART_MAIN);
+  }
+
+  // Footer / build info
+  lv_obj_t *foot = lv_label_create(scr);
+  lv_label_set_text(foot, "MOKI · BUILD VOM 30. APRIL · v0.4");
+  lv_obj_set_style_text_font(foot, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(foot, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(foot, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(foot, 16, LV_PART_MAIN);
+}
+
+// ============================================================================
 // CHAT DETAIL — single conversation thread (read-only, sample messages)
 // ============================================================================
 typedef struct { const char *from; const char *text; const char *ts; } chat_msg_t;
@@ -3329,6 +3563,7 @@ void setup() {
   state_load_habits();
   state_load_mood();
   state_load_notes();
+  state_load_settings();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
@@ -3368,6 +3603,9 @@ static void poll_serial(void) {
           int y = line.substring(p2 + 1).toInt();
           emit_synth_tap((int16_t)x, (int16_t)y, is_long ? 700 : 300);
         }
+      } else if (line.startsWith("goto ")) {
+        int n = line.substring(5).toInt();
+        switch_screen((screen_id_t)n);
       } else if (line == "dump") {
         Serial.printf("[dump] screen=%d heap=%u psram=%u todos=%d habits=%d\n",
                       (int)current_screen,
