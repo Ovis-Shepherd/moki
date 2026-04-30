@@ -99,14 +99,27 @@ Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop
 - Persistiert in NVS (`notes_v=1`)
 
 ### CHATS
-- Liste mit 4 Sample-Conversations (1:1 / GR / PUB Kind-Indicator)
+- Liste mit **5** Conversations: **#moki-mesh (LORA)** + 4 Sample-Conversations
+- Kind-Indicator: LORA / 1:1 / GR / PUB
 - Last-Message-Preview, Reset-Hint, Timestamp, Unread-Badge
-- **Tap auf Row** → CHAT_DETAIL mit:
+- **Tap auf #moki-mesh** → LoRa-Chat-Detail (siehe LORA-Sektion)
+- **Tap auf Sample-Chat** → CHAT_DETAIL mit:
   - Kicker mit Kind-Label
   - Italic Title
   - Reset-Hint wenn vorhanden
   - 2-3 Sample-Message-Bubbles mit Sender · Timestamp · Body
   - "ANTWORTEN KOMMT IM NÄCHSTEN UPDATE" Footer-Stub
+
+### LoRa Chat (#moki-mesh)
+- **SX1262** auf 868 MHz, BW 250 kHz, SF 10, CR 6, sync 0xAB
+- **RX-only by default** — sicher ohne Antenne (output_power=0 dBm)
+- **TX nur wenn `g_settings.lora_tx_armed = true`** (toggle in Settings)
+- Bei TX: kurz auf 14 dBm bumpen, transmit, zurück auf 0 dBm, re-arm RX
+- **Protokoll:** `MOKI|<handle>|<text>` ASCII-Pakete, max 200 Bytes
+- **Ring-Buffer** für 32 zuletzt empfangene Messages (RAM, kein Persist)
+- Chat-Detail zeigt Status (RX/TX-Counts, ARMED-Flag), Bubbles mit RSSI
+- Compose-Overlay mit deutscher Tastatur, "SENDEN" → `lora_send()`
+- **Antennen-Sicherheits-Hint** in Settings als italic-text
 
 ### KARTE (2 Tabs)
 
@@ -182,7 +195,7 @@ Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop
 | 5 — Compose + Keyboard | ✅ | Title + Cat/Deadline/Recurring chips |
 | 6 — Notes + Markdown | ✅ | List + Templates + Read/Write Editor |
 | 7 — Reader + Feed | 🟡 | Buch nur Static-Excerpt; Feed Stub; Notizen voll |
-| 8 — LoRa + MeshCore | ⏳ | nicht angefangen (HARDEST) |
+| 8 — LoRa + MeshCore | 🟡 | RX-only läuft, TX gated, **kein MeshCore** (eigenes ASCII-Protokoll) |
 | 9 — Map + GPS | 🟡 | Stylized only, kein echter GPS/OSM |
 | 10 — Chats | ✅ | List + Detail mit Bubbles |
 | 11 — Polish | ✅ | Settings, Profile, Toast, Stat-Tile-Nav, Sync-Counter |
@@ -199,6 +212,9 @@ goto N               # jump directly to screen by ID:
                        5=MOOD 6=PROFILE 7=NOTE_NEW 8=NOTE_EDIT
                        9=CHAT_DETAIL 10=SETTINGS
 dump                 # state snapshot incl. per-habit details
+lora                 # LoRa status + RX/TX counts + armed flag
+lorasend <text>      # Inject fake RX message (UI-test ohne 2nd device)
+loraarm / loradisarm # Toggle TX-armed flag from host
 ```
 
 ---
