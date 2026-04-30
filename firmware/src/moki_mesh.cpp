@@ -142,8 +142,11 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   }
 
 public:
+  // Pool size 16 (the simple_secure_chat default) drained quickly indoors
+  // because the rx_queue fills with delayed-flood packets from the busy
+  // 869.618 MHz Heidelberg mesh. 64 gives comfortable breathing room.
   MyMesh(mesh::Radio& radio, mesh::RNG& rng, mesh::RTCClock& rtc, SimpleMeshTables& tables)
-    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables)
+    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(64), tables)
   {}
 
   void beginWithIdentity(mesh::RNG &seed_rng) {
@@ -164,7 +167,10 @@ public:
   bool sendToMokiChannel(const char *sender_name, const char *text) {
     if (!_moki_channel) return false;
     uint32_t ts = getRTCClock()->getCurrentTimeUnique();
-    return sendGroupMessage(ts, _moki_channel->channel, sender_name, text, strlen(text));
+    bool ok = sendGroupMessage(ts, _moki_channel->channel, sender_name, text, strlen(text));
+    Serial.printf("[mesh] tx '%s': '%s' (%s)\n",
+                  sender_name, text, ok ? "queued" : "FAILED");
+    return ok;
   }
 };
 

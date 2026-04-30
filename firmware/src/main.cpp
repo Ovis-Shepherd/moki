@@ -4307,8 +4307,15 @@ static void on_lora_compose_cancel(lv_event_t *e) {
 }
 static void on_lora_compose_save(lv_event_t *e) {
   if (g_lora_compose[0] == 0) { lora_compose_close(); return; }
-  bool ok = lora_send(g_lora_compose);
-  show_toast(ok ? "GESENDET ÜBER LORA" : "TX NICHT FREI · ANTENNE PRÜFEN");
+  // Route through MeshCore (M7) when armed — the encrypted, repeater-aware
+  // path that two distant Mokis can actually use across HD.
+  bool ok = false;
+  if (g_settings.lora_tx_armed) {
+    ok = moki_mesh_send(g_settings.handle, g_lora_compose);
+    // Echo locally so the sender sees their own message.
+    if (ok) lora_push_msg(g_settings.handle, g_lora_compose, 0);
+  }
+  show_toast(ok ? "GESENDET ÜBER MESH" : "TX NICHT FREI · ANTENNE PRÜFEN");
   g_lora_compose[0] = 0;
   lora_compose_close();
   switch_screen(SCR_CHAT_DETAIL);
@@ -5148,11 +5155,12 @@ void loop() {
   // LVGL ticker
   lv_timer_handler();
 
-  // LoRa RX poll (legacy raw-radio path — still active for foreign-protocol
-  // scans and our custom MOKI| protocol).
-  lora_poll();
-
-  // M7 — MeshCore loop (handles MeshCore protocol RX/TX, channel messages).
+  // M7 — MeshCore owns the radio now. Its loop drives RX/TX/dispatch.
+  // The legacy lora_poll() raw-radio path is *not* called when mesh is up,
+  // because both would race on the same SX1262 IRQ + readData and corrupt
+  // each other. lora_poll remains defined for the foreign-protocol scan
+  // tools (lora_preset_meshtastic_*, etc.) — those need a separate "raw
+  // mode" toggle in a future iteration.
   moki_mesh_loop();
 
   // RTC tick — habit midnight rollover (cheap, runs ~once / 30s)
