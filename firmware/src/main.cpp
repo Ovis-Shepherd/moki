@@ -491,6 +491,7 @@ typedef struct {
   uint8_t  lora_preset;           // LORA_PRESET_*
   char     mesh_channel_name[16]; // MeshCore group-channel label (UI only)
   char     mesh_channel_psk_b64[28]; // Base64 16-byte PSK + NUL — 22+1 padded
+  uint8_t  auto_sleep_min;        // 0 = off, otherwise sleep after N min idle
 } moki_settings_t;
 // Default uses MeshCore's well-known public PSK so out-of-the-box two Mokis
 // can talk to each other (and any other MeshCore-Public participant).
@@ -498,8 +499,13 @@ static moki_settings_t g_settings = {
   30, "hourly", "levin", "liest langsam. läuft lieber.", false,
   LORA_PRESET_MESHCORE_NARROW,
   "moki",
-  "izOH6cXN6mrJ5e26oRXNcg=="
+  "izOH6cXN6mrJ5e26oRXNcg==",
+  0   // auto_sleep_min — disabled by default (Lucas opts in)
 };
+
+// Activity tracker for auto-sleep — touched on any user input.
+static uint32_t g_last_activity_ms = 0;
+static inline void mark_activity(void) { g_last_activity_ms = millis(); }
 
 // LoRa-Chat ring buffer of recent messages.
 // Body is stored as raw bytes (may contain non-printable / non-NUL-terminated).
@@ -5107,6 +5113,16 @@ static void poll_serial(void) {
         } else {
           Serial.println(F("[rtc] not ready"));
         }
+      } else if (line.startsWith("set_autosleep ")) {
+        int n = line.substring(14).toInt();
+        if (n < 0 || n > 60) {
+          Serial.println(F("[sleep] auto_sleep_min: 0=off, 1..60"));
+        } else {
+          g_settings.auto_sleep_min = (uint8_t)n;
+          state_save_settings();
+          mark_activity();   // reset countdown
+          Serial.printf("[sleep] auto_sleep_min = %d\n", n);
+        }
       } else if (line.startsWith("set_channel ")) {
         String name = line.substring(12);
         name.trim();
@@ -5229,12 +5245,10 @@ static void enter_deep_sleep(uint32_t wake_after_seconds) {
   if (wake_after_seconds > 0) {
     esp_sleep_enable_timer_wakeup((uint64_t)wake_after_seconds * 1000000ULL);
   }
-  // Touch IRQ wake — TOUCH_IRQ is on RTC-capable GPIO so ext0 works.
-  // GT911 INT goes LOW on touch (default), wake on level 0.
-  // (TOUCH_IRQ pin number from main.cpp's touch globals; if not RTC-capable
-  // we'd need ext1 with bitmask. Skipped for now — timer wake is enough
-  // for a first sleep cycle.)
-  Serial.printf("[sleep] entering deep sleep, wake in %lus\n",
+  // Touch IRQ wake — GT911 INT goes LOW on touch.
+  // GPIO3 on ESP32-S3 is RTC-capable so ext0 works.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)TOUCH_IRQ, 0);
+  Serial.printf("[sleep] entering deep sleep, wake in %lus or on touch\n",
                 (unsigned long)wake_after_seconds);
   Serial.flush();
   esp_deep_sleep_start();
@@ -5265,6 +5279,20 @@ void loop() {
   if (now_pressed != was_pressed) {
     Serial.printf("[touch poll] state %d → %d\n", was_pressed, now_pressed);
     was_pressed = now_pressed;
+    if (now_pressed) mark_activity();
+  }
+
+  // Auto-sleep after configured idle — opt-in via g_settings.auto_sleep_min.
+  if (g_settings.auto_sleep_min > 0 && g_last_activity_ms > 0) {
+    uint32_t idle_ms = millis() - g_last_activity_ms;
+    uint32_t threshold_ms = g_settings.auto_sleep_min * 60UL * 1000UL;
+    if (idle_ms > threshold_ms) {
+      Serial.printf("[sleep] auto-sleep after %lu min idle\n",
+                    (unsigned long)g_settings.auto_sleep_min);
+      // Sleep for sync_interval * 60s — wake to do a sync round.
+      uint32_t wake_secs = g_settings.sync_interval_min * 60UL;
+      enter_deep_sleep(wake_secs);
+    }
   }
 
   // Heartbeat once per second.
