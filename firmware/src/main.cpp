@@ -1479,11 +1479,19 @@ static void flush_timer_cb(lv_timer_t *t) {
   };
   epd_draw_rotated_image(render_area, decodebuffer, epd_hl_get_framebuffer(&hl));
   epd_poweron();
-  // MODE_GC16 = 16-level greyscale, slow but full-quality. Anti-aliased text
-  // needs the grey shades; MODE_DU collapses them inconsistently.
-  check_err(epd_hl_update_screen(&hl, MODE_GC16, epd_ambient_temperature()));
+  // Speed strategy: our disp_flush already threshold-snaps colors to pure
+  // black/white (y8<80 → 0, y8>175 → 255), so the framebuffer is effectively
+  // 1-bit by the time it reaches the EPD. MODE_DU is the 1-bit fast mode
+  // (~150ms vs MODE_GC16's ~750ms) and gives identical visual output for
+  // our binary content. Every 8 updates we kick a MODE_GC16 cycle to clear
+  // any ghosting that accumulates from the differential MODE_DU updates.
+  static uint32_t flush_count = 0;
+  bool full_refresh = ((flush_count & 7) == 0);
+  EpdDrawMode mode = full_refresh ? MODE_GC16 : MODE_DU;
+  check_err(epd_hl_update_screen(&hl, mode, epd_ambient_temperature()));
   epd_poweroff();
-  Serial.println(F("[epd] flush done (MODE_GC16)"));
+  if (full_refresh) Serial.println(F("[epd] flush done (MODE_GC16 cleanup)"));
+  flush_count++;
   lv_timer_pause(flush_timer);
 }
 

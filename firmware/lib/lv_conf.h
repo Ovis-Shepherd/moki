@@ -79,10 +79,13 @@
    HAL SETTINGS
  *====================*/
 
-/*Default display refresh period. LVG will redraw changed areas with this period time*/
-#define LV_DISP_DEF_REFR_PERIOD 10      /*[ms]*/
+/*Default display refresh period. E-Ink partial-refresh takes ~150ms, so any
+ *period below that just queues unflushed frames. 80ms keeps UI responsive
+ *but stops LVGL from invalidating during an in-progress EPD flush.*/
+#define LV_DISP_DEF_REFR_PERIOD 80      /*[ms]*/
 
-/*Input device read period in milliseconds*/
+/*Input device read period — keep tight so taps feel responsive even with
+ *the slower display period above. 30ms is fine on this CPU.*/
 #define LV_INDEV_DEF_READ_PERIOD 30     /*[ms]*/
 
 /*Use a custom tick source that tells the elapsed time in milliseconds.
