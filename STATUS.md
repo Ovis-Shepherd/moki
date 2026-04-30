@@ -1,110 +1,164 @@
 # Moki — Aktueller Stand
 
-**Letztes Update:** 2026-04-30
+**Letztes Update:** 2026-04-30 (Nacht-Session)
 **Hardware:** 1× LILYGO T5 E-Paper S3 Pro (zweites Gerät noch nicht geflasht)
-**Repo-Stand:** 14 Commits, von Stage 0 bis Habit-Detail-Heatmap
+**Repo-Stand:** 22+ Commits, von Stage 0 bis Settings + Closed-Loop-Debug
 
-> Lebendes Dokument. Was hier steht, läuft auf der Hardware. Was gestrichen
-> ist, war geplant aber zurückgestellt. Brief = `spec/MOKI.md`.
+> Lebendes Dokument. Was hier steht, läuft auf der Hardware. Brief = `spec/MOKI.md`.
+
+---
+
+## Closed-Loop Debug System
+
+Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop** gebaut:
+
+- **Mac-Kamera (FaceTime HD)** über `ffmpeg -f avfoundation` schießt Snaps des T5-Displays
+- **Synth-Touch via Serial** mit Commands: `tap X Y`, `long X Y`, `goto N`, `dump`
+- Damit kann ich **autonom flashen → snappen → analysieren → tappen → snappen → fixen** ohne dass Lucas physisch eingreift
+- Hat in dieser Session 3 Bugs gefunden die auf Handy-Fotos unsichtbar waren
 
 ---
 
 ## Was läuft auf dem Gerät
 
-### Display & Touch (Stage 0–1c · ✅)
-- Boot über USB-CDC Serial (`moki alive · t=Xs · heap=… · psram=…`)
-- 540 × 960 portrait Render, MODE_GC16 für vollen Greyscale
-- 4-bit packed greyscale flush mit ITU-R BT.601 Luminance + crisp threshold
-- GT911 Touch über I2C @ 0x5D, LVGL Pointer-Indev, native 540×960 Coords
-- Custom-Fonts: Fraunces Italic/Regular + JetBrains Mono Medium in 4 Größen
+### Display & Touch
+- 540×960 portrait, MODE_GC16 für vollen Greyscale, 4-bit packed flush mit
+  ITU-R BT.601 Luminance + crisp threshold (y8<80→0, y8>175→255)
+- GT911 Touch via I2C @ 0x5D, native 540×960 coords (no rotation)
+- Synthetic-Touch-Indev parallel zum echten — Serial-driven
+- Custom Fonts: Fraunces Italic + Regular + JetBrains Mono Medium
+  in 6 Größen (16/18/22/28/36)
 
-### Home-Screen (Stage 2 · ✅)
-- Status-Bar: SYNC · 12M (links), 78  14:32 (rechts)
-- Date-Kicker: DIENSTAG · 20. APRIL
-- Italic Title: „langsam, aber jeden tag."
+### Status-Bar (auf jedem Screen)
+- **SYNC · NM** — live countdown abgeleitet aus uptime + settings.sync_interval_min
+- **Battery 78** (statisch) + **Uptime HH:MM** rechts
+- INK-on-PAPER, dashed bottom border (1px MID)
+
+### Home-Screen
+- Date-Kicker links (DIENSTAG · 20. APRIL) + tap-bare Profile-Circle "L" rechts
+- Italic Title "langsam, aber jeden tag." (Fraunces 36pt)
 - **Moki-Pet** als lv_canvas-Drawing (200×200): tufted ears, INK body,
-  PAPER eyes, mouth-line, paws, no shadow/belly (E-Ink-Limit)
-- Mood-Pill (clickable, aber Picker noch nicht gewired)
-- 3 Stat-Tiles: GEWOHN 1/4 · AUFGAB 3 · NAH 3
-- Dock unten: heim · tun · lesen · chat · karte (heim active)
+  PAPER eyes, mouth, rounded paws, mid-grey ground shadow
+- Pet-Name "moki" + Meta "TAG 14 · 3 IN FOLGE"
+- **Mood-Pill** mit aktiv-Indikator: dunkel mit "du teilst: X · AKTIV" wenn aktiv,
+  hell mit "wie fühlst du dich heute? · TEILEN →" wenn leer; tap → MoodPicker
+- **3 Stat-Tiles** mit live counts:
+  - GEWOHN N/M heute → tap → DO/gewohnheiten
+  - AUFGAB N offen   → tap → DO/aufgaben
+  - NAH N in der nähe → tap → MAP/in der nähe
+- Dock unten: heim · tun · lesen · chat · karte (active mit underline)
 
-### Navigation (Stage 2.5 · ✅)
-- Dock-Tap wechselt zwischen 5 primären Screens
-- Active-Item bekommt INK-Underline
-- LVGL `lv_obj_clean(scr)` + Re-Build pro Switch
-- Tabs in DO/READ/MAP: re-render in place wenn Tab gewechselt
-
-### DO / Tun (Stage 4-lite + 5-lite + 3-lite + 4-habits + 4-habit-detail · ✅)
-- Drei Tabs: **gewohnheiten · aufgaben · kalender**
+### DO / Tun (3 Tabs)
 
 **Gewohnheiten:**
-- Liste mit Name, Streak-Dots `●●●○○`, Count-Badge
-- **Tap auf Row** → today_count + 1, Streak +1 wenn 0→1
-- **Long-press** → today_count − 1, Streak −1 wenn 1→0
-- **Tap auf Count-Badge** → öffnet **HABIT_DETAIL**
-- "+ NEUE GEWOHNHEIT" → Compose-Sheet
-- **Persistiert via NVS** (`habits_v=2` schema)
+- Liste mit Name, "N TAGE IN FOLGE" / "NOCH KEINE SERIE", Count-Badge
+- **Tap auf Row** → today_count + 1 (Streak +1 wenn 0→1)
+- **Long-press** → today_count − 1 (Streak −1 wenn 1→0)
+- **Tap auf Count-Badge** → öffnet HABIT_DETAIL
+- "+ NEUE GEWOHNHEIT" → Compose-Sheet mit deutscher Tastatur
+- Persistiert in NVS (`habits_v=2`)
 
-**HABIT_DETAIL (✅):**
-- 12-Wochen × 7-Tage GitHub-Commit-Style Heatmap (5 Grey-Levels)
-- Legend WENIGER ▢▢▢▢▢ MEHR
+**HABIT_DETAIL:**
+- 12-Wochen × 7-Tage Heatmap mit 5 Greylevels
+- Month-Labels (FEB/MÄR/APR) + Weekday-Labels (MO/DI/MI/DO/FR/SA/SO)
 - Inline +/− Controls + Count-Pill
 - 3 Stat-Cards: heute / gesamt (12 Wo.) / serie
-- "← ZURÜCK" zur Liste
 
 **Aufgaben:**
-- Liste mit Checkbox, Title, Cat-Mark, Deadline, Recurring
+- Liste mit Checkbox, Title, Cat-Mark (H/P/W/S/F), Deadline, Recurring
 - Open + ERLEDIGT split sections
 - **Tap auf Checkbox** → toggle done, persists
-- "+ NEUE AUFGABE" → Compose-Sheet (gleiche Tastatur)
-- **Persistiert via NVS**
+- "+ NEUE AUFGABE" → Compose-Sheet mit Chips:
+  - **KATEGORIE** chips (zuhause/pflanzen/arbeit/selbst/freund_innen)
+  - **BIS WANN** chips (heute/morgen/diese woche/ohne)
+  - **WIEDERHOLT** chips (einmalig/wöchentlich)
+- Persistiert in NVS
 
 **Kalender:**
-- Wochen-Strip Mo–So, today highlighted
+- Wochen-Strip Mo–So mit today-Highlight
 - Liste „kommend" mit Datum/Zeit/Title/Place/Visibility
 - Read-only (Sample-Daten)
 
-### READ / Lesen (Stage 7-lite · partial)
-- Drei Tabs: **buch · feed · notizen**
-- **Buch:** Walden-Excerpt in Fraunces Italic, "42 / 312" Page-Nav, Author-Kicker
-- Feed + Notizen: "kommt bald"-Stub (deferred)
+### READ / Lesen (3 Tabs)
 
-### CHAT (Stage 10-lite · partial)
-- Liste mit 4 Sample-Conversations
-- Kind-Glyph (◯ direct / ◑ group / ◉ public)
+**Buch:** Walden-Excerpt in Fraunces Italic, "42 / 312" Page-Nav, Author-Kicker
+
+**Feed:** Stub ("kommt bald")
+
+**Notizen (Stage 6 voll):**
+- Folder-Filter-Chips am oberen Rand (alle/tagebuch/küche/gelesen/ideen)
+- Liste pinned-first, mit "* " prefix für pinned, folder + visibility meta
+- "+ NEUE NOTIZ" → Template-Picker (leer/tagebuch/rezept/liste/idee)
+- Note-Editor:
+  - **Read mode:** Markdown-Renderer (# H1, ## H2, ### H3, - bullet, > quote, --- divider)
+  - **Write mode:** Raw-Text + Format-Toolbar (H1/H2/LIST/QUOT/HR/NEU) + Tastatur
+  - Header: ZURÜCK · ANGEPINNT/ANPINNEN · LESEN/SCHREIBEN · LÖSCHEN
+  - Auto-save beim Verlassen
+- Persistiert in NVS (`notes_v=1`)
+
+### CHATS
+- Liste mit 4 Sample-Conversations (1:1 / GR / PUB Kind-Indicator)
 - Last-Message-Preview, Reset-Hint, Timestamp, Unread-Badge
-- Read-only, kein Conversation-Detail (deferred)
+- **Tap auf Row** → CHAT_DETAIL mit:
+  - Kicker mit Kind-Label
+  - Italic Title
+  - Reset-Hint wenn vorhanden
+  - 2-3 Sample-Message-Bubbles mit Sender · Timestamp · Body
+  - "ANTWORTEN KOMMT IM NÄCHSTEN UPDATE" Footer-Stub
 
-### KARTE (Stage 9-lite · partial)
-- Zwei Tabs: **karte · in der nähe**
-- **Karte:** Self-Pin (Center), 4 Place-Pins, 2 Live-Friend-Pins, Neckar-Stripe
-- **In der Nähe:** Liste mit Avatar/Name/Mood/Last-Heard/Distance
-- Read-only, kein echter GPS, keine OSM-Tiles (deferred)
+### KARTE (2 Tabs)
 
-### Compose-Sheet (Stage 5-lite · ✅)
-- Vollbild-Overlay (`lv_layer_top()`)
+**Karte:**
+- Header: HEIDELBERG · ~1KM (left) + ICH · STÜNDLICH/AUS/LIVE (clickable, cycles)
+- Stylized Cartography: Self-Pin (Center), 4 Place-Pins, 2 Live-Friend-Pins, Neckar-Stripe
+
+**In der Nähe:**
+- 3 Sample-Peers mit Avatar-Circle, Name, Mood-Line, Last-Heard, Distance
+
+### MOOD-PICKER
+- 4×2 Grid mit 8 Presets (camp/sport/food/drink/spont/games/walk/read)
+- Active-State markiert
+- "NICHTS MEHR TEILEN" wenn aktiv
+- Persistiert via NVS
+
+### PROFILE
+- Handle/Bio aus Settings (mutable)
+- 3 Stat-Cards: AUFGABEN / GEWOHNHEITEN / TAG
+- Link zu EINSTELLUNGEN
+
+### SETTINGS
+- SYNC-INTERVALL chips (5/15/30/60 min)
+- Battery-Hint scaled (z.B. "ca. 2-4 wochen akku · slow tech ist absicht")
+- STANDORT-FREIGABE chips (off/hourly/live)
+- Build-Footer "MOKI · BUILD VOM 30. APRIL · v0.4"
+- Persistiert in NVS
+
+### COMPOSE-SHEET
+- Vollbild-Overlay auf `lv_layer_top()`
 - Header: ABBRECHEN · NEUE AUFGABE/GEWOHNHEIT · SICHERN
 - Title-Field mit Underline + Caret
-- 3-Reihen Tastatur: q-w-…-p / a-…-ä / y-…-ß + LEERZEICHEN/BACK
-- UTF-8-aware Backspace (ä/ö/ü als 1 Glyph löschen)
-- Save → in g_todos[] / g_habits[] → persistiert sofort
-- **Limit:** keine cat/deadline-Chips, keine Description, kein Recurring
+- Für TODO: Kategorie/Deadline/Recurring Chips
+- 3-Reihen Tastatur (q-w-…-p / a-…-ä / y-…-ß) + LEERZEICHEN/BACK
+- UTF-8-aware Backspace
+- Save → in g_todos[] / g_habits[] → persistiert sofort + Toast
+
+### TOAST-SYSTEM
+- INK pill auf lv_layer_top() für 2.5s
+- Triggert nach: Compose-Save (AUFGABE/GEWOHNHEIT GESPEICHERT),
+  Mood-Pick (STIMMUNG GETEILT), Settings-Change (EINSTELLUNG GESPEICHERT),
+  Map-Share-Cycle (STANDORT-FREIGABE GEWECHSELT)
 
 ---
 
-## Was persistiert (NVS)
+## Persistence (NVS Namespace "moki")
 
-| Key       | Schema | Bedeutung |
-|-----------|--------|-----------|
-| `todos`, `todos_n` | flat blob | Alle Todos inkl. user-erstellte |
+| Key | Schema | Bedeutung |
+|-----|--------|-----------|
+| `todos`, `todos_n` | flat blob | User-erstellte + Sample-Todos |
 | `habits`, `habits_n`, `habits_v` (=2) | flat blob | Habits inkl. history[84] |
-
-**Was NICHT persistiert (yet):**
-- Kalender-Events (sample-data, read-only)
-- Chats (sample-data, read-only)
-- Pet-State (age, streak, mood)
-- Profile (handle, pub_key, bio)
-- Active-Mood
+| `notes`, `notes_n`, `notes_v` (=1) | flat blob | Notes mit body, template, folder, pinned |
+| `mood` | string | active mood preset id |
+| `settings` | flat blob | sync_interval, share_default, handle, bio |
 
 ---
 
@@ -116,48 +170,63 @@
 | 1ab — Display + LVGL | ✅ | LILYGO libs vendored, MODE_GC16 |
 | 1c — Touch | ✅ | GT911 native 540×960 coords |
 | 2a — Home Layout | ✅ | E-Ink-tuned palette |
-| 2b — Pet Drawing | ✅ | lv_canvas, no shadow/belly |
+| 2b — Pet Drawing | ✅ | lv_canvas, no shadow/belly originally; ground-shadow added in polish |
 | 2c — Custom Fonts | ✅ | Fraunces + JB Mono Medium |
-| **2d — Breathing animation** | ❌ | **gestrichen** (Lucas: "unnötig kompliziert") |
+| **2d — Breathing animation** | ❌ | gestrichen (Lucas: "unnötig kompliziert") |
 | 2.5 — Navigation | ✅ | bonus stage |
-| 3 — Persistence | 🟡 lite | Todos+Habits via NVS, Rest deferred |
-| 4 — Habits + DO | ✅ | inkl. Detail-Heatmap + Inc/Dec |
-| 5 — Compose + Keyboard | 🟡 lite | Title-only; Cat/Deadline-Chips deferred |
-| 6 — Notes + Markdown | ⏳ | nicht angefangen |
-| 7 — Reader + Feed | 🟡 lite | Buch nur Static-Excerpt |
+| 3 — Persistence | ✅ | NVS für todos+habits+notes+mood+settings |
+| 4 — Habits + DO | ✅ | inkl. Detail-Heatmap mit Inc/Dec, history[84] |
+| 5 — Compose + Keyboard | ✅ | Title + Cat/Deadline/Recurring chips |
+| 6 — Notes + Markdown | ✅ | List + Templates + Read/Write Editor |
+| 7 — Reader + Feed | 🟡 | Buch nur Static-Excerpt; Feed Stub; Notizen voll |
 | 8 — LoRa + MeshCore | ⏳ | nicht angefangen (HARDEST) |
-| 9 — Map + GPS | 🟡 lite | Stylized only, kein echter GPS/OSM |
-| 10 — Chats | 🟡 lite | Liste only, kein Conversation-Detail |
-| 11 — Polish | ⏳ | Power-Mgmt, Settings, Onboarding |
+| 9 — Map + GPS | 🟡 | Stylized only, kein echter GPS/OSM |
+| 10 — Chats | ✅ | List + Detail mit Bubbles |
+| 11 — Polish | ✅ | Settings, Profile, Toast, Stat-Tile-Nav, Sync-Counter |
+
+---
+
+## Synthetic-Test-Commands (Serial)
+
+```
+tap X Y              # 300ms synthetic press at (X,Y)
+long X Y             # 700ms long-press
+goto N               # jump directly to screen by ID:
+                       0=HOME 1=DO 2=READ 3=CHAT 4=MAP
+                       5=MOOD 6=PROFILE 7=NOTE_NEW 8=NOTE_EDIT
+                       9=CHAT_DETAIL 10=SETTINGS
+dump                 # state snapshot incl. per-habit details
+```
 
 ---
 
 ## Known Issues / Quirks
 
-- **Pet-Pfoten** sehen aus wie Quadrate (sind rounded-rect mit LV_RADIUS_CIRCLE,
-  aber bei 24×14 nur leicht gerundet) — kosmetisch
 - **Status-Bar Datums-Anzeige hardcoded** — DIENSTAG · 20. APRIL ist statisch,
-  kein RTC-Hookup yet
-- **E-Ink Mikrokapsel-Textur** sichtbar bei direktem Licht — Hardware-Limit, akzeptiert
-- **Sync-Counter `SYNC · 12M`** ist hardcoded String (kein echter Sync läuft)
-- **GT911 reportet Resolution 0×0** — Treiber liefert trotzdem brauchbare
-  raw-coords, kein Bug
-- **Brown-out detector deaktiviert** wegen Display-Power-Spike (`-DCONFIG_ESP_BROWNOUT_DET=0`)
-- **Pet-Canvas in .bss** belegt 156 KB internal SRAM — keine PSRAM-Migration yet,
-  aber Heap noch über 100 KB frei
+  kein RTC-Hookup yet (PCF85063 vorhanden auf I2C @ 0x51, deferred)
+- **Battery-Anzeige hardcoded auf 78** — BQ27220 Wiring deferred
+- **Pet-Pfoten und Belly** — Belly skip wegen Threshold (DARK = INK auf E-Ink)
+- **E-Ink Mikrokapsel-Textur** sichtbar bei direktem Licht — Hardware-Limit
+- **Glyph-Fallbacks** für ●○★☆◯◐◑◉◈ — JetBrains Mono + Fraunces Italic
+  haben diese geometric-shapes nicht; wir benutzen ASCII oder Text-Fallbacks
+  (z.B. "* " statt "★ " für pinned, "1:1" statt "◯" für direct chat)
+- **Calendar Events sind read-only** — kein Event-Compose UI yet
+- **Chat-Reply** ist Stub ("antworten kommt im nächsten update")
+- **Habit Day-Rollover** kein Auto-Mid-night reset (RTC-needed)
 
 ---
 
 ## Architektur-Highlights
 
-### disp_flush
-LVGL → 32-bit ARGB → Luminance ITU-R BT.601 → Threshold-Snap → 4-bit packed
-greyscale → epdiy framebuffer.
+### Memory-Footprint
+- RAM: ~63% (207 KB / 320 KB) — hauptsächlich Pet-Canvas (156 KB) +
+  LVGL Draw-Buffers in PSRAM
+- Flash: ~9.8% (640 KB) — incl. 6 Custom-Fonts (~470 KB)
+- PSRAM: 5.1 MB free (von 8 MB)
 
-Threshold: y8 < 80 → 0 (pure black), y8 > 175 → 255 (pure white). Mid-Range
-[80-175] passt durch als gray4 5-10. Diese Threshold kontrolliert Anti-Aliasing-Look
-und limitiert die nutzbaren Greyscale-Tones (5 Levels in Heatmap mussten als
-spezifische Hex-Werte gewählt werden).
+### disp_flush Pipeline
+LVGL → 32-bit ARGB → Luminance ITU-R BT.601 → Threshold-Snap → 4-bit packed
+greyscale → epdiy framebuffer → MODE_GC16 update.
 
 ### Screen-System
 ```
@@ -165,18 +234,14 @@ ui_entry() → switch_screen(SCR_HOME)
             ↓
             lv_obj_clean(scr) + build_X()
                 ↓
-                build_screen_chrome(scr, dock_idx)
-                    ├── status_bar
-                    ├── content (flex_grow=1)
-                    └── dock
+                build_screen_chrome(scr, dock_idx) [for primary screens]
+                    ├── status_bar (with live sync countdown)
+                    ├── content (flex_grow=1, screen-specific)
+                    └── dock (active item underlined)
 ```
 
-`build_X()` für jeden primären Screen (HOME, DO, READ, CHATS, MAP).
-Drill-Down-Screens (HABIT_DETAIL) clearen ebenfalls scr und bauen ohne Dock.
-
-### Compose-Sheet als Modal
-Vollbild-Overlay auf `lv_layer_top()`. Beim Schließen `lv_obj_del()`. Keine
-Stack-Verwaltung — nur "open / close one at a time".
+11 Screen-Typen: 5 primary (HOME/DO/READ/CHAT/MAP) + 6 detail
+(MOOD/PROFILE/NOTE_NEW/NOTE_EDIT/CHAT_DETAIL/SETTINGS).
 
 ---
 
@@ -190,7 +255,7 @@ Stack-Verwaltung — nur "open / close one at a time".
 ├── firmware/
 │   ├── platformio.ini                    ← Build config (T5-ePaper-S3 board)
 │   ├── boards/T5-ePaper-S3.json          ← LILYGO custom board
-│   ├── src/main.cpp                      ← Alles (~2400 lines)
+│   ├── src/main.cpp                      ← Alles (~2800 lines)
 │   └── lib/
 │       ├── epdiy/                        ← E-Paper driver (vendored)
 │       ├── lvgl/                         ← UI framework v8.3 (vendored)
@@ -202,11 +267,13 @@ Stack-Verwaltung — nur "open / close one at a time".
 
 ---
 
-## Nächste Schritte (Lucas-prio)
+## Was als nächstes lohnt (nicht eilig)
 
-1. **Mood-Picker** — Tap auf Mood-Pill am Home → 8-Preset-Picker
-   (`camp/sport/food/drink/spont/games/walk/read`) → persistiert active_mood
-2. **Notes-Editor** (Stage 6) — Markdown-Editor in READ/Notizen
-3. *(später)* Compose-Erweiterung mit Cat/Deadline/Recurring-Chips
-4. *(später)* Habits 0:00-Rollover + RTC-Integration
-5. *(später)* Polish: Pet-Pfoten, Date-Kicker dynamisch, Settings-Screen
+1. **PCF85063 RTC** wiring → echte Datum/Zeit + Habit-Midnight-Rollover
+2. **BQ27220** Battery readout → echte Battery-Anzeige
+3. **Calendar Event Compose** → "+ termin" mit Place + Visibility chips
+4. **Chat Reply Stub** → einfaches "ANTWORTEN" mit Tastatur (in-RAM only first)
+5. **Onboarding First-Boot** → Handle entry für leeres g_settings.handle
+6. **Pet Variants** + Accessories → parametric ears/belly + worn item layer
+7. **Markdown Bold/Italic** im Read-Mode (`**bold**` / `*italic*` inline)
+8. **Stage 8 LoRa+MeshCore** — Sync mit anderen Mokis (Heidelberg-Mesh)

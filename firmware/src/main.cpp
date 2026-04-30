@@ -1212,7 +1212,13 @@ static void build_stat_tile(lv_obj_t *parent, const char *kicker,
   lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(tile, on_element_tapped,
+  static auto on_stat_cb = [](lv_event_t *e) {
+    const char *id = (const char *)lv_event_get_user_data(e);
+    if (!strcmp(id, "stat-gewohn")) { current_do_tab = DO_HABITS; switch_screen(SCR_DO); }
+    else if (!strcmp(id, "stat-aufgab")) { current_do_tab = DO_TODOS;  switch_screen(SCR_DO); }
+    else if (!strcmp(id, "stat-nah"))    { current_map_tab = MAP_NEARBY; switch_screen(SCR_MAP); }
+  };
+  lv_obj_add_event_cb(tile, on_stat_cb,
                       LV_EVENT_CLICKED, (void *)tap_id);
 
   lv_obj_t *k = lv_label_create(tile);
@@ -1365,9 +1371,18 @@ static void build_home_content(lv_obj_t *parent) {
   lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_SPACE_BETWEEN,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  build_stat_tile(tiles, "GEWOHN", "1/4", "heute",      "stat-gewohn");
-  build_stat_tile(tiles, "AUFGAB", "3",   "offen",      "stat-aufgab");
-  build_stat_tile(tiles, "NAH",    "3",   "in der nähe", "stat-nah");
+  // Live counts
+  int habits_done = 0, todos_open = 0;
+  for (int i = 0; i < g_habits_count; i++) if (g_habits[i].today_count > 0) habits_done++;
+  for (int i = 0; i < g_todos_count; i++)  if (!g_todos[i].done) todos_open++;
+  char gewohn_v[16], aufgab_v[16], nah_v[16];
+  snprintf(gewohn_v, sizeof(gewohn_v), "%d/%d", habits_done, g_habits_count);
+  snprintf(aufgab_v, sizeof(aufgab_v), "%d", todos_open);
+  snprintf(nah_v,    sizeof(nah_v),    "%d", SAMPLE_NEARBY_COUNT);
+
+  build_stat_tile(tiles, "GEWOHN", gewohn_v, "heute",       "stat-gewohn");
+  build_stat_tile(tiles, "AUFGAB", aufgab_v, "offen",       "stat-aufgab");
+  build_stat_tile(tiles, "NAH",    nah_v,    "in der nähe", "stat-nah");
 }
 
 // ----------------------------------------------------------------------------
