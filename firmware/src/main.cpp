@@ -3368,6 +3368,68 @@ static void build_chats_content(lv_obj_t *parent) {
   for (int i = 0; i < SAMPLE_CHATS_COUNT; i++) {
     build_chat_row(col, &SAMPLE_CHATS[i]);
   }
+
+  // ── DEINE MOKIS — discovered MeshCore contacts ────────────────────────
+  // (Forward decls — actual defs are below in the LoRa-Compose section.)
+  extern int g_dm_target_idx;
+  extern void open_lora_compose(void);
+
+  int n_contacts = moki_mesh_contact_count();
+  if (n_contacts > 0) {
+    lv_obj_t *gap = lv_obj_create(col);
+    lv_obj_remove_style_all(gap);
+    lv_obj_set_size(gap, LV_PCT(100), 16);
+
+    lv_obj_t *kicker2 = lv_label_create(col);
+    lv_label_set_text(kicker2, "DEINE MOKIS");
+    lv_obj_set_style_text_font(kicker2, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(kicker2, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(kicker2, 3, LV_PART_MAIN);
+
+    lv_obj_t *sub = lv_label_create(col);
+    lv_label_set_text(sub, "im mesh entdeckt — tippen für direkt-nachricht.");
+    lv_obj_set_style_text_font(sub, &moki_fraunces_italic_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sub, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_width(sub, LV_PCT(100));
+    lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_pad_bottom(sub, 8, LV_PART_MAIN);
+
+    static auto on_contact_clicked = [](lv_event_t *e) {
+      g_dm_target_idx = (int)(intptr_t)lv_event_get_user_data(e);
+      open_lora_compose();   // reuse the existing compose overlay
+    };
+    for (int i = 0; i < n_contacts; i++) {
+      char name[40]; uint8_t key4[4];
+      if (!moki_mesh_get_contact(i, name, sizeof(name), key4)) continue;
+
+      lv_obj_t *row = lv_obj_create(col);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_style_pad_top(row, 8, LV_PART_MAIN);
+      lv_obj_set_style_pad_bottom(row, 8, LV_PART_MAIN);
+      lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+      lv_obj_set_style_border_color(row, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+      lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, on_contact_clicked, LV_EVENT_CLICKED,
+                          (void *)(intptr_t)i);
+
+      lv_obj_t *nl = lv_label_create(row);
+      lv_label_set_text(nl, name);
+      lv_obj_set_style_text_font(nl, &moki_fraunces_italic_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(nl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+      char id_buf[32];
+      snprintf(id_buf, sizeof(id_buf), "id %02x%02x%02x%02x",
+               key4[0], key4[1], key4[2], key4[3]);
+      lv_obj_t *il = lv_label_create(row);
+      lv_label_set_text(il, id_buf);
+      lv_obj_set_style_text_font(il, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(il, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(il, 1, LV_PART_MAIN);
+    }
+  }
 }
 
 static void build_chats(void) {
@@ -4342,6 +4404,8 @@ static void on_lora_send_clicked(lv_event_t *e) { open_lora_compose(); }
 static void lora_apply_preset(uint8_t preset);
 extern void show_toast(const char *msg);
 static void enter_deep_sleep(uint32_t wake_after_seconds);
+extern void open_lora_compose(void);
+extern int  g_dm_target_idx;
 
 static void on_lora_preset_picked(lv_event_t *e) {
   uint8_t preset = (uint8_t)(intptr_t)lv_event_get_user_data(e);
@@ -4674,6 +4738,11 @@ void build_chat_detail(void) {
 static bool lora_send(const char *text);
 
 // ============================================================================
+// When >= 0, LoRa-Compose sends a DIRECT message to that contact index
+// instead of broadcasting to the active channel. Reset to -1 after send.
+// Non-static so the chats-list contact-tap handler can set it from above.
+int g_dm_target_idx = -1;
+
 // LoRa-Compose — small overlay reusing the German keyboard for chat input.
 // ============================================================================
 static char       g_lora_compose[160] = "";
@@ -4689,16 +4758,29 @@ static void on_lora_compose_cancel(lv_event_t *e) {
 }
 static void on_lora_compose_save(lv_event_t *e) {
   if (g_lora_compose[0] == 0) { lora_compose_close(); return; }
-  // Route through MeshCore (M7) when armed — the encrypted, repeater-aware
-  // path that two distant Mokis can actually use across HD.
   bool ok = false;
+  bool was_dm = (g_dm_target_idx >= 0);
   if (g_settings.lora_tx_armed) {
-    ok = moki_mesh_send(g_settings.handle, g_lora_compose);
-    // Echo locally so the sender sees their own message.
-    if (ok) lora_push_msg(g_settings.handle, g_lora_compose, 0);
+    if (was_dm) {
+      // Direct-Message to a specific contact (M4 Phase 2).
+      ok = moki_mesh_dm(g_dm_target_idx, g_lora_compose);
+      if (ok) {
+        char from[32]; uint8_t key4[4];
+        moki_mesh_get_contact(g_dm_target_idx, from, sizeof(from), key4);
+        char tag[40];
+        snprintf(tag, sizeof(tag), "dm → %s", from);
+        lora_push_msg(tag, g_lora_compose, 0);
+      }
+    } else {
+      // Group-channel broadcast.
+      ok = moki_mesh_send(g_settings.handle, g_lora_compose);
+      if (ok) lora_push_msg(g_settings.handle, g_lora_compose, 0);
+    }
   }
-  show_toast(ok ? "GESENDET ÜBER MESH" : "TX NICHT FREI · ANTENNE PRÜFEN");
+  show_toast(ok ? (was_dm ? "DM GESENDET" : "GESENDET ÜBER MESH")
+                : "TX NICHT FREI · ANTENNE PRÜFEN");
   g_lora_compose[0] = 0;
+  g_dm_target_idx = -1;   // reset DM mode regardless of result
   lora_compose_close();
   switch_screen(SCR_CHAT_DETAIL);
 }
@@ -5700,6 +5782,16 @@ void loop() {
 
   // RTC tick — habit midnight rollover (cheap, runs ~once / 30s)
   rtc_tick();
+
+  // Periodic self-advert — fires once 5s after boot, then every 15 min, so
+  // other Mokis can discover this one without manual `advert` commands.
+  // Requires TX armed (otherwise we'd risk damage on antenna-less Mokis).
+  static uint32_t next_advert_ms = 5000;
+  if (g_settings.lora_tx_armed && g_lora_ready &&
+      millis() > next_advert_ms) {
+    moki_mesh_advert(g_settings.handle);
+    next_advert_ms = millis() + 15UL * 60UL * 1000UL;  // every 15 min
+  }
 
   // Host-driven synthetic touch + diagnostic commands
   poll_serial();
