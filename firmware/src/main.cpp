@@ -80,9 +80,13 @@ typedef struct {
   bool done;
 } moki_todo_t;
 typedef struct {
-  uint8_t day; const char *hour; const char *title; const char *place;
-  const char *kind;       // private/friends/public
+  uint8_t day;
+  char hour[8];
+  char title[64];
+  char place[48];
+  char kind[12];           // private/friends/public
 } moki_event_t;
+#define MAX_EVENTS 16
 
 struct sample_habit_def { const char *name; uint8_t today; uint8_t streak; float intensity; };
 static const sample_habit_def SAMPLE_HABITS_DEF[] = {
@@ -204,6 +208,39 @@ static const moki_event_t SAMPLE_EVENTS[] = {
   { 5, "20:30", "lesekreis · walden",         "café frieda", "public"  },
 };
 static const int SAMPLE_EVENTS_COUNT = sizeof(SAMPLE_EVENTS) / sizeof(SAMPLE_EVENTS[0]);
+
+static moki_event_t g_events[MAX_EVENTS];
+static int g_events_count = 0;
+
+static void state_init_events(void) {
+  for (int i = 0; i < SAMPLE_EVENTS_COUNT && i < MAX_EVENTS; i++) g_events[i] = SAMPLE_EVENTS[i];
+  g_events_count = SAMPLE_EVENTS_COUNT;
+}
+static void state_save_events(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt("events_n", (uint32_t)g_events_count);
+  if (g_events_count > 0)
+    g_prefs.putBytes("events", g_events, sizeof(moki_event_t) * g_events_count);
+  else
+    g_prefs.remove("events");
+  g_prefs.end();
+  Serial.printf("[persist] saved %d events\n", g_events_count);
+}
+static void state_load_events(void) {
+  g_prefs.begin("moki", true);
+  uint32_t n = g_prefs.getUInt("events_n", 0xFFFFFFFFu);
+  if (n != 0xFFFFFFFFu && n <= MAX_EVENTS) {
+    g_events_count = (int)n;
+    if (g_events_count > 0)
+      g_prefs.getBytes("events", g_events, sizeof(moki_event_t) * g_events_count);
+    g_prefs.end();
+    Serial.printf("[persist] loaded %d events\n", g_events_count);
+  } else {
+    g_prefs.end();
+    state_init_events();
+    state_save_events();
+  }
+}
 
 // Chats — direct/group/public with optional reset cadence
 typedef struct {
@@ -418,6 +455,7 @@ static void on_note_delete(lv_event_t *e);
 static void on_note_mode_toggle(lv_event_t *e);
 void open_compose_todo(void);
 void open_compose_habit(void);
+void open_compose_event(void);
 
 // Active note + edit-mode state
 static int g_active_note   = -1;          // index into g_notes
@@ -496,7 +534,7 @@ static void on_map_tab_clicked(lv_event_t *e) {
 // ============================================================================
 // Compose sheet — shared state + helpers
 // ============================================================================
-typedef enum { COMPOSE_TODO, COMPOSE_HABIT } compose_kind_t;
+typedef enum { COMPOSE_TODO, COMPOSE_HABIT, COMPOSE_EVENT } compose_kind_t;
 static compose_kind_t g_compose_kind     = COMPOSE_TODO;
 static char        g_compose_title[64]   = "";
 static char        g_compose_cat[16]     = "self";
@@ -528,7 +566,7 @@ static void compose_save(void) {
     Serial.printf("[compose] saved todo: '%s'\n", t->title);
     state_save_todos();
     show_toast("AUFGABE GESPEICHERT");
-  } else { // COMPOSE_HABIT
+  } else if (g_compose_kind == COMPOSE_HABIT) {
     if (g_habits_count >= MAX_HABITS) return;
     moki_habit_t *h = &g_habits[g_habits_count++];
     strncpy(h->name, g_compose_title, sizeof(h->name)-1); h->name[sizeof(h->name)-1] = 0;
@@ -537,6 +575,17 @@ static void compose_save(void) {
     Serial.printf("[compose] saved habit: '%s'\n", h->name);
     state_save_habits();
     show_toast("GEWOHNHEIT GESPEICHERT");
+  } else { // COMPOSE_EVENT
+    if (g_events_count >= MAX_EVENTS) return;
+    moki_event_t *ev = &g_events[g_events_count++];
+    strncpy(ev->title, g_compose_title, sizeof(ev->title)-1); ev->title[sizeof(ev->title)-1] = 0;
+    strncpy(ev->place, g_compose_cat,   sizeof(ev->place)-1); ev->place[sizeof(ev->place)-1] = 0;
+    strcpy(ev->kind, "private");
+    strcpy(ev->hour, "19:00");
+    ev->day = 2;
+    Serial.printf("[compose] saved event: '%s'\n", ev->title);
+    state_save_events();
+    show_toast("TERMIN GESPEICHERT");
   }
 
   g_compose_title[0]    = 0;
@@ -545,7 +594,9 @@ static void compose_save(void) {
   g_compose_recurring   = false;
   compose_close();
   // Re-arm the DO screen so we pick the right tab
-  current_do_tab = (g_compose_kind == COMPOSE_TODO) ? DO_TODOS : DO_HABITS;
+  current_do_tab = (g_compose_kind == COMPOSE_TODO) ? DO_TODOS
+                 : (g_compose_kind == COMPOSE_HABIT) ? DO_HABITS
+                                                    : DO_CALENDAR;
   switch_screen(SCR_DO);
 }
 
@@ -635,6 +686,7 @@ static void build_compose_overlay(void);
 
 void open_compose_todo(void)  { g_compose_kind = COMPOSE_TODO;  build_compose_overlay(); }
 void open_compose_habit(void) { g_compose_kind = COMPOSE_HABIT; build_compose_overlay(); }
+void open_compose_event(void) { g_compose_kind = COMPOSE_EVENT; build_compose_overlay(); }
 
 static void build_compose_overlay(void) {
   if (g_compose_overlay) {
@@ -672,7 +724,10 @@ static void build_compose_overlay(void) {
   lv_obj_add_event_cb(cancel, on_cancel_clicked, LV_EVENT_CLICKED, NULL);
 
   lv_obj_t *t = lv_label_create(hdr);
-  lv_label_set_text(t, g_compose_kind == COMPOSE_TODO ? "NEUE AUFGABE" : "NEUE GEWOHNHEIT");
+  lv_label_set_text(t,
+      g_compose_kind == COMPOSE_TODO  ? "NEUE AUFGABE"
+    : g_compose_kind == COMPOSE_HABIT ? "NEUE GEWOHNHEIT"
+                                      : "NEUER TERMIN");
   lv_obj_set_style_text_font(t, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(t, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(t, 3, LV_PART_MAIN);
@@ -1860,8 +1915,8 @@ static void build_do_content(lv_obj_t *parent) {
     lv_obj_set_style_pad_top(hdr, 12, LV_PART_MAIN);
     lv_obj_set_style_pad_bottom(hdr, 4, LV_PART_MAIN);
 
-    for (int i = 0; i < SAMPLE_EVENTS_COUNT; i++) {
-      const moki_event_t *ev = &SAMPLE_EVENTS[i];
+    for (int i = 0; i < g_events_count; i++) {
+      const moki_event_t *ev = &g_events[i];
       lv_obj_t *row = lv_obj_create(body);
       lv_obj_remove_style_all(row);
       lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
@@ -1901,6 +1956,26 @@ static void build_do_content(lv_obj_t *parent) {
       lv_obj_set_style_text_color(p, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
       lv_obj_set_style_pad_top(p, 3, LV_PART_MAIN);
     }
+
+    // "+ TERMIN" button
+    lv_obj_t *add = lv_obj_create(body);
+    lv_obj_remove_style_all(add);
+    lv_obj_set_size(add, LV_PCT(100), 56);
+    lv_obj_set_style_border_color(add, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(add, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(add, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(add, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(add, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(add, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(add, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(add, [](lv_event_t *){ open_compose_event(); },
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *plus = lv_label_create(add);
+    lv_label_set_text(plus, "+ NEUER TERMIN");
+    lv_obj_set_style_text_font(plus, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(plus, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(plus, 3, LV_PART_MAIN);
   }
 }
 
@@ -3011,6 +3086,28 @@ static void on_note_mode_toggle(lv_event_t *e) {
   switch_screen(SCR_NOTE_EDIT);
 }
 
+// Strip simple inline markdown markers (**bold** and *italic*) from a line.
+// We don't have proper inline runs in LVGL labels, so we just strip the
+// punctuation and let the line read cleanly.
+static String strip_inline_md(const String &s) {
+  String out;
+  out.reserve(s.length());
+  int from = 0;
+  while (from < (int)s.length()) {
+    int p_b = s.indexOf("**", from);
+    int p_i = s.indexOf('*', from);
+    int p   = (p_b >= 0 && (p_i < 0 || p_b <= p_i)) ? p_b : p_i;
+    if (p < 0) { out += s.substring(from); break; }
+    out += s.substring(from, p);
+    int mlen  = (p == p_b) ? 2 : 1;
+    int close = s.indexOf((p == p_b) ? "**" : "*", p + mlen);
+    if (close < 0) { out += s.substring(p); break; }
+    out += s.substring(p + mlen, close);
+    from = close + mlen;
+  }
+  return out;
+}
+
 // Rough markdown line renderer — appends labels for each line into a column.
 // Subset: # H1, ## H2, ### H3, - bullet, > quote, --- divider, plain text.
 static void render_markdown_into(lv_obj_t *parent, const char *text) {
@@ -3039,23 +3136,22 @@ static void render_markdown_into(lv_obj_t *parent, const char *text) {
     }
 
     const lv_font_t *font = &moki_fraunces_italic_22;
-    const char *txt = line.c_str();
+    String body_line = line;
     int color = MOKI_INK;
     if (line.startsWith("# ")) {
       font = &moki_fraunces_italic_36;
-      txt = line.c_str() + 2;
+      body_line = line.substring(2);
     } else if (line.startsWith("## ")) {
       font = &moki_fraunces_regular_36;
-      txt = line.c_str() + 3;
+      body_line = line.substring(3);
     } else if (line.startsWith("### ")) {
       font = &moki_fraunces_italic_28;
-      txt = line.c_str() + 4;
+      body_line = line.substring(4);
     } else if (line.startsWith("- ")) {
-      // bullet rendered with ASCII fallback (• missing in JB Mono)
       font = &moki_fraunces_italic_22;
-      String bullet = String("·  ") + line.substring(2);
+      body_line = String("·  ") + strip_inline_md(line.substring(2));
       lv_obj_t *l = lv_label_create(parent);
-      lv_label_set_text(l, bullet.c_str());
+      lv_label_set_text(l, body_line.c_str());
       lv_obj_set_style_text_font(l, font, LV_PART_MAIN);
       lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
       lv_obj_set_width(l, LV_PCT(100));
@@ -3063,12 +3159,13 @@ static void render_markdown_into(lv_obj_t *parent, const char *text) {
       continue;
     } else if (line.startsWith("> ")) {
       font = &moki_fraunces_italic_22;
-      txt = line.c_str() + 2;
+      body_line = line.substring(2);
       color = MOKI_DARK;
     }
 
+    String stripped = strip_inline_md(body_line);
     lv_obj_t *l = lv_label_create(parent);
-    lv_label_set_text(l, txt);
+    lv_label_set_text(l, stripped.c_str());
     lv_obj_set_style_text_font(l, font, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
     lv_obj_set_width(l, LV_PCT(100));
@@ -3699,6 +3796,7 @@ void setup() {
   state_load_mood();
   state_load_notes();
   state_load_settings();
+  state_load_events();
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
