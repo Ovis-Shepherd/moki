@@ -115,11 +115,45 @@ Während der Nacht-Session haben wir einen **vollständigen autonomen Debug-Loop
 - **RX-only by default** — sicher ohne Antenne (output_power=0 dBm)
 - **TX nur wenn `g_settings.lora_tx_armed = true`** (toggle in Settings)
 - Bei TX: kurz auf 14 dBm bumpen, transmit, zurück auf 0 dBm, re-arm RX
-- **Protokoll:** `MOKI|<handle>|<text>` ASCII-Pakete, max 200 Bytes
+- **Protokoll:** `MOKI|<handle>|<text>` ASCII-Pakete, max 200 Bytes (custom, **deprecated** — wird durch MeshCore ersetzt, siehe unten)
 - **Ring-Buffer** für 32 zuletzt empfangene Messages (RAM, kein Persist)
 - Chat-Detail zeigt Status (RX/TX-Counts, ARMED-Flag), Bubbles mit RSSI
 - Compose-Overlay mit deutscher Tastatur, "SENDEN" → `lora_send()`
 - **Antennen-Sicherheits-Hint** in Settings als italic-text
+- **Scan-Commands** (Serial): `lora_preset_meshtastic_lf` / `lora_preset_meshcore` / `lora_freq <MHz>` / `lora_sf <n>` / `lora_sync <hex>` — 2026-04-30 verifiziert, fängt echtes Meshtastic-Traffic in HD
+
+### MeshCore-Migration (2026-04-30, Phase 1 prepared)
+**Strategische Entscheidung:** Custom-`MOKI|`-Protokoll wird durch **MeshCore** ersetzt:
+- `rhein-neckar-mesh.de` läuft MeshCore — sofort lokale Anbindung möglich
+- Companion-Rolle passt zu „moki schläft, moki wacht" (kein Relay-Duty)
+- 64-Hop-Reichweite vs Meshtastic 7
+- AES-CCM Channel-PSK (gleiche Krypto-Stärke wie Meshtastic)
+
+**Phase 1 — vendored & ready (kein Hardware-Test nötig):**
+- ✅ `lib/MeshCore/` ← MeshCore 1.10.0 source (~952K, MIT)
+- ✅ `lib/Crypto/` ← rweather/Crypto (AES, Curve25519, etc., ~1.1M)
+- ✅ `lib/RadioLib_v7/` ← RadioLib 7.6.0 (separat vom aktiven 6.5.0)
+- ✅ `variants/lilygo_t5_s3_epaper_pro/target.{h,cpp}` ← Pin-Map gefolgt von t3s3-Pattern
+- ✅ Build mit alten Libs **grün** verifiziert (PIO LDF zieht neue Libs nicht autom. ein)
+
+**Phase 2 — am Device (≈2-3h, vorbereitet):**
+1. `platformio.ini` Build-Flags aktivieren (`USE_SX1262`, `RADIO_CLASS=CustomSX1262`, `WRAPPER_CLASS=CustomSX1262Wrapper`, `MC_VARIANT=lilygo_t5_s3_epaper_pro`, `LORA_FREQ`, `LORA_BW`, `LORA_SF`, `LORA_CR`, `LORA_TX_POWER`)
+2. RadioLib auf v7.6.0 swappen (lib/RadioLib → archive, lib/RadioLib_v7 → lib/RadioLib)
+3. main.cpp Pin-#defines exportieren als `P_LORA_*` (matched MeshCore convention)
+4. `MyMesh : public BaseChatMesh, ContactVisitor` Klasse anlegen, Hook-Callbacks ins existing g_lora_msgs Ring-Buffer
+5. Serial-Scan-Commands deaktivieren (kollidieren mit MeshCore radio)
+6. Settings-Screen: Channel-PSK-Input (Base64 String) + Frequenz-Picker
+7. Persist Identity + Contacts via LittleFS (NVS reicht nicht — zu groß)
+8. Build + Flash + Test: erst Loopback (gleiche PSK auf beiden Geräten), dann RN-Mesh
+
+**Phase 3 — RN-Mesh Connect (≈1h, blockiert auf Lucas):**
+
+⚠️ **Open Questions vor Phase 3:**
+- [ ] Exakte LoRa-Params der Rhein-Neckar-Mesh? (Frequenz nicht 869.525 sicher; SF/CR/BW?)
+- [ ] Channel-PSK des `#rhein-neckar` Channels? (vermutlich öffentlich oder via Telegram-Gruppe verteilt)
+- [ ] Repeater-Liste? (Prefix `HDB-` per Memory, aber genaue Standorte/IDs?)
+- [ ] Welche MeshCore-Version läuft im Mesh? (Companion v1 vs v2 Protokoll-Spec)
+- [ ] Erstkontakt: Telegram/Discord-Gruppe der Rhein-Neckar-Mesh, dort Begrüßung + PSK-Austausch
 
 ### KARTE (2 Tabs)
 

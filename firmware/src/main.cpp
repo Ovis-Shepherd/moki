@@ -10,6 +10,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -42,6 +43,10 @@ static bool              g_lora_ready      = false;
 static const char       *g_lora_status     = "INIT";
 static uint32_t          g_lora_rx_count   = 0;
 static uint32_t          g_lora_tx_count   = 0;
+// Last RX diagnostics — surfaced on the chat-detail screen.
+static int16_t           g_lora_last_rssi  = 0;
+static float             g_lora_last_snr   = 0.0f;
+static uint32_t          g_lora_last_rx_ms = 0;
 
 // --- Moki palette (mirrors simulator exactly) -------------------------------
 #define MOKI_PAPER  0xE8E2D1
@@ -107,6 +112,7 @@ typedef struct {
   char kind[12];           // private/friends/public
 } moki_event_t;
 #define MAX_EVENTS 16
+#define EVENTS_SCHEMA_V 1
 
 struct sample_habit_def { const char *name; uint8_t today; uint8_t streak; float intensity; };
 static const sample_habit_def SAMPLE_HABITS_DEF[] = {
@@ -146,6 +152,7 @@ static const int SAMPLE_TODOS_COUNT = sizeof(SAMPLE_TODOS) / sizeof(SAMPLE_TODOS
 // Runtime todos — compose-sheet save appends here. Initialized from
 // SAMPLE_TODOS in setup(). Persistence to LittleFS comes in Stage 3.
 #define MAX_TODOS 32
+#define TODOS_SCHEMA_V 1
 static moki_todo_t g_todos[MAX_TODOS];
 static int g_todos_count = 0;
 
@@ -161,6 +168,7 @@ static Preferences g_prefs;
 
 static void state_save_todos(void) {
   g_prefs.begin("moki", false);
+  g_prefs.putUInt("todos_v", TODOS_SCHEMA_V);
   g_prefs.putUInt("todos_n", (uint32_t)g_todos_count);
   if (g_todos_count > 0) {
     g_prefs.putBytes("todos", g_todos, sizeof(moki_todo_t) * g_todos_count);
@@ -173,17 +181,30 @@ static void state_save_todos(void) {
 
 static void state_load_todos(void) {
   g_prefs.begin("moki", true);                     // read-only
+  // todos_v: 0 = legacy (no version key, treat as v1 layout)
+  //          1 = current
+  uint32_t v = g_prefs.getUInt("todos_v", 0);
   uint32_t n = g_prefs.getUInt("todos_n", 0xFFFFFFFFu);
-  if (n != 0xFFFFFFFFu && n <= MAX_TODOS) {
+  bool ok = (n != 0xFFFFFFFFu && n <= MAX_TODOS);
+  // Accept legacy (v=0) for backward-compat — same struct layout.
+  if (ok && (v == 0 || v == TODOS_SCHEMA_V)) {
     g_todos_count = (int)n;
     if (g_todos_count > 0) {
       g_prefs.getBytes("todos", g_todos, sizeof(moki_todo_t) * g_todos_count);
     }
     g_prefs.end();
-    Serial.printf("[persist] loaded %d todos from NVS\n", g_todos_count);
+    Serial.printf("[persist] loaded %d todos (v=%lu)\n",
+                  g_todos_count, (unsigned long)v);
+    if (v == 0) state_save_todos();  // upgrade legacy in place
+  } else if (ok) {
+    g_prefs.end();
+    Serial.printf("[persist] todos schema mismatch (got v=%lu, want %d) — keeping defaults\n",
+                  (unsigned long)v, TODOS_SCHEMA_V);
+    state_init_todos();
+    state_save_todos();
   } else {
     g_prefs.end();
-    Serial.println(F("[persist] NVS empty — bootstrapping with sample data"));
+    Serial.println(F("[persist] NVS empty — bootstrapping with sample todos"));
     state_init_todos();
     state_save_todos();
   }
@@ -238,6 +259,7 @@ static void state_init_events(void) {
 }
 static void state_save_events(void) {
   g_prefs.begin("moki", false);
+  g_prefs.putUInt("events_v", EVENTS_SCHEMA_V);
   g_prefs.putUInt("events_n", (uint32_t)g_events_count);
   if (g_events_count > 0)
     g_prefs.putBytes("events", g_events, sizeof(moki_event_t) * g_events_count);
@@ -248,13 +270,23 @@ static void state_save_events(void) {
 }
 static void state_load_events(void) {
   g_prefs.begin("moki", true);
+  uint32_t v = g_prefs.getUInt("events_v", 0);
   uint32_t n = g_prefs.getUInt("events_n", 0xFFFFFFFFu);
-  if (n != 0xFFFFFFFFu && n <= MAX_EVENTS) {
+  bool ok = (n != 0xFFFFFFFFu && n <= MAX_EVENTS);
+  if (ok && (v == 0 || v == EVENTS_SCHEMA_V)) {
     g_events_count = (int)n;
     if (g_events_count > 0)
       g_prefs.getBytes("events", g_events, sizeof(moki_event_t) * g_events_count);
     g_prefs.end();
-    Serial.printf("[persist] loaded %d events\n", g_events_count);
+    Serial.printf("[persist] loaded %d events (v=%lu)\n",
+                  g_events_count, (unsigned long)v);
+    if (v == 0) state_save_events();
+  } else if (ok) {
+    g_prefs.end();
+    Serial.printf("[persist] events schema mismatch (v=%lu, want %d) — defaults\n",
+                  (unsigned long)v, EVENTS_SCHEMA_V);
+    state_init_events();
+    state_save_events();
   } else {
     g_prefs.end();
     state_init_events();
@@ -418,51 +450,237 @@ typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
                SCR_CHAT_DETAIL,
                SCR_SETTINGS } screen_id_t;
 
-// Settings (persistent)
+// LoRa preset IDs — mirrored in lora_apply_preset()
+enum {
+  LORA_PRESET_MOKI            = 0,  // 868.0/BW250/SF10/CR6/sync 0xAB — private Moki-Welle
+  LORA_PRESET_MESHCORE_NARROW = 1,  // 869.618/BW62.5/SF8/CR8/sync 0x12 — RN-Mesh (Standard seit Oct 2025)
+  LORA_PRESET_MESHCORE_LEGACY = 2,  // 869.525/BW250/SF11/CR5/sync 0x12 — MeshCore pre-2025
+  LORA_PRESET_MESHTASTIC_LF   = 3,  // 869.525/BW250/SF11/CR5/sync 0x2B — andere HD-User auf Meshtastic
+};
+#define LORA_PRESET_COUNT 4
+static const char *LORA_PRESET_LABELS[LORA_PRESET_COUNT] = {
+  "moki", "narrow", "legacy", "mtast"
+};
+
+// Settings (persistent). Order matters: new fields APPENDED, not inserted, so
+// older NVS blobs still load correctly via partial-match in state_load_settings.
+// SCHEMA POLICY:
+//   - v1: initial layout (sync_interval through lora_tx_armed)
+//   - v2: + lora_preset (uint8) appended
+//   Bump SETTINGS_SCHEMA_V whenever a field is reordered/removed/changed type.
+//   Pure appends keep the version (size-based partial-load handles them).
+#define SETTINGS_SCHEMA_V 2
 typedef struct {
   uint8_t  sync_interval_min;     // 5 / 15 / 30 / 60
   char     share_default[8];      // off / hourly / live
   char     handle[32];            // user handle
   char     bio[80];
   bool     lora_tx_armed;         // false = RX-only (safe without antenna)
+  uint8_t  lora_preset;           // LORA_PRESET_*
 } moki_settings_t;
-static moki_settings_t g_settings = { 30, "hourly", "levin", "liest langsam. läuft lieber.", false };
+static moki_settings_t g_settings = { 30, "hourly", "levin", "liest langsam. läuft lieber.", false,
+                                      LORA_PRESET_MESHCORE_NARROW };
 
-// LoRa-Chat ring buffer of recent messages
+// LoRa-Chat ring buffer of recent messages.
+// Body is stored as raw bytes (may contain non-printable / non-NUL-terminated).
 typedef struct {
-  char from[24];
-  char text[160];
-  int16_t rssi;
   uint32_t ts_ms;
+  int16_t  rssi;
+  int8_t   snr_x10;   // SNR * 10 — e.g. -75 = -7.5 dB
+  uint8_t  len;       // raw byte length (≤ sizeof(text))
+  uint8_t  preset;    // LORA_PRESET_* active when received
+  char     from[24];
+  char     text[160]; // raw payload bytes (NOT NUL-terminated guaranteed)
 } moki_lora_msg_t;
 #define LORA_MSG_CAP 32
 static moki_lora_msg_t g_lora_msgs[LORA_MSG_CAP];
 static int g_lora_msg_count = 0;          // total received (for ring index)
 static int g_lora_msg_head  = 0;          // ring buffer head
 
+// Forward decl — actual definition lives in the LittleFS section below.
+static void lora_persist_append(const moki_lora_msg_t *m);
+
 static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
   moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
   strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
-  strncpy(m->text, text, sizeof(m->text)-1); m->text[sizeof(m->text)-1] = 0;
+  size_t tlen = strlen(text);
+  if (tlen > sizeof(m->text)) tlen = sizeof(m->text);
+  memcpy(m->text, text, tlen);
+  m->len    = (uint8_t)tlen;
   m->rssi   = rssi;
+  m->snr_x10 = 0;
+  m->preset  = g_settings.lora_preset;
   m->ts_ms  = millis();
   g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
   if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
+  lora_persist_append(m);
+}
+
+// ── LittleFS-backed persistence for LoRa-Chat ─────────────────────────────
+// Stores raw moki_lora_msg_t records in append-only log /lora.log.
+// Survives reboots & battery-pulls (vs RAM ring buffer alone).
+//
+// Schema-Version 1 — sizeof(moki_lora_msg_t) is the record size.
+// If the struct layout changes, bump LORA_LOG_SCHEMA_V and add migration.
+#define LORA_LOG_PATH "/lora.log"
+#define LORA_LOG_SCHEMA_V 1
+#define LORA_LOG_MAX_BYTES (256u * 1024u)  // ~1300 messages → soft cap, then truncate
+
+static bool g_fs_ready = false;
+
+static void fs_mount(void) {
+  // .begin(format_on_fail=true) → if first boot or partition broken, format.
+  if (LittleFS.begin(true)) {
+    g_fs_ready = true;
+    Serial.printf("[fs] LittleFS mounted: total=%u used=%u\n",
+                  (unsigned)LittleFS.totalBytes(),
+                  (unsigned)LittleFS.usedBytes());
+  } else {
+    Serial.println(F("[fs] LittleFS mount FAILED — disk persistence disabled"));
+  }
+}
+
+// Forward decl — defined in the LittleFS section below.
+static void lora_persist_append(const moki_lora_msg_t *m);
+
+// Variant that also captures SNR and raw bytes (no NUL-termination assumption).
+static void lora_push_msg_raw(const char *from, const uint8_t *raw, size_t len,
+                              int16_t rssi, float snr) {
+  moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
+  strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
+  if (len > sizeof(m->text)) len = sizeof(m->text);
+  memcpy(m->text, raw, len);
+  m->len     = (uint8_t)len;
+  m->rssi    = rssi;
+  m->snr_x10 = (int8_t)(snr * 10.0f);
+  m->preset  = g_settings.lora_preset;
+  m->ts_ms   = millis();
+  g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
+  if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
+  lora_persist_append(m);
+}
+
+static void lora_persist_append(const moki_lora_msg_t *m) {
+  if (!g_fs_ready) return;
+  // Soft size cap: drop the file if it grows too big — simpler than full
+  // log compaction. Lucas can `lora_clear` anytime to reset deliberately.
+  if (LittleFS.exists(LORA_LOG_PATH)) {
+    File probe = LittleFS.open(LORA_LOG_PATH, "r");
+    if (probe && probe.size() >= LORA_LOG_MAX_BYTES) {
+      probe.close();
+      LittleFS.remove(LORA_LOG_PATH);
+      Serial.println(F("[fs] lora.log capped — truncated to 0"));
+    } else if (probe) {
+      probe.close();
+    }
+  }
+  File f = LittleFS.open(LORA_LOG_PATH, "a");
+  if (!f) return;
+  f.write((const uint8_t *)m, sizeof(*m));
+  f.close();
+}
+
+static void lora_persist_load(void) {
+  if (!g_fs_ready) return;
+  if (!LittleFS.exists(LORA_LOG_PATH)) return;
+  File f = LittleFS.open(LORA_LOG_PATH, "r");
+  if (!f) return;
+  size_t total = f.size();
+  size_t rec   = sizeof(moki_lora_msg_t);
+  if (total < rec) { f.close(); return; }
+  size_t n_rec = total / rec;
+  // Read only the most-recent LORA_MSG_CAP records into the ring buffer.
+  size_t skip = (n_rec > LORA_MSG_CAP) ? (n_rec - LORA_MSG_CAP) : 0;
+  f.seek(skip * rec);
+  size_t loaded = 0;
+  while (loaded < LORA_MSG_CAP) {
+    moki_lora_msg_t m;
+    size_t got = f.read((uint8_t *)&m, rec);
+    if (got != rec) break;
+    g_lora_msgs[g_lora_msg_head] = m;
+    g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
+    if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
+    loaded++;
+  }
+  f.close();
+  Serial.printf("[fs] loaded %u lora msgs from disk (file had %u total)\n",
+                (unsigned)loaded, (unsigned)n_rec);
+}
+
+static void lora_persist_clear(void) {
+  if (!g_fs_ready) return;
+  if (LittleFS.exists(LORA_LOG_PATH)) LittleFS.remove(LORA_LOG_PATH);
+  Serial.println(F("[fs] lora.log removed"));
 }
 
 static void state_save_settings(void) {
   g_prefs.begin("moki", false);
+  g_prefs.putUInt("settings_v", SETTINGS_SCHEMA_V);
   g_prefs.putBytes("settings", &g_settings, sizeof(g_settings));
   g_prefs.end();
   Serial.println(F("[persist] saved settings"));
 }
+// ── Mesh-Identity (32-byte secret) ───────────────────────────────────────
+// Holds a per-device 32-byte secret. Used as:
+//   - PSK material for Moki↔Moki encrypted chat (AES-128 derived from first 16B)
+//   - Future MeshCore Ed25519 seed (when we wire BaseChatMesh in Phase 2c)
+// Stored under NVS key "identity" (32 raw bytes).
+//
+// Generated lazily: first boot creates it from RadioLib RNG (best entropy
+// source we have until MeshCore is active). Persisted thereafter.
+#define IDENTITY_SECRET_SIZE 32
+static uint8_t g_identity_secret[IDENTITY_SECRET_SIZE] = {0};
+static bool    g_identity_ready = false;
+
+static void state_load_identity(void) {
+  g_prefs.begin("moki", true);
+  size_t got = g_prefs.getBytes("identity", g_identity_secret, IDENTITY_SECRET_SIZE);
+  g_prefs.end();
+  if (got == IDENTITY_SECRET_SIZE) {
+    g_identity_ready = true;
+    Serial.printf("[persist] identity loaded (first byte: 0x%02x)\n",
+                  g_identity_secret[0]);
+  } else {
+    Serial.println(F("[persist] identity not yet generated"));
+  }
+}
+
+// Call after lora_init so we have RadioLib RNG available.
+static void state_ensure_identity(void) {
+  if (g_identity_ready) return;
+  // Use SX1262 random hardware (RSSI noise) — best entropy source on this MCU.
+  for (int i = 0; i < IDENTITY_SECRET_SIZE; i++) {
+    if (g_lora_ready) {
+      g_identity_secret[i] = (uint8_t)(g_radio.random(256));
+    } else {
+      // Fallback: ESP32 hardware RNG via esp_random()
+      g_identity_secret[i] = (uint8_t)(esp_random() & 0xFF);
+    }
+  }
+  g_prefs.begin("moki", false);
+  g_prefs.putBytes("identity", g_identity_secret, IDENTITY_SECRET_SIZE);
+  g_prefs.end();
+  g_identity_ready = true;
+  Serial.printf("[persist] generated new identity (first byte: 0x%02x)\n",
+                g_identity_secret[0]);
+}
+
 static void state_load_settings(void) {
+  // Backward-compat: older NVS blobs are smaller (no lora_preset). Read up to
+  // the actual stored size; uninitialized tail keeps the defaults from the
+  // global initializer.
   g_prefs.begin("moki", true);
   size_t got = g_prefs.getBytes("settings", &g_settings, sizeof(g_settings));
   g_prefs.end();
-  if (got == sizeof(g_settings)) {
-    Serial.printf("[persist] loaded settings (sync=%u handle='%s')\n",
-                  (unsigned)g_settings.sync_interval_min, g_settings.handle);
+  if (got >= sizeof(g_settings) - 1) {
+    Serial.printf("[persist] loaded settings (sync=%u handle='%s' preset=%u)\n",
+                  (unsigned)g_settings.sync_interval_min, g_settings.handle,
+                  (unsigned)g_settings.lora_preset);
+  } else if (got > 0) {
+    Serial.printf("[persist] migrated old settings (%u→%u bytes), preset default\n",
+                  (unsigned)got, (unsigned)sizeof(g_settings));
+    g_settings.lora_preset = LORA_PRESET_MESHCORE_NARROW;
+    state_save_settings();
   } else {
     Serial.println(F("[persist] settings empty — using defaults"));
     state_save_settings();
@@ -3740,6 +3958,23 @@ static const chat_msg_t MSGS_RHEIN[] = {
 extern void open_lora_compose(void);
 static void on_lora_send_clicked(lv_event_t *e) { open_lora_compose(); }
 
+// Forward decls — actual definitions live in the LoRa section below.
+static void lora_apply_preset(uint8_t preset);
+extern void show_toast(const char *msg);
+
+static void on_lora_preset_picked(lv_event_t *e) {
+  uint8_t preset = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+  if (preset >= LORA_PRESET_COUNT) return;
+  g_settings.lora_preset = preset;
+  state_save_settings();
+  if (g_lora_ready) lora_apply_preset(preset);
+  // Don't wipe last_rx — the ring buffer still has those packets and the
+  // "vor Xs" age is genuinely informative across preset switches.
+  char msg[32];
+  snprintf(msg, sizeof(msg), "preset · %s", LORA_PRESET_LABELS[preset]);
+  show_toast(msg);
+}
+
 void build_chat_detail(void) {
   if (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT) {
     switch_screen(SCR_CHAT); return;
@@ -3799,11 +4034,84 @@ void build_chat_detail(void) {
   }
 
   if (is_lora) {
-    // Show LoRa status + messages from g_lora_msgs ring buffer
+    // ── Preset-Picker (4 chips, current preset highlighted) ──────────────
+    lv_obj_t *preset_strip = lv_obj_create(scr);
+    lv_obj_remove_style_all(preset_strip);
+    lv_obj_set_size(preset_strip, LV_PCT(100), 50);
+    lv_obj_set_flex_flow(preset_strip, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(preset_strip, 6, LV_PART_MAIN);
+    for (uint8_t pi = 0; pi < LORA_PRESET_COUNT; pi++) {
+      bool active = (g_settings.lora_preset == pi);
+      lv_obj_t *c = lv_obj_create(preset_strip);
+      lv_obj_remove_style_all(c);
+      lv_obj_set_flex_grow(c, 1);
+      lv_obj_set_height(c, 50);
+      lv_obj_set_style_bg_color(c,
+          lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(c, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+      lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(c, on_lora_preset_picked, LV_EVENT_CLICKED,
+                          (void *)(intptr_t)pi);
+      lv_obj_t *l = lv_label_create(c);
+      lv_label_set_text(l, LORA_PRESET_LABELS[pi]);
+      lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l,
+          lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+    }
+
+    // ── Big stat tile: RX-Count + last RSSI/SNR + secs since last RX ─────
+    lv_obj_t *stat = lv_obj_create(scr);
+    lv_obj_remove_style_all(stat);
+    lv_obj_set_size(stat, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(stat, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(stat, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(stat, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+    lv_obj_set_style_border_width(stat, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(stat, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(stat, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(stat, LV_FLEX_FLOW_COLUMN);
+
+    // Big RX counter
+    char big[32];
+    snprintf(big, sizeof(big), "%lu pakete", (unsigned long)g_lora_rx_count);
+    lv_obj_t *bigl = lv_label_create(stat);
+    lv_label_set_text(bigl, big);
+    lv_obj_set_style_text_font(bigl, &moki_fraunces_italic_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(bigl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+    // RSSI + SNR + seconds since last
+    char detail[96];
+    int64_t age_diff = (int64_t)millis() - (int64_t)g_lora_last_rx_ms;
+    if (g_lora_last_rx_ms > 0 && age_diff >= 0) {
+      uint32_t since = (uint32_t)(age_diff / 1000);
+      snprintf(detail, sizeof(detail),
+               "letztes signal: %d dBm · snr %.1f · vor %lus",
+               g_lora_last_rssi, g_lora_last_snr, (unsigned long)since);
+    } else if (g_lora_msg_count > 0) {
+      snprintf(detail, sizeof(detail),
+               "%d nachrichten gespeichert · diese sitzung still",
+               g_lora_msg_count);
+    } else {
+      snprintf(detail, sizeof(detail), "noch kein signal empfangen");
+    }
+    lv_obj_t *det = lv_label_create(stat);
+    lv_label_set_text(det, detail);
+    lv_obj_set_style_text_font(det, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(det, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(det, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(det, 6, LV_PART_MAIN);
+
+    // Compact tech-line: TX-state + status
     char status[80];
-    snprintf(status, sizeof(status), "%s · RX %lu · TX %lu · %s",
+    snprintf(status, sizeof(status), "%s · TX %lu · %s",
              g_lora_status,
-             (unsigned long)g_lora_rx_count,
              (unsigned long)g_lora_tx_count,
              g_settings.lora_tx_armed ? "TX FREI" : "RX-ONLY");
     lv_obj_t *st = lv_label_create(scr);
@@ -3839,20 +4147,33 @@ void build_chat_detail(void) {
         lv_obj_set_style_pad_all(bubble, 12, LV_PART_MAIN);
         lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
 
-        char hdr[80];
+        // Header: from · RSSI · SNR · preset
+        char hdr[96];
+        const char *plabel = (m->preset < LORA_PRESET_COUNT
+                              ? LORA_PRESET_LABELS[m->preset] : "?");
         if (m->rssi)
-          snprintf(hdr, sizeof(hdr), "%s · RSSI %d dBm", m->from, m->rssi);
+          snprintf(hdr, sizeof(hdr), "%s · %d dBm · snr %.1f · %s",
+                   m->from, m->rssi, m->snr_x10/10.0, plabel);
         else
-          snprintf(hdr, sizeof(hdr), "%s · gesendet", m->from);
+          snprintf(hdr, sizeof(hdr), "%s · gesendet · %s", m->from, plabel);
         lv_obj_t *h = lv_label_create(bubble);
         lv_label_set_text(h, hdr);
-        lv_obj_set_style_text_font(h, &moki_jetbrains_mono_22, LV_PART_MAIN);
+        lv_obj_set_style_text_font(h, &moki_jetbrains_mono_18, LV_PART_MAIN);
         lv_obj_set_style_text_color(h, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
         lv_obj_set_style_text_letter_space(h, 1, LV_PART_MAIN);
 
+        // Body: NUL-terminated copy with non-printables replaced by '.'
+        char safe[sizeof(m->text) + 1];
+        size_t tn = m->len;
+        if (tn > sizeof(m->text)) tn = sizeof(m->text);
+        for (size_t i = 0; i < tn; i++) {
+          uint8_t b = (uint8_t)m->text[i];
+          safe[i] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+        }
+        safe[tn] = 0;
         lv_obj_t *t = lv_label_create(bubble);
-        lv_label_set_text(t, m->text);
-        lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
+        lv_label_set_text(t, safe);
+        lv_obj_set_style_text_font(t, &moki_jetbrains_mono_18, LV_PART_MAIN);
         lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
         lv_obj_set_width(t, LV_PCT(100));
         lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
@@ -4176,17 +4497,33 @@ static void lora_init(void) {
 
 // Parse "MOKI|<from>|<text>" — split by '|', limit 2 fields.
 // Loose: if no header, treat the whole thing as anonymous text.
-static void lora_handle_packet(const String &buf, int16_t rssi) {
-  String from = "anon", text = buf;
+static void lora_handle_packet(const String &buf, int16_t rssi, float snr) {
+  // Always dump raw hex first — useful for promiscuous scanning of foreign nets
+  Serial.printf("[lora] rx %u bytes rssi=%d snr=%.1f raw=", (unsigned)buf.length(), rssi, snr);
+  for (size_t i = 0; i < buf.length() && i < 96; i++) {
+    Serial.printf("%02x", (uint8_t)buf[i]);
+  }
+  Serial.print(" ascii=\"");
+  for (size_t i = 0; i < buf.length() && i < 96; i++) {
+    char c = buf[i];
+    Serial.print((c >= 0x20 && c < 0x7F) ? c : '.');
+  }
+  Serial.println('"');
+
+  String from = "anon";
+  size_t header_len = 0;
   if (buf.startsWith("MOKI|")) {
     int p1 = buf.indexOf('|', 5);
     if (p1 > 5) {
       from = buf.substring(5, p1);
-      text = buf.substring(p1 + 1);
+      header_len = p1 + 1;
     }
   }
-  Serial.printf("[lora] rx '%s' from='%s' rssi=%d\n", text.c_str(), from.c_str(), rssi);
-  lora_push_msg(from.c_str(), text.c_str(), rssi);
+  // Push the RAW payload (post-header if MOKI|, else full packet) so we can
+  // dump exact hex later. Foreign packets (Meshtastic/MeshCore) keep all bytes.
+  const char *body = buf.c_str() + header_len;
+  size_t body_len  = buf.length() - header_len;
+  lora_push_msg_raw(from.c_str(), (const uint8_t *)body, body_len, rssi, snr);
   g_lora_rx_count++;
 }
 
@@ -4198,12 +4535,55 @@ static void lora_poll(void) {
   String received;
   int state = g_radio.readData(received);
   int16_t rssi = (int16_t)g_radio.getRSSI();
+  float snr = g_radio.getSNR();
   if (state == RADIOLIB_ERR_NONE && received.length() > 0) {
-    lora_handle_packet(received, rssi);
+    g_lora_last_rssi  = rssi;
+    g_lora_last_snr   = snr;
+    g_lora_last_rx_ms = millis();
+    lora_handle_packet(received, rssi, snr);
   } else {
-    Serial.printf("[lora] readData err=%d\n", state);
+    Serial.printf("[lora] rx_err code=%d rssi=%d snr=%.1f\n", state, rssi, snr);
   }
   g_radio.startReceive();
+}
+
+// Apply one of the LORA_PRESET_* configurations.
+// Persistable — caller may save settings afterwards.
+static void lora_reconfigure(float freq_mhz, float bw_khz, int sf, int cr, uint8_t sync, bool crc);
+
+static void lora_apply_preset(uint8_t preset) {
+  switch (preset) {
+    case LORA_PRESET_MESHCORE_NARROW:
+      lora_reconfigure(869.618, 62.5,  8, 8, 0x12, true);
+      break;
+    case LORA_PRESET_MESHCORE_LEGACY:
+      lora_reconfigure(869.525, 250.0, 11, 5, 0x12, true);
+      break;
+    case LORA_PRESET_MESHTASTIC_LF:
+      lora_reconfigure(869.525, 250.0, 11, 5, 0x2B, true);
+      break;
+    case LORA_PRESET_MOKI:
+    default:
+      lora_reconfigure(868.0,   250.0, 10, 6, 0xAB, true);
+      break;
+  }
+}
+
+// Reconfigure SX1262 on-the-fly — useful for scanning foreign networks.
+// Always enables RX-boosted-gain for max sensitivity (~3dB better RX).
+static void lora_reconfigure(float freq_mhz, float bw_khz, int sf, int cr, uint8_t sync, bool crc) {
+  g_radio.standby();
+  g_radio.setFrequency(freq_mhz);
+  g_radio.setBandwidth(bw_khz);
+  g_radio.setSpreadingFactor(sf);
+  g_radio.setCodingRate(cr);
+  g_radio.setSyncWord(sync);
+  g_radio.setCRC(crc);
+  g_radio.setRxBoostedGainMode(true);
+  g_radio.setPacketReceivedAction(lora_irq_cb);
+  g_radio.startReceive();
+  Serial.printf("[lora] reconf %.3fMHz bw=%.1fkHz sf=%d cr=4/%d sync=0x%02X crc=%d boost=on\n",
+                freq_mhz, bw_khz, sf, cr, sync, crc ? 1 : 0);
 }
 
 // Send a message via LoRa. Gated by settings: returns false if not armed.
@@ -4314,14 +4694,24 @@ void setup() {
   lv_indev_drv_register(&synth_drv);
   Serial.println(F("[lvgl] synth indev registered"));
 
+  fs_mount();
+
   state_load_todos();
   state_load_habits();
   state_load_mood();
   state_load_notes();
   state_load_settings();
   state_load_events();
+  state_load_identity();
+  lora_persist_load();   // restore last LORA_MSG_CAP messages from disk
 
   lora_init();   // safe RX-only by default
+  // After radio is up, apply user-chosen preset (Moki / MeshCore / Meshtastic).
+  if (g_lora_ready) {
+    lora_apply_preset(g_settings.lora_preset);
+  }
+  // Identity needs RNG → must come after radio is up. First boot only.
+  state_ensure_identity();
 
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
@@ -4383,6 +4773,103 @@ static void poll_serial(void) {
       } else if (line == "loradisarm") {
         g_settings.lora_tx_armed = false; state_save_settings();
         Serial.println(F("[lora] tx disarmed"));
+      } else if (line.startsWith("lora_freq ")) {
+        float f = line.substring(10).toFloat();
+        g_radio.standby(); g_radio.setFrequency(f); g_radio.startReceive();
+        Serial.printf("[lora] freq=%.3fMHz\n", f);
+      } else if (line.startsWith("lora_bw ")) {
+        float bw = line.substring(8).toFloat();
+        g_radio.standby(); g_radio.setBandwidth(bw); g_radio.startReceive();
+        Serial.printf("[lora] bw=%.1fkHz\n", bw);
+      } else if (line.startsWith("lora_sf ")) {
+        int sf = line.substring(8).toInt();
+        g_radio.standby(); g_radio.setSpreadingFactor(sf); g_radio.startReceive();
+        Serial.printf("[lora] sf=%d\n", sf);
+      } else if (line.startsWith("lora_cr ")) {
+        int cr = line.substring(8).toInt();
+        g_radio.standby(); g_radio.setCodingRate(cr); g_radio.startReceive();
+        Serial.printf("[lora] cr=4/%d\n", cr);
+      } else if (line.startsWith("lora_sync ")) {
+        // Accept "0x12" or "12" (hex)
+        String s = line.substring(10);
+        s.trim();
+        if (s.startsWith("0x") || s.startsWith("0X")) s = s.substring(2);
+        uint8_t sync = (uint8_t)strtol(s.c_str(), NULL, 16);
+        g_radio.standby(); g_radio.setSyncWord(sync); g_radio.startReceive();
+        Serial.printf("[lora] sync=0x%02X\n", sync);
+      } else if (line.startsWith("lora_crc ")) {
+        bool on = line.substring(9) == "on" || line.substring(9) == "1";
+        g_radio.standby(); g_radio.setCRC(on); g_radio.startReceive();
+        Serial.printf("[lora] crc=%d\n", on ? 1 : 0);
+      } else if (line == "lora_preset_meshtastic_lf") {
+        // Meshtastic Long Fast EU (default in Heidelberg most likely)
+        lora_reconfigure(869.525, 250.0, 11, 5, 0x2B, true);
+      } else if (line == "lora_preset_meshtastic_ls") {
+        // Meshtastic Long Slow
+        lora_reconfigure(869.525, 125.0, 12, 8, 0x2B, true);
+      } else if (line == "lora_preset_meshtastic_mf") {
+        // Meshtastic Medium Fast
+        lora_reconfigure(869.525, 250.0, 9, 5, 0x2B, true);
+      } else if (line == "lora_preset_meshcore") {
+        // MeshCore EU "Narrow" preset (current standard since Oct 2025)
+        lora_reconfigure(869.618, 62.5, 8, 8, 0x12, true);
+      } else if (line == "lora_preset_meshcore_old") {
+        // MeshCore EU pre-2025 (legacy SF11)
+        lora_reconfigure(869.525, 250.0, 11, 5, 0x12, true);
+      } else if (line == "lora_preset_moki") {
+        // Moki defaults
+        lora_reconfigure(868.0, 250.0, 10, 6, 0xAB, true);
+      } else if (line == "lora_status") {
+        Serial.printf("[lora] ready=%d rx=%lu tx=%lu armed=%d\n",
+                      g_lora_ready ? 1 : 0,
+                      (unsigned long)g_lora_rx_count,
+                      (unsigned long)g_lora_tx_count,
+                      g_settings.lora_tx_armed ? 1 : 0);
+      } else if (line == "lora_dump") {
+        // Print every message in the ring buffer (oldest first), with hex.
+        // Format per line:
+        //   [%2d] +%lus rssi=%d snr=%.1f len=%u preset=%s from='%s' raw=<hex>
+        Serial.printf("[lora_dump] %d msgs (cap=%d)\n",
+                      g_lora_msg_count, LORA_MSG_CAP);
+        int start = (g_lora_msg_count == LORA_MSG_CAP) ? g_lora_msg_head : 0;
+        uint32_t now = millis();
+        for (int n = 0; n < g_lora_msg_count; n++) {
+          int idx = (start + n) % LORA_MSG_CAP;
+          const moki_lora_msg_t *m = &g_lora_msgs[idx];
+          // Pre-reboot messages have ts_ms > now → would underflow.
+          // Print "older" instead of bogus large negatives.
+          int64_t diff = (int64_t)now - (int64_t)m->ts_ms;
+          if (diff < 0) {
+            Serial.printf("  [%2d] older    rssi=%d snr=%.1f len=%u preset=%s from='%s' raw=",
+                          n, m->rssi, m->snr_x10/10.0,
+                          (unsigned)m->len,
+                          (m->preset < LORA_PRESET_COUNT
+                           ? LORA_PRESET_LABELS[m->preset] : "?"),
+                          m->from);
+            for (int i = 0; i < m->len; i++) Serial.printf("%02x", (uint8_t)m->text[i]);
+            Serial.println();
+            continue;
+          }
+          uint32_t age_s = (uint32_t)(diff / 1000);
+          Serial.printf("  [%2d] -%lus rssi=%d snr=%.1f len=%u preset=%s from='%s' raw=",
+                        n, (unsigned long)age_s, m->rssi, m->snr_x10/10.0,
+                        (unsigned)m->len,
+                        (m->preset < LORA_PRESET_COUNT
+                         ? LORA_PRESET_LABELS[m->preset] : "?"),
+                        m->from);
+          for (int i = 0; i < m->len; i++) Serial.printf("%02x", (uint8_t)m->text[i]);
+          Serial.println();
+        }
+        Serial.println(F("[lora_dump] done"));
+      } else if (line == "lora_clear") {
+        g_lora_msg_count = 0;
+        g_lora_msg_head  = 0;
+        g_lora_rx_count  = 0;
+        g_lora_last_rssi  = 0;
+        g_lora_last_snr   = 0.0f;
+        g_lora_last_rx_ms = 0;
+        lora_persist_clear();
+        Serial.println(F("[lora] cleared ring buffer + counts + disk log"));
       } else if (line == "dump") {
         Serial.printf("[dump] screen=%d heap=%u psram=%u todos=%d habits=%d\n",
                       (int)current_screen,
