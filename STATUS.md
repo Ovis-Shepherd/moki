@@ -253,10 +253,8 @@ loraarm / loradisarm # Toggle TX-armed flag from host
 
 ---
 
-## Known Issues / Quirks
+## Known Issues / Quirks (Hardware/UX)
 
-- **Status-Bar Datums-Anzeige hardcoded** — DIENSTAG · 20. APRIL ist statisch,
-  kein RTC-Hookup yet (PCF85063 vorhanden auf I2C @ 0x51, deferred)
 - **Battery-Anzeige hardcoded auf 78** — BQ27220 Wiring deferred
 - **Pet-Pfoten und Belly** — Belly skip wegen Threshold (DARK = INK auf E-Ink)
 - **E-Ink Mikrokapsel-Textur** sichtbar bei direktem Licht — Hardware-Limit
@@ -265,7 +263,50 @@ loraarm / loradisarm # Toggle TX-armed flag from host
   (z.B. "* " statt "★ " für pinned, "1:1" statt "◯" für direct chat)
 - **Calendar Events sind read-only** — kein Event-Compose UI yet
 - **Chat-Reply** ist Stub ("antworten kommt im nächsten update")
-- **Habit Day-Rollover** kein Auto-Mid-night reset (RTC-needed)
+
+---
+
+## Bug Tracker — vergiss nicht!
+
+**Diese Liste ist die Single-Source-of-Truth** für offene Bugs/Tech-Debt.
+Wenn ein Item gefixt ist: hier rauslöschen + ggf. inline-`TODO`-Kommentar im
+Code entfernen. Wenn neuer Bug auftritt: hier reinpacken.
+
+### 🔴 Priorität: BLOCKING / KORRUPT
+- **PCF85063 set_time round-trip broken**
+  - Symptom: `set_time 2026-04-30 12:00:00` → readback `2026-04-14 04:00:00`
+  - Effekt: Zeit kann nicht gesetzt werden, RTC bleibt bei boot-time
+  - Time advances? **NEIN** — Oszillator scheint zu stoppen
+  - Versucht: CTRL1=0x00 explizit gesetzt → keine Änderung
+  - Verdacht: I2C-Bus-Contention mit GT911+XL9555 ODER Chip-State broken
+  - Nächster Schritt: Logic-Analyzer auf SDA/SCL, raw-CTRL2/Status-Read,
+    `Wire.endTransmission()` Returncode prüfen
+  - Code-Ort: `firmware/src/main.cpp` `rtc_init()` + KNOWN ISSUE comment
+  - Workaround heute: Status-Bar zeigt einfach was Chip liefert (boot-fixed)
+
+### 🟡 Priorität: WORKAROUNDS / COSMETIC
+- **GPIO ISR service already installed** Warnung beim LoRa-Init
+  - Cosmetic only — `[lora] init... E (4012) gpio: gpio_install_isr_service(450)`
+  - Effekt: keiner, RX läuft trotzdem
+  - Fix: vor lora_init explizit `gpio_uninstall_isr_service()` callen
+- **`/littlefs/lora.log does not exist, no permits for creation`** Warnung
+  - Cosmetic — VFS-Layer-Log beim ersten Boot oder nach lora_clear
+  - Effekt: keiner, lora_persist_load checked exists vorher
+  - Fix: vfs_set_log_level oder ignore
+- **`noch kein signal empfangen`** trotz vorhandenen Pakete im Buffer
+  - Logik-Bug behoben in stage 2c-mobile, jetzt ok wenn ring-buffer >0
+- **Bubble-Body bei Foreign-Protokollen** zeigte non-printables → behoben
+  (jetzt `.` für non-ASCII)
+
+### 🟢 Priorität: DEFERRED FEATURES (kein Bug, aber merken)
+- **M3 Auto-Sleep-after-Idle** — `g_settings.auto_sleep_min` Toggle fehlt,
+  derzeit nur manuell via `sleep_now N` Serial command
+- **M3 Touch-IRQ-Wake** — aktuell nur Timer-Wake, GT911-INT als ext0-Wake
+  wäre für UX kritisch (sonst muss User Power-Button drücken zum Aufwecken)
+- **Settings-Migration** — `lora_preset` partial-load funktioniert, aber
+  bei künftigen breaking changes brauchen wir explizite Migration-Functions
+- **Stage 3d: Atomic Writes** — write-then-rename für Power-fail-Sicherheit
+- **Stage 3e: Boot-Integrity-Check** — CRC + Recovery für korrupten State
 
 ---
 
@@ -320,15 +361,16 @@ ui_entry() → switch_screen(SCR_HOME)
 
 ---
 
-## Roadmap — 9 Milestones (2026-04-30)
+## Roadmap — 8 Milestones (2026-04-30 revised)
 
-Geordnet nach Abhängigkeiten + ihrem Wert. Jeder Milestone ist einzeln versandbar.
+**Pivot 2026-04-30:** M1 (lokale Moki↔Moki AES) entfällt — wenn 2 User zusammen
+sind, reden sie direkt. Echter Wert ist **MeshCore-Reichweite** (Citywide).
+M7 wird damit **erste Priorität** — bringt sowohl Reichweite ALS AUCH Crypto
+gleichzeitig (MeshCore Channel-PSK).
 
-### M1 · „Two Mokis Talk Securely" (≈2-3h, Foundation steht)
-- AES-128-GCM Wrapper um existing MOKI|-Protokoll
-- Pairing: Identity-Secret als QR-Code anzeigen + scannen (oder Hex-Eingabe)
-- Settings: Friend-PSK pro Kontakt
-- **Voraussetzung:** ✅ erfüllt (Identity-Secret in NVS)
+### ~~M1 · „Two Mokis Talk Securely"~~ — VERWORFEN
+*Lokal sinnlos: Zusammen → reden direkt. MeshCore-Channel-PSK übernimmt
+die Crypto-Aufgabe für Distance-Communication.*
 
 ### M2 · „Moki Keeps Time" (≈2h)
 - PCF85063 RTC initialisieren (I2C)
@@ -343,12 +385,13 @@ Geordnet nach Abhängigkeiten + ihrem Wert. Jeder Milestone ist einzeln versandb
 - LittleFS-Sync nur on-change
 - Akku-Ziel: 2-4 Wochen statt aktuell ~Tage
 
-### M4 · „Friends in Moki" (≈4-6h, depends on M1)
-- BLE-Server (NimBLE-Stack)
-- Pairing-Flow: 2 nahe Mokis → BLE-Discover → Verify-Code-Tausch
-- Friend-List in NVS (mit per-Friend AES-PSK)
-- Profile-Sync (Handle, Bio, Mood)
-- Object-Send über BLE: Buch, Note, Calendar-Event, Map-Location
+### M4 · „Friends in Moki" (≈4-6h, depends on M7)
+- BLE-Server (NimBLE-Stack) für **lokale** Pairing-Aktionen (z.B. Friend-Add
+  per Side-by-Side, Object-Transfer wie Buch/Note/Location)
+- Pairing-Flow: 2 nahe Mokis → BLE-Discover → MeshCore-PubKey-Tausch
+- Friend-List in NVS (mit MeshCore-Identity-Pubkeys jedes Friends)
+- Profile-Sync (Handle, Bio, Mood) — über MeshCore-Direct-Messages
+- Object-Send über BLE (lokal, schneller) ODER MeshCore (citywide)
 
 ### M5 · „Read Books on Moki" (≈6-8h, Stage 7-Full)
 - minizip-ng für EPUB-ZIP-Extraction
@@ -367,11 +410,19 @@ Geordnet nach Abhängigkeiten + ihrem Wert. Jeder Milestone ist einzeln versandb
 - Geographische Vector-Layer (Neckar, Brücken)
 - GPS-Position via LoRa broadcasten für Friends-Map
 
-### M7 · „Citywide Reach" (≈3-5h, MeshCore Phase 2c-Full + 3)
-- MyMesh : BaseChatMesh subclass
-- Identity (32-Byte) als Ed25519-Seed
-- Adverts + Direct-Messages über RN-Mesh-Repeater
-- Phase-3-Connect-Test mit RN-Mesh-PSK (`izOH6cXN6mrJ5e26oRXNcg==`)
+### M7 · „Citywide Reach" — JETZT ERSTE PRIORITÄT (≈3-5h)
+**Ersetzt M1.** MeshCore-Channel-PSK liefert Crypto + RN-Mesh-Reichweite
+gleichzeitig. Phase 2c-Full + Phase 3 bundled.
+- `MyMesh : public BaseChatMesh` Subclass implementieren
+- Identity-Bridge: g_identity_secret (32B) als Ed25519-Seed nutzen
+- Eigener „moki" Channel mit eigener PSK (von Lucas wählbar)
+  → 2 Mokis mit derselben moki-PSK können sich gegenseitig schreiben,
+  egal wo in HD (Repeater hops!)
+- Optional: zusätzlich „rn-mesh-public" Channel mit bekannter PSK
+  (`izOH6cXN6mrJ5e26oRXNcg==`) zum mitreden im großen Mesh
+- Adverts + Direct-Messages funktional
+- Bestehendes UI weiter genutzt (g_lora_msgs ring buffer + chat-detail screen)
+- Settings: Channel-Liste mit PSK-Eingabe
 
 ### M8 · „OTA Updates" (≈4-6h, WiFi-Setup nötig)
 - WiFi-Onboarding (SSID/Pass via QR oder Touch)
@@ -388,18 +439,17 @@ Geordnet nach Abhängigkeiten + ihrem Wert. Jeder Milestone ist einzeln versandb
 - Markdown Bold/Italic Inline-Render
 - Onboarding-First-Boot-Flow für leeren handle
 
-## Empfohlene Reihenfolge
+## Empfohlene Reihenfolge (revised 2026-04-30)
 
 ```
-M1 (Encrypted) ──┐
-                 ├─→ M4 (Friends) ──┐
-M2 (Time) ───────┤                  ├─→ M6 (Map+GPS)
-                 ├─→ M5 (EPUB)      │
-M3 (Battery) ────┘                  │
-                                    │
-M7 (Citywide MeshCore) ─────────────┤
-M8 (OTA) ───────────────────────────┘
+M2 (Time) ✅       ─┐
+M3 (Battery) ⚠️ skel ─┤
+                    ├─→ M7 (MeshCore) ──┬─→ M4 (Friends) ─┐
+                    │                   │                 │
+                    └─→ M5 (EPUB)       │                 ├─→ M6 (Map+GPS)
+                                        │                 │
+                                        └─→ M8 (OTA) ─────┘
 M9 (Polish) — parallel
 ```
 
-**Concrete Order:** M1 → M2 → M3 → M5 oder M4 → M6 → M7 → M8 → M9.
+**Concrete Order:** ✅ M2 done · ⚠️ M3 skel done · → **M7 NEXT** → M5 oder M4 → M6 → M8 → M9.
