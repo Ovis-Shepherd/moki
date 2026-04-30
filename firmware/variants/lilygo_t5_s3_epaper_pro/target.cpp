@@ -7,8 +7,10 @@
 
 ESP32Board board;
 
-static SPIClass spi(HSPI);
-RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, spi);
+// Use the global Arduino SPI (FSPI on ESP32-S3) — main.cpp's lora_init()
+// does SPI.begin() with our pins, so we share that bus and don't need our
+// own SPIClass instance.
+RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, SPI);
 WRAPPER_CLASS radio_driver(radio, board);
 
 #ifndef LORA_CR
@@ -16,8 +18,8 @@ WRAPPER_CLASS radio_driver(radio, board);
 #endif
 
 bool radio_init() {
-  spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
-  return radio.std_init(&spi);
+  SPI.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
+  return radio.std_init(&SPI);
 }
 
 uint32_t radio_get_rng_seed() {

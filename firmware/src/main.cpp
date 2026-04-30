@@ -37,7 +37,13 @@
 #define LORA_BUSY  47
 #define SD_CS      12
 
-static SX1262 g_radio = new Module(LORA_CS, LORA_IRQ, LORA_RST, LORA_BUSY);
+// LoRa radio is owned by variants/lilygo_t5_s3_epaper_pro/target.cpp now
+// (MeshCore needs the same Module instance the BaseChatMesh stack uses).
+// We expose it here under the same name (g_radio) to keep the existing
+// lora_* code unchanged. RADIO_CLASS is CustomSX1262 — extends SX1262.
+#include <helpers/radiolib/CustomSX1262.h>
+extern CustomSX1262 radio;
+#define g_radio radio
 static ExtensionIOXL9555 g_xl9555;
 static SensorPCF85063 g_rtc;
 static bool g_rtc_ready = false;
@@ -505,6 +511,34 @@ static int g_lora_msg_head  = 0;          // ring buffer head
 // Forward decl — actual definition lives in the LittleFS section below.
 static void lora_persist_append(const moki_lora_msg_t *m);
 
+// Bridge for moki_mesh.cpp — exposes lora_push_msg via C-linkage so the
+// MyMesh subclass can dump received channel-messages into our existing
+// ring buffer + UI.
+extern "C" void moki_lora_push_msg_external(const char *from, const char *text, int16_t rssi) {
+  // Mirrors lora_push_msg() but accessible from another translation unit.
+  moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
+  strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
+  size_t tlen = strlen(text);
+  if (tlen > sizeof(m->text)) tlen = sizeof(m->text);
+  memcpy(m->text, text, tlen);
+  m->len    = (uint8_t)tlen;
+  m->rssi   = rssi;
+  m->snr_x10 = 0;
+  m->preset  = g_settings.lora_preset;
+  m->ts_ms  = millis();
+  g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
+  if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
+  lora_persist_append(m);
+  g_lora_rx_count++;
+}
+
+// MeshCore C-API forward decls (defined in moki_mesh.cpp).
+extern "C" {
+  void moki_mesh_init(void);
+  void moki_mesh_loop(void);
+  bool moki_mesh_send(const char *sender_name, const char *text);
+}
+
 static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
   moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
   strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
@@ -634,7 +668,8 @@ static void state_save_settings(void) {
 // Generated lazily: first boot creates it from RadioLib RNG (best entropy
 // source we have until MeshCore is active). Persisted thereafter.
 #define IDENTITY_SECRET_SIZE 32
-static uint8_t g_identity_secret[IDENTITY_SECRET_SIZE] = {0};
+// Non-static: moki_mesh.cpp references this for Ed25519 key derivation.
+uint8_t g_identity_secret[IDENTITY_SECRET_SIZE] = {0};
 static bool    g_identity_ready = false;
 
 static void state_load_identity(void) {
@@ -4835,6 +4870,15 @@ void setup() {
   // Identity needs RNG → must come after radio is up. First boot only.
   state_ensure_identity();
 
+  // M7 — initialize MeshCore mesh layer. Identity is now in NVS, radio is up,
+  // so we can build the BaseChatMesh-derived MyMesh and start advertising.
+  // NOTE: takes over RX from our raw lora_poll path. Foreign-protocol scan
+  // commands (lora_preset_meshtastic_*, etc.) are still callable but they
+  // reconfigure the radio underneath the mesh — use with care.
+  if (g_lora_ready && g_identity_ready) {
+    moki_mesh_init();
+  }
+
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
@@ -4983,6 +5027,15 @@ static void poll_serial(void) {
           Serial.println();
         }
         Serial.println(F("[lora_dump] done"));
+      } else if (line.startsWith("mesh_send ")) {
+        // mesh_send <text> — push a channel message into the MeshCore mesh.
+        const String text = line.substring(10);
+        if (!g_settings.lora_tx_armed) {
+          Serial.println(F("[mesh] tx not armed — set ANTENNE DRAN in settings first"));
+        } else {
+          bool ok = moki_mesh_send(g_settings.handle, text.c_str());
+          Serial.printf("[mesh] send %s\n", ok ? "queued" : "FAILED");
+        }
       } else if (line.startsWith("sleep_now")) {
         // Format: "sleep_now [SECS]" — secs default 60
         int secs = 60;
@@ -5095,8 +5148,12 @@ void loop() {
   // LVGL ticker
   lv_timer_handler();
 
-  // LoRa RX poll
+  // LoRa RX poll (legacy raw-radio path — still active for foreign-protocol
+  // scans and our custom MOKI| protocol).
   lora_poll();
+
+  // M7 — MeshCore loop (handles MeshCore protocol RX/TX, channel messages).
+  moki_mesh_loop();
 
   // RTC tick — habit midnight rollover (cheap, runs ~once / 30s)
   rtc_tick();
