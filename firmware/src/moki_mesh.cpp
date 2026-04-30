@@ -109,7 +109,15 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   void onContactVisit(const ContactInfo& contact) override {}
 
   // Pure virtual stubs (we don't use these features yet).
-  void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {}
+  void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
+    Serial.printf("[mesh] %s contact: '%s' path_len=%u\n",
+                  is_new ? "new" : "updated", contact.name, (unsigned)path_len);
+    if (is_new) {
+      char from[40];
+      snprintf(from, sizeof(from), "neu: %s", contact.name);
+      moki_lora_push_msg_external(from, "ist im mesh sichtbar.", 0);
+    }
+  }
   ContactInfo* processAck(const uint8_t *data) override {
     if (memcmp(data, &_expected_ack_crc, 4) == 0) {
       _expected_ack_crc = 0;
@@ -211,6 +219,47 @@ public:
     Serial.printf("[mesh] identity set, %d channels active\n", _num_channels);
   }
 
+  // Send a self-advert so other Mokis discover us. Uses the user's handle
+  // as the public name. Repeaters flood it across the mesh.
+  bool sendSelfAdvert(const char *name) {
+    auto pkt = createSelfAdvert(name);
+    if (!pkt) {
+      Serial.println(F("[mesh] advert: alloc failed"));
+      return false;
+    }
+    sendFlood(pkt);
+    Serial.printf("[mesh] sent self-advert as '%s'\n", name);
+    return true;
+  }
+
+  // Iterate contacts — exposed for UI. Returns name into out_buf, pubkey
+  // first 4 bytes into out_pubkey4. Returns false if idx out of range.
+  bool getContactNameAndKey(int idx, char *out_name, size_t name_buf_size,
+                            uint8_t out_pubkey4[4]) {
+    ContactInfo c;
+    if (!getContactByIdx((uint32_t)idx, c)) return false;
+    strncpy(out_name, c.name, name_buf_size - 1);
+    out_name[name_buf_size - 1] = 0;
+    memcpy(out_pubkey4, c.id.pub_key, 4);
+    return true;
+  }
+
+  // Send a direct (1:1) message to contact at index `idx`.
+  bool sendDirectMessageTo(int idx, const char *text) {
+    ContactInfo c;
+    if (!getContactByIdx((uint32_t)idx, c)) return false;
+    uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+    uint32_t expected_ack = 0;
+    uint32_t est_timeout = 0;
+    int rc = sendMessage(c, ts, /*attempt*/0, text, expected_ack, est_timeout);
+    Serial.printf("[mesh] dm to %s: rc=%d ack_expected=%lu\n",
+                  c.name, rc, (unsigned long)expected_ack);
+    _expected_ack_crc = expected_ack;
+    return rc != MSG_SEND_FAILED;
+  }
+
+  int contactCount() { return getNumContacts(); }
+
   // Returns true if message was queued for transmission to the active channel.
   bool sendToActiveChannel(const char *sender_name, const char *text) {
     int idx = moki_channels_active_idx();
@@ -251,6 +300,26 @@ void moki_mesh_loop(void) {
 bool moki_mesh_send(const char *sender_name, const char *text) {
   if (!g_mesh) return false;
   return g_mesh->sendToActiveChannel(sender_name, text);
+}
+
+bool moki_mesh_advert(const char *name) {
+  if (!g_mesh) return false;
+  return g_mesh->sendSelfAdvert(name);
+}
+
+int moki_mesh_contact_count() {
+  if (!g_mesh) return 0;
+  return g_mesh->contactCount();
+}
+
+bool moki_mesh_get_contact(int idx, char *out_name, int name_size, uint8_t out_pubkey4[4]) {
+  if (!g_mesh) return false;
+  return g_mesh->getContactNameAndKey(idx, out_name, (size_t)name_size, out_pubkey4);
+}
+
+bool moki_mesh_dm(int contact_idx, const char *text) {
+  if (!g_mesh) return false;
+  return g_mesh->sendDirectMessageTo(contact_idx, text);
 }
 
 }

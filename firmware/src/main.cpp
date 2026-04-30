@@ -637,6 +637,10 @@ extern "C" {
   void moki_mesh_init(void);
   void moki_mesh_loop(void);
   bool moki_mesh_send(const char *sender_name, const char *text);
+  bool moki_mesh_advert(const char *name);
+  int  moki_mesh_contact_count();
+  bool moki_mesh_get_contact(int idx, char *out_name, int name_size, uint8_t out_pubkey4[4]);
+  bool moki_mesh_dm(int contact_idx, const char *text);
 }
 
 // Settings accessors for moki_mesh.cpp (so it doesn't need the full struct).
@@ -5537,6 +5541,36 @@ static void poll_serial(void) {
           Serial.printf("[mesh] removed channel [%d] (effective on next boot)\n", idx);
         } else {
           Serial.println(F("[mesh] cannot remove (last/invalid)"));
+        }
+      } else if (line == "advert") {
+        if (!g_settings.lora_tx_armed) {
+          Serial.println(F("[mesh] tx not armed"));
+        } else {
+          moki_mesh_advert(g_settings.handle);
+        }
+      } else if (line == "contacts") {
+        int n = moki_mesh_contact_count();
+        Serial.printf("[mesh] %d contacts:\n", n);
+        for (int i = 0; i < n; i++) {
+          char name[40]; uint8_t key4[4];
+          if (moki_mesh_get_contact(i, name, sizeof(name), key4)) {
+            Serial.printf("  [%d] '%s' id=%02x%02x%02x%02x\n",
+                          i, name, key4[0], key4[1], key4[2], key4[3]);
+          }
+        }
+      } else if (line.startsWith("dm ")) {
+        // dm <contact_idx> <text>
+        String body = line.substring(3); body.trim();
+        int sp = body.indexOf(' ');
+        if (sp <= 0) {
+          Serial.println(F("[mesh] usage: dm <idx> <text>"));
+        } else if (!g_settings.lora_tx_armed) {
+          Serial.println(F("[mesh] tx not armed"));
+        } else {
+          int idx = body.substring(0, sp).toInt();
+          String text = body.substring(sp + 1);
+          bool ok = moki_mesh_dm(idx, text.c_str());
+          Serial.printf("[mesh] dm %s\n", ok ? "queued" : "FAILED");
         }
       } else if (line.startsWith("ch_active ")) {
         int idx = line.substring(10).toInt();
