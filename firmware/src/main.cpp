@@ -21,7 +21,27 @@
 #include "sdkconfig.h"
 #include "lvgl.h"
 #include "TouchDrvGT911.hpp"
+#include "ExtensionIOXL9555.hpp"
 #include "moki_fonts.h"
+#include <RadioLib.h>
+
+// --- LoRa SX1262 (T5 S3 Pro) -------------------------------------------------
+#define LORA_MISO  21
+#define LORA_MOSI  13
+#define LORA_SCLK  14
+#define LORA_CS    46
+#define LORA_IRQ   10
+#define LORA_RST    1
+#define LORA_BUSY  47
+#define SD_CS      12
+
+static SX1262 g_radio = new Module(LORA_CS, LORA_IRQ, LORA_RST, LORA_BUSY);
+static ExtensionIOXL9555 g_xl9555;
+static volatile bool     g_lora_rx_flag    = false;
+static bool              g_lora_ready      = false;
+static const char       *g_lora_status     = "INIT";
+static uint32_t          g_lora_rx_count   = 0;
+static uint32_t          g_lora_tx_count   = 0;
 
 // --- Moki palette (mirrors simulator exactly) -------------------------------
 #define MOKI_PAPER  0xE8E2D1
@@ -402,8 +422,31 @@ typedef struct {
   char     share_default[8];      // off / hourly / live
   char     handle[32];            // user handle
   char     bio[80];
+  bool     lora_tx_armed;         // false = RX-only (safe without antenna)
 } moki_settings_t;
-static moki_settings_t g_settings = { 30, "hourly", "levin", "liest langsam. läuft lieber." };
+static moki_settings_t g_settings = { 30, "hourly", "levin", "liest langsam. läuft lieber.", false };
+
+// LoRa-Chat ring buffer of recent messages
+typedef struct {
+  char from[24];
+  char text[160];
+  int16_t rssi;
+  uint32_t ts_ms;
+} moki_lora_msg_t;
+#define LORA_MSG_CAP 32
+static moki_lora_msg_t g_lora_msgs[LORA_MSG_CAP];
+static int g_lora_msg_count = 0;          // total received (for ring index)
+static int g_lora_msg_head  = 0;          // ring buffer head
+
+static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
+  moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
+  strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
+  strncpy(m->text, text, sizeof(m->text)-1); m->text[sizeof(m->text)-1] = 0;
+  m->rssi   = rssi;
+  m->ts_ms  = millis();
+  g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
+  if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
+}
 
 static void state_save_settings(void) {
   g_prefs.begin("moki", false);
@@ -3734,6 +3777,127 @@ void build_chat_detail(void) {
 }
 
 // ----------------------------------------------------------------------------
+// ============================================================================
+// LoRa SX1262 — RX-by-default for safety. TX only when antenna confirmed via
+// settings (lora_tx_armed). Power supply for radio + GPS is gated by IO0 of
+// the XL9555 IO expander @ I2C 0x20.
+// ============================================================================
+ICACHE_RAM_ATTR static void lora_irq_cb(void) { g_lora_rx_flag = true; }
+
+static void lora_power_on(void) {
+  if (!g_xl9555.init(Wire, 39, 40, 0x20)) {
+    Serial.println(F("[lora] XL9555 IO expander not found — LoRa offline"));
+    g_lora_status = "NO IO";
+    return;
+  }
+  g_xl9555.pinMode(ExtensionIOXL9555::IO0, OUTPUT);
+  g_xl9555.digitalWrite(ExtensionIOXL9555::IO0, HIGH);
+  delay(1500);
+}
+
+static void lora_init(void) {
+  // Both LoRa and SD share SPI; ensure both CS pins are high before init.
+  pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
+  pinMode(SD_CS,   OUTPUT); digitalWrite(SD_CS,   HIGH);
+
+  lora_power_on();
+  SPI.begin(LORA_SCLK, LORA_MISO, LORA_MOSI);
+
+  Serial.print(F("[lora] init... "));
+  int state = g_radio.begin();
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("FAILED code=%d\n", state);
+    g_lora_status = "FAIL";
+    return;
+  }
+
+  // EU 868 MHz, BW 250 kHz, SF 10, CR 6, sync 0xAB, preamble 15
+  g_radio.setFrequency(868.0);
+  g_radio.setBandwidth(250.0);
+  g_radio.setSpreadingFactor(10);
+  g_radio.setCodingRate(6);
+  g_radio.setSyncWord(0xAB);
+  g_radio.setPreambleLength(15);
+  g_radio.setCRC(true);
+  g_radio.setTCXO(2.4);
+  g_radio.setDio2AsRfSwitch(true);
+  // SAFE default: 0 dBm (1 mW). Even without antenna, brief TX is harmless.
+  // When user arms via settings + has antenna, we step up to 14 dBm.
+  g_radio.setOutputPower(0);
+  g_radio.setCurrentLimit(60);
+
+  // RX with interrupt
+  g_radio.setPacketReceivedAction(lora_irq_cb);
+  state = g_radio.startReceive();
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("startReceive failed code=%d\n", state);
+    g_lora_status = "RX FAIL";
+    return;
+  }
+
+  g_lora_ready  = true;
+  g_lora_status = "RX";
+  Serial.println(F("ok @ 868MHz, RX listening"));
+}
+
+// Parse "MOKI|<from>|<text>" — split by '|', limit 2 fields.
+// Loose: if no header, treat the whole thing as anonymous text.
+static void lora_handle_packet(const String &buf, int16_t rssi) {
+  String from = "anon", text = buf;
+  if (buf.startsWith("MOKI|")) {
+    int p1 = buf.indexOf('|', 5);
+    if (p1 > 5) {
+      from = buf.substring(5, p1);
+      text = buf.substring(p1 + 1);
+    }
+  }
+  Serial.printf("[lora] rx '%s' from='%s' rssi=%d\n", text.c_str(), from.c_str(), rssi);
+  lora_push_msg(from.c_str(), text.c_str(), rssi);
+  g_lora_rx_count++;
+}
+
+static void lora_poll(void) {
+  if (!g_lora_ready) return;
+  if (!g_lora_rx_flag) return;
+  g_lora_rx_flag = false;
+
+  String received;
+  int state = g_radio.readData(received);
+  int16_t rssi = (int16_t)g_radio.getRSSI();
+  if (state == RADIOLIB_ERR_NONE && received.length() > 0) {
+    lora_handle_packet(received, rssi);
+  } else {
+    Serial.printf("[lora] readData err=%d\n", state);
+  }
+  g_radio.startReceive();
+}
+
+// Send a message via LoRa. Gated by settings: returns false if not armed.
+static bool lora_send(const char *text) {
+  if (!g_lora_ready) return false;
+  if (!g_settings.lora_tx_armed) {
+    Serial.println(F("[lora] tx not armed (no antenna confirmed)"));
+    return false;
+  }
+  char pkt[200];
+  snprintf(pkt, sizeof(pkt), "MOKI|%s|%s", g_settings.handle, text);
+  Serial.printf("[lora] tx '%s'\n", pkt);
+  // Bump output power for armed transmit (still moderate at 14 dBm = 25 mW)
+  g_radio.setOutputPower(14);
+  int state = g_radio.transmit((uint8_t *)pkt, strlen(pkt));
+  g_radio.setOutputPower(0);   // back to safe-default
+  g_radio.startReceive();      // re-arm RX
+  if (state == RADIOLIB_ERR_NONE) {
+    g_lora_tx_count++;
+    // Echo locally so user sees their own message
+    lora_push_msg(g_settings.handle, text, 0);
+    return true;
+  }
+  Serial.printf("[lora] tx failed code=%d\n", state);
+  return false;
+}
+
+// ----------------------------------------------------------------------------
 // ui_entry — initial render: home screen.
 // ----------------------------------------------------------------------------
 static void ui_entry(void) {
@@ -3822,6 +3986,9 @@ void setup() {
   state_load_notes();
   state_load_settings();
   state_load_events();
+
+  lora_init();   // safe RX-only by default
+
   Serial.println(F("[lvgl] ui_entry"));
   ui_entry();
 }
@@ -3892,6 +4059,9 @@ static void poll_serial(void) {
 void loop() {
   // LVGL ticker
   lv_timer_handler();
+
+  // LoRa RX poll
+  lora_poll();
 
   // Host-driven synthetic touch + diagnostic commands
   poll_serial();
