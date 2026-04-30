@@ -6,6 +6,9 @@
 
 #include "BuildOpt.h"
 
+/*! \brief Global-scope function that returns timestamp since start (in microseconds). */
+RadioLibTime_t rlb_time_us();
+
 /*!
   \class RadioLibHal
   \brief Hardware abstraction library base interface.
@@ -57,6 +60,11 @@ class RadioLibHal {
     */
     RadioLibHal(const uint32_t input, const uint32_t output, const uint32_t low, const uint32_t high, const uint32_t rising, const uint32_t falling);
 
+    /*!
+      \brief Default destructor.
+    */
+    virtual ~RadioLibHal() = default;
+
     // pure virtual methods - these must be implemented by the hardware abstraction for RadioLib to function
 
     /*!
@@ -104,28 +112,28 @@ class RadioLibHal {
       Must be implemented by the platform-specific hardware abstraction!
       \param ms Number of milliseconds to wait.
     */
-    virtual void delay(unsigned long ms) = 0;
+    virtual void delay(RadioLibTime_t ms) = 0;
     
     /*!
       \brief Blocking microsecond wait function.
       Must be implemented by the platform-specific hardware abstraction!
       \param us Number of microseconds to wait.
     */
-    virtual void delayMicroseconds(unsigned long us) = 0;
+    virtual void delayMicroseconds(RadioLibTime_t us) = 0;
     
     /*!
       \brief Get number of milliseconds since start.
       Must be implemented by the platform-specific hardware abstraction!
       \returns Number of milliseconds since start.
     */
-    virtual unsigned long millis() = 0;
+    virtual RadioLibTime_t millis() = 0;
     
     /*!
       \brief Get number of microseconds since start.
       Must be implemented by the platform-specific hardware abstraction!
       \returns Number of microseconds since start.
     */
-    virtual unsigned long micros() = 0;
+    virtual RadioLibTime_t micros() = 0;
     
     /*!
       \brief Measure the length of incoming digital pulse in microseconds.
@@ -135,7 +143,7 @@ class RadioLibHal {
       \param timeout Timeout in microseconds.
       \returns Pulse length in microseconds, or 0 if the pulse did not start before timeout.
     */
-    virtual long pulseIn(uint32_t pin, uint32_t state, unsigned long timeout) = 0;
+    virtual long pulseIn(uint32_t pin, uint32_t state, RadioLibTime_t timeout) = 0;
 
     /*!
       \brief SPI initialization method.
@@ -188,7 +196,7 @@ class RadioLibHal {
       \param frequency Frequency of the square wave.
       \param duration Duration of the tone in ms. When set to 0, the tone will be infinite.
     */
-    virtual void tone(uint32_t pin, unsigned int frequency, unsigned long duration = 0);
+    virtual void tone(uint32_t pin, unsigned int frequency, RadioLibTime_t duration = 0);
 
     /*!
       \brief Method to stop producing a tone.
@@ -207,6 +215,14 @@ class RadioLibHal {
       \returns The interrupt number of a given pin.
     */
     virtual uint32_t pinToInterrupt(uint32_t pin);
+
+    /*!
+      \brief Enable or disable pull up or pull down for a specific pin.
+      \param pin Pin to change.
+      \param enable True to enable, false to disable.
+      \param up Pull direction, true for pull up, false for pull down.
+    */
+    virtual void pullUpDown(uint32_t pin, bool enable, bool up);
 };
 
 #endif

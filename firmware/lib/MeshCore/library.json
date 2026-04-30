@@ -1,0 +1,21 @@
+{
+    "name": "MeshCore",
+    "version" : "1.10.0",
+    "dependencies": {
+        "SPI": "*",
+        "Wire": "*"
+    },
+    "build": {
+        "srcFilter": [
+            "+<*.cpp>",
+            "+<helpers/*.cpp>",
+            "-<helpers/AutoDiscoverRTCClock.cpp>",
+            "-<helpers/RTC_RX8130CE.cpp>",
+            "-<helpers/CommonCLI.cpp>",
+            "-<helpers/RegionMap.cpp>",
+            "-<helpers/SensorManager.cpp>",
+            "+<helpers/radiolib/*.cpp>",
+            "+<helpers/esp32/*.cpp>"
+        ]
+    }
+}

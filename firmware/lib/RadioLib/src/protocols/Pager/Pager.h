@@ -117,7 +117,7 @@ class PagerClient {
       \param function bits (NUMERIC, TONE, ACTIVATION, ALPHANUMERIC). Allowed values 0 to 3. Defaults to auto select by specified encoding
       \returns \ref status_codes
     */
-    int16_t transmit(uint8_t* data, size_t len, uint32_t addr, uint8_t encoding = RADIOLIB_PAGER_BCD, uint8_t function = RADIOLIB_PAGER_FUNC_AUTO);
+    int16_t transmit(const uint8_t* data, size_t len, uint32_t addr, uint8_t encoding = RADIOLIB_PAGER_BCD, uint8_t function = RADIOLIB_PAGER_FUNC_AUTO);
 
     #if !RADIOLIB_EXCLUDE_DIRECT_RECEIVE
     /*!
@@ -177,20 +177,20 @@ class PagerClient {
 #endif
     PhysicalLayer* phyLayer;
 
-    float baseFreq;
-    float dataRate;
-    uint32_t baseFreqRaw;
-    uint16_t shiftFreq;
-    uint16_t shiftFreqHz;
-    uint16_t bitDuration;
-    uint32_t filterAddr;
-    uint32_t filterMask;
-    uint32_t *filterAddresses;
-    uint32_t *filterMasks;
-    size_t filterNumAddresses;
+    float baseFreq = 0;
+    float dataRate = 0;
+    uint32_t baseFreqRaw = 0;
+    uint16_t shiftFreq = 0;
+    uint16_t shiftFreqHz = 0;
+    RadioLibTime_t bitDuration = 0;
+    uint32_t filterAddr = 0;
+    uint32_t filterMask = 0;
+    uint32_t *filterAddresses = nullptr;
+    uint32_t *filterMasks = nullptr;
+    size_t filterNumAddresses = 0;
     bool inv = false;
 
-    void write(uint32_t* data, size_t len);
+    void write(const uint32_t* data, size_t len);
     void write(uint32_t codeWord);
     int16_t startReceiveCommon();
     bool addressMatched(uint32_t addr);
