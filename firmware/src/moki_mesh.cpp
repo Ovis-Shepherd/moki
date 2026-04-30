@@ -43,6 +43,11 @@ extern struct moki_settings_t g_settings;
 // the full struct layout here — keeps moki_mesh.cpp decoupled).
 extern "C" const char *moki_settings_get_channel_name();
 extern "C" const char *moki_settings_get_channel_psk();
+// Multi-channel API (Phase 1 of M4)
+extern "C" int moki_channels_count();
+extern "C" const char *moki_channel_name(int idx);
+extern "C" const char *moki_channel_psk(int idx);
+extern "C" int moki_channels_active_idx();
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -95,8 +100,9 @@ public:
 // ── MyMesh ──────────────────────────────────────────────────────────────────
 
 class MyMesh : public BaseChatMesh, ContactVisitor {
-  ChannelDetails* _moki_channel  = NULL;
-  ChannelDetails* _public_channel = NULL;
+  // Up to MAX_GROUP_CHANNELS channels held — pointers come from addChannel().
+  ChannelDetails* _channels[4] = {NULL, NULL, NULL, NULL};
+  int _num_channels = 0;
   uint32_t _expected_ack_crc = 0;
 
   // ContactVisitor — we don't surface contacts in UI yet.
@@ -132,24 +138,45 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     Serial.println(F("[mesh] tx timeout (no ACK)"));
   }
 
+  // Identify which channel a packet came from by hash matching.
+  int channelIdxByHash(const uint8_t *hash) {
+    for (int i = 0; i < _num_channels; i++) {
+      if (_channels[i] && memcmp(_channels[i]->channel.hash, hash, PATH_HASH_SIZE) == 0) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
   // The channel-message hook — what we actually care about right now.
   // MeshCore wire format: "<sender>: <body>" — we split here so the chat-
   // detail bubbles show sender + text separately, like a real chat client.
   void onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t timestamp, const char *text) override {
-    Serial.printf("[mesh] channel msg (%s, %d hops): %s\n",
-                  pkt->isRouteDirect() ? "direct" : "flood",
+    int ch_idx = channelIdxByHash(channel.hash);
+    const char *ch_name = (ch_idx >= 0) ? moki_channel_name(ch_idx) : "?";
+
+    Serial.printf("[mesh] msg [ch=%s] (%s, %d hops): %s\n",
+                  ch_name, pkt->isRouteDirect() ? "direct" : "flood",
                   pkt->path_len, text);
+
+    // Sender format: "<name>: <body>"
     const char *colon = strstr(text, ": ");
-    if (colon && (colon - text) < 23) {
-      // Split sender (up to 23 chars) and body.
-      char sender[24];
+    if (colon && (colon - text) < 18) {
+      // "<sender> · <ch>" so the bubble header shows both source AND room.
+      char from[24];
       size_t name_len = colon - text;
-      if (name_len >= sizeof(sender)) name_len = sizeof(sender) - 1;
-      memcpy(sender, text, name_len);
-      sender[name_len] = 0;
-      moki_lora_push_msg_external(sender, colon + 2, 0);
+      if (name_len >= 18) name_len = 17;
+      memcpy(from, text, name_len);
+      from[name_len] = ' ';
+      from[name_len + 1] = ':';
+      from[name_len + 2] = '#';
+      strncpy(&from[name_len + 3], ch_name, sizeof(from) - name_len - 4);
+      from[sizeof(from) - 1] = 0;
+      moki_lora_push_msg_external(from, colon + 2, 0);
     } else {
-      moki_lora_push_msg_external("mesh", text, 0);
+      char from[24];
+      snprintf(from, sizeof(from), "mesh:#%s", ch_name);
+      moki_lora_push_msg_external(from, text, 0);
     }
   }
 
@@ -169,22 +196,31 @@ public:
     // pubkey across reboots.
     self_id = mesh::LocalIdentity(&seed_rng);
 
-    // Channel from settings (user-configurable name + Base64 PSK).
-    const char *name = moki_settings_get_channel_name();
-    const char *psk  = moki_settings_get_channel_psk();
-    _moki_channel = addChannel(name, psk);
-
-    Serial.printf("[mesh] identity set, channel '%s' (%s)\n",
-                  name, _moki_channel ? "ok" : "FAILED");
+    // Register all channels from the settings store. RX from any of them
+    // ends up routed via onChannelMessageRecv (channel pointer indicates
+    // which one).
+    int n = moki_channels_count();
+    for (int i = 0; i < n && i < 4; i++) {
+      const char *name = moki_channel_name(i);
+      const char *psk  = moki_channel_psk(i);
+      _channels[i] = addChannel(name, psk);
+      _num_channels++;
+      Serial.printf("[mesh] channel[%d] '%s' (%s)\n",
+                    i, name, _channels[i] ? "ok" : "FAILED");
+    }
+    Serial.printf("[mesh] identity set, %d channels active\n", _num_channels);
   }
 
-  // Returns true if message was queued for transmission.
-  bool sendToMokiChannel(const char *sender_name, const char *text) {
-    if (!_moki_channel) return false;
+  // Returns true if message was queued for transmission to the active channel.
+  bool sendToActiveChannel(const char *sender_name, const char *text) {
+    int idx = moki_channels_active_idx();
+    if (idx < 0 || idx >= _num_channels || !_channels[idx]) return false;
     uint32_t ts = getRTCClock()->getCurrentTimeUnique();
-    bool ok = sendGroupMessage(ts, _moki_channel->channel, sender_name, text, strlen(text));
-    Serial.printf("[mesh] tx '%s': '%s' (%s)\n",
-                  sender_name, text, ok ? "queued" : "FAILED");
+    bool ok = sendGroupMessage(ts, _channels[idx]->channel,
+                               sender_name, text, strlen(text));
+    Serial.printf("[mesh] tx [ch=%s] '%s': '%s' (%s)\n",
+                  moki_channel_name(idx), sender_name, text,
+                  ok ? "queued" : "FAILED");
     return ok;
   }
 };
@@ -214,7 +250,7 @@ void moki_mesh_loop(void) {
 
 bool moki_mesh_send(const char *sender_name, const char *text) {
   if (!g_mesh) return false;
-  return g_mesh->sendToMokiChannel(sender_name, text);
+  return g_mesh->sendToActiveChannel(sender_name, text);
 }
 
 }

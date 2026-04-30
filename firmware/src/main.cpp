@@ -547,9 +547,10 @@ static const char *LORA_PRESET_LABELS[LORA_PRESET_COUNT] = {
 //   - v1: initial layout (sync_interval through lora_tx_armed)
 //   - v2: + lora_preset (uint8) appended
 //   - v3: + mesh_channel_name + mesh_channel_psk_b64 (MeshCore channel)
+//   - v4: + auto_sleep_min, mesh_active_channel (multi-channel selector)
 //   Bump SETTINGS_SCHEMA_V whenever a field is reordered/removed/changed type.
 //   Pure appends keep the version (size-based partial-load handles them).
-#define SETTINGS_SCHEMA_V 3
+#define SETTINGS_SCHEMA_V 4
 typedef struct {
   uint8_t  sync_interval_min;     // 5 / 15 / 30 / 60
   char     share_default[8];      // off / hourly / live
@@ -557,10 +558,25 @@ typedef struct {
   char     bio[80];
   bool     lora_tx_armed;         // false = RX-only (safe without antenna)
   uint8_t  lora_preset;           // LORA_PRESET_*
-  char     mesh_channel_name[16]; // MeshCore group-channel label (UI only)
-  char     mesh_channel_psk_b64[28]; // Base64 16-byte PSK + NUL — 22+1 padded
+  char     mesh_channel_name[16]; // First channel label (legacy, kept for compat)
+  char     mesh_channel_psk_b64[28]; // First channel PSK (legacy)
   uint8_t  auto_sleep_min;        // 0 = off, otherwise sleep after N min idle
+  uint8_t  mesh_active_channel;   // Index into g_channels[] for TX target
 } moki_settings_t;
+
+// ── Multi-Channel Support (Phase 1 of M4) ─────────────────────────────────
+// Up to 4 channels can be active at once. Each has a name + Base64 PSK.
+// Channel #0 mirrors mesh_channel_* fields above for legacy migration.
+// Channels persist as a separate NVS blob "channels" with schema version.
+#define MAX_MOKI_CHANNELS 4
+#define CHANNELS_SCHEMA_V 1
+typedef struct {
+  char name[16];
+  char psk_b64[28];
+  bool active;       // true = registered with MeshCore at boot
+} moki_channel_t;
+static moki_channel_t g_channels[MAX_MOKI_CHANNELS];
+static int g_num_channels = 0;
 // Default uses MeshCore's well-known public PSK so out-of-the-box two Mokis
 // can talk to each other (and any other MeshCore-Public participant).
 static moki_settings_t g_settings = {
@@ -568,7 +584,8 @@ static moki_settings_t g_settings = {
   LORA_PRESET_MESHCORE_NARROW,
   "moki",
   "izOH6cXN6mrJ5e26oRXNcg==",
-  0   // auto_sleep_min — disabled by default (Lucas opts in)
+  0,   // auto_sleep_min — disabled by default (Lucas opts in)
+  0    // mesh_active_channel — index 0 (first channel)
 };
 
 // Activity tracker for auto-sleep — touched on any user input.
@@ -628,6 +645,21 @@ extern "C" const char *moki_settings_get_channel_name() {
 }
 extern "C" const char *moki_settings_get_channel_psk() {
   return g_settings.mesh_channel_psk_b64;
+}
+
+// Multi-channel API: iterate all configured channels at boot, query active.
+extern "C" int moki_channels_count() { return g_num_channels; }
+extern "C" const char *moki_channel_name(int idx) {
+  if (idx < 0 || idx >= g_num_channels) return NULL;
+  return g_channels[idx].name;
+}
+extern "C" const char *moki_channel_psk(int idx) {
+  if (idx < 0 || idx >= g_num_channels) return NULL;
+  return g_channels[idx].psk_b64;
+}
+extern "C" int moki_channels_active_idx() {
+  return (g_settings.mesh_active_channel < g_num_channels)
+         ? g_settings.mesh_active_channel : 0;
 }
 
 static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
@@ -750,6 +782,79 @@ static void state_save_settings(void) {
   g_prefs.end();
   Serial.println(F("[persist] saved settings"));
 }
+// ── Multi-Channel persist (NVS blob "channels") ──────────────────────────
+static void state_save_channels(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt("channels_v", CHANNELS_SCHEMA_V);
+  g_prefs.putUInt("channels_n", (uint32_t)g_num_channels);
+  if (g_num_channels > 0) {
+    g_prefs.putBytes("channels", g_channels,
+                     sizeof(moki_channel_t) * g_num_channels);
+  }
+  g_prefs.end();
+  Serial.printf("[persist] saved %d channels\n", g_num_channels);
+}
+static void state_load_channels(void) {
+  g_prefs.begin("moki", true);
+  uint32_t v = g_prefs.getUInt("channels_v", 0);
+  uint32_t n = g_prefs.getUInt("channels_n", 0xFFFFFFFFu);
+  bool ok = (n != 0xFFFFFFFFu && n <= MAX_MOKI_CHANNELS);
+  if (ok && v == CHANNELS_SCHEMA_V) {
+    g_num_channels = (int)n;
+    if (g_num_channels > 0) {
+      g_prefs.getBytes("channels", g_channels,
+                       sizeof(moki_channel_t) * g_num_channels);
+    }
+    g_prefs.end();
+    Serial.printf("[persist] loaded %d channels\n", g_num_channels);
+  } else {
+    g_prefs.end();
+    // Bootstrap from legacy single-channel settings: copy mesh_channel_*
+    // into g_channels[0] so existing users seamlessly migrate.
+    g_num_channels = 1;
+    strncpy(g_channels[0].name, g_settings.mesh_channel_name,
+            sizeof(g_channels[0].name) - 1);
+    g_channels[0].name[sizeof(g_channels[0].name) - 1] = 0;
+    strncpy(g_channels[0].psk_b64, g_settings.mesh_channel_psk_b64,
+            sizeof(g_channels[0].psk_b64) - 1);
+    g_channels[0].psk_b64[sizeof(g_channels[0].psk_b64) - 1] = 0;
+    g_channels[0].active = true;
+    state_save_channels();
+    Serial.println(F("[persist] channels bootstrapped from legacy settings"));
+  }
+}
+
+// Add a new channel (returns false if already at max).
+static bool channels_add(const char *name, const char *psk_b64) {
+  if (g_num_channels >= MAX_MOKI_CHANNELS) return false;
+  strncpy(g_channels[g_num_channels].name, name,
+          sizeof(g_channels[g_num_channels].name) - 1);
+  g_channels[g_num_channels].name[sizeof(g_channels[g_num_channels].name) - 1] = 0;
+  strncpy(g_channels[g_num_channels].psk_b64, psk_b64,
+          sizeof(g_channels[g_num_channels].psk_b64) - 1);
+  g_channels[g_num_channels].psk_b64[sizeof(g_channels[g_num_channels].psk_b64) - 1] = 0;
+  g_channels[g_num_channels].active = true;
+  g_num_channels++;
+  state_save_channels();
+  return true;
+}
+
+// Remove channel by index (returns false if out of range or last channel).
+static bool channels_remove(int idx) {
+  if (idx < 0 || idx >= g_num_channels) return false;
+  if (g_num_channels <= 1) return false;  // keep at least one
+  for (int i = idx; i < g_num_channels - 1; i++) {
+    g_channels[i] = g_channels[i + 1];
+  }
+  g_num_channels--;
+  if (g_settings.mesh_active_channel >= g_num_channels) {
+    g_settings.mesh_active_channel = 0;
+    state_save_settings();
+  }
+  state_save_channels();
+  return true;
+}
+
 // ── M5-Lite: Reader pagination state ──────────────────────────────────────
 // Saved in NVS as a uint32 under "book_p" so Lucas's last-read page persists
 // across reboots. One book for now; multi-book index lands in M5-Full.
@@ -4247,6 +4352,18 @@ static void on_lora_preset_picked(lv_event_t *e) {
   show_toast(msg);
 }
 
+// Channel chip click — switch active channel for outgoing messages.
+static void on_mesh_channel_picked(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= g_num_channels) return;
+  g_settings.mesh_active_channel = (uint8_t)idx;
+  state_save_settings();
+  char msg[32];
+  snprintf(msg, sizeof(msg), "kanal · %s", g_channels[idx].name);
+  show_toast(msg);
+  switch_screen(SCR_CHAT_DETAIL);
+}
+
 void build_chat_detail(void) {
   if (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT) {
     switch_screen(SCR_CHAT); return;
@@ -4306,6 +4423,42 @@ void build_chat_detail(void) {
   }
 
   if (is_lora) {
+    // ── Channel-Picker (1..4 chips, current active channel highlighted) ──
+    if (g_num_channels > 0) {
+      lv_obj_t *ch_strip = lv_obj_create(scr);
+      lv_obj_remove_style_all(ch_strip);
+      lv_obj_set_size(ch_strip, LV_PCT(100), 50);
+      lv_obj_set_flex_flow(ch_strip, LV_FLEX_FLOW_ROW);
+      lv_obj_set_style_pad_column(ch_strip, 6, LV_PART_MAIN);
+      for (int ci = 0; ci < g_num_channels; ci++) {
+        bool active = (ci == g_settings.mesh_active_channel);
+        lv_obj_t *c = lv_obj_create(ch_strip);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_flex_grow(c, 1);
+        lv_obj_set_height(c, 50);
+        lv_obj_set_style_bg_color(c,
+            lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(c, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+        lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+        lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(c, on_mesh_channel_picked, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)ci);
+        lv_obj_t *l = lv_label_create(c);
+        char tag[24];
+        snprintf(tag, sizeof(tag), "#%s", g_channels[ci].name);
+        lv_label_set_text(l, tag);
+        lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l,
+            lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+        lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+      }
+    }
+
     // ── Preset-Picker (4 chips, current preset highlighted) ──────────────
     lv_obj_t *preset_strip = lv_obj_create(scr);
     lv_obj_remove_style_all(preset_strip);
@@ -5121,6 +5274,7 @@ void setup() {
   state_load_events();
   state_load_identity();
   state_load_book_page();
+  state_load_channels();    // multi-channel list (Phase 1 of M4)
   lora_persist_load();   // restore last LORA_MSG_CAP messages from disk
 
   lora_init();   // safe RX-only by default
@@ -5351,9 +5505,49 @@ static void poll_serial(void) {
           state_save_settings();
           Serial.println(F("[mesh] PSK saved (effective on next boot)"));
         }
-      } else if (line == "channel") {
-        Serial.printf("[mesh] channel='%s' psk='%s'\n",
-                      g_settings.mesh_channel_name, g_settings.mesh_channel_psk_b64);
+      } else if (line == "channel" || line == "ch_list") {
+        Serial.printf("[mesh] %d channels (active=%u):\n",
+                      g_num_channels, (unsigned)g_settings.mesh_active_channel);
+        for (int i = 0; i < g_num_channels; i++) {
+          Serial.printf("  [%d]%s '%s' psk='%s'\n",
+                        i, i == g_settings.mesh_active_channel ? "*" : " ",
+                        g_channels[i].name, g_channels[i].psk_b64);
+        }
+      } else if (line.startsWith("ch_add ")) {
+        // ch_add <name> <psk_b64>
+        String body = line.substring(7); body.trim();
+        int sp = body.indexOf(' ');
+        if (sp <= 0) {
+          Serial.println(F("[mesh] usage: ch_add <name> <psk_b64>"));
+        } else {
+          String n = body.substring(0, sp); n.trim();
+          String p = body.substring(sp + 1); p.trim();
+          if (p.length() != 24) {
+            Serial.println(F("[mesh] PSK must be 24-char Base64"));
+          } else if (!channels_add(n.c_str(), p.c_str())) {
+            Serial.println(F("[mesh] channel list full"));
+          } else {
+            Serial.printf("[mesh] added channel '%s' (effective on next boot)\n",
+                          n.c_str());
+          }
+        }
+      } else if (line.startsWith("ch_remove ")) {
+        int idx = line.substring(10).toInt();
+        if (channels_remove(idx)) {
+          Serial.printf("[mesh] removed channel [%d] (effective on next boot)\n", idx);
+        } else {
+          Serial.println(F("[mesh] cannot remove (last/invalid)"));
+        }
+      } else if (line.startsWith("ch_active ")) {
+        int idx = line.substring(10).toInt();
+        if (idx < 0 || idx >= g_num_channels) {
+          Serial.println(F("[mesh] active idx out of range"));
+        } else {
+          g_settings.mesh_active_channel = (uint8_t)idx;
+          state_save_settings();
+          Serial.printf("[mesh] active channel = [%d] '%s'\n",
+                        idx, g_channels[idx].name);
+        }
       } else if (line == "rtc_raw") {
         // Diagnostic: dump all 11 PCF85063 registers (0x00..0x0A) raw.
         Wire.beginTransmission(PCF85063_SLAVE_ADDRESS);
