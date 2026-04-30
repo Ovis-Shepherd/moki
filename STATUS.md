@@ -320,13 +320,86 @@ ui_entry() → switch_screen(SCR_HOME)
 
 ---
 
-## Was als nächstes lohnt (nicht eilig)
+## Roadmap — 9 Milestones (2026-04-30)
 
-1. **PCF85063 RTC** wiring → echte Datum/Zeit + Habit-Midnight-Rollover
-2. **BQ27220** Battery readout → echte Battery-Anzeige
-3. **Calendar Event Compose** → "+ termin" mit Place + Visibility chips
-4. **Chat Reply Stub** → einfaches "ANTWORTEN" mit Tastatur (in-RAM only first)
-5. **Onboarding First-Boot** → Handle entry für leeres g_settings.handle
-6. **Pet Variants** + Accessories → parametric ears/belly + worn item layer
-7. **Markdown Bold/Italic** im Read-Mode (`**bold**` / `*italic*` inline)
-8. **Stage 8 LoRa+MeshCore** — Sync mit anderen Mokis (Heidelberg-Mesh)
+Geordnet nach Abhängigkeiten + ihrem Wert. Jeder Milestone ist einzeln versandbar.
+
+### M1 · „Two Mokis Talk Securely" (≈2-3h, Foundation steht)
+- AES-128-GCM Wrapper um existing MOKI|-Protokoll
+- Pairing: Identity-Secret als QR-Code anzeigen + scannen (oder Hex-Eingabe)
+- Settings: Friend-PSK pro Kontakt
+- **Voraussetzung:** ✅ erfüllt (Identity-Secret in NVS)
+
+### M2 · „Moki Keeps Time" (≈2h)
+- PCF85063 RTC initialisieren (I2C)
+- Zeit/Datum in Status-Bar + Home
+- 0:00-Habit-Rollover (täglich auf history[83] schreiben)
+- Sync-Interval-Logik aus echter Zeit statt millis()
+
+### M3 · „Moki Lasts a Week" (≈3-4h, kritisch für Slow-Tech-Promise)
+- Deep-Sleep nach 30s Idle (esp_sleep + GT911 IRQ wake)
+- LoRa-RX nur in Bursts (z.B. alle 5 min für 30s)
+- TPS65185 EPD-Power explizit OFF in Sleep
+- LittleFS-Sync nur on-change
+- Akku-Ziel: 2-4 Wochen statt aktuell ~Tage
+
+### M4 · „Friends in Moki" (≈4-6h, depends on M1)
+- BLE-Server (NimBLE-Stack)
+- Pairing-Flow: 2 nahe Mokis → BLE-Discover → Verify-Code-Tausch
+- Friend-List in NVS (mit per-Friend AES-PSK)
+- Profile-Sync (Handle, Bio, Mood)
+- Object-Send über BLE: Buch, Note, Calendar-Event, Map-Location
+
+### M5 · „Read Books on Moki" (≈6-8h, Stage 7-Full)
+- minizip-ng für EPUB-ZIP-Extraction
+- opf-Parser für Inhaltsverzeichnis
+- HTML→Plain-Text Mini-Renderer (basiert auf existing Markdown-Renderer)
+- microSD-Card-Mount für .epub Files
+- Bookmark/Lesefortschritt pro Buch in NVS
+- Stage 7-lite Placeholder ist schon da
+
+### M6 · „Where Am I" (≈8-12h, Stage 9-Full, depends on M2+M4)
+- u-blox MIA-M10Q UART/NMEA-Parser
+- GPS-Power via XL9555 IO-Expander
+- GPS-Fix periodisch (z.B. alle 15 min)
+- Eigene Position + Markierungen auf Map
+- OSM-Tiles auf microSD (HD-Region offline)
+- Geographische Vector-Layer (Neckar, Brücken)
+- GPS-Position via LoRa broadcasten für Friends-Map
+
+### M7 · „Citywide Reach" (≈3-5h, MeshCore Phase 2c-Full + 3)
+- MyMesh : BaseChatMesh subclass
+- Identity (32-Byte) als Ed25519-Seed
+- Adverts + Direct-Messages über RN-Mesh-Repeater
+- Phase-3-Connect-Test mit RN-Mesh-PSK (`izOH6cXN6mrJ5e26oRXNcg==`)
+
+### M8 · „OTA Updates" (≈4-6h, WiFi-Setup nötig)
+- WiFi-Onboarding (SSID/Pass via QR oder Touch)
+- GitHub-Releases-API pollen (wöchentlich)
+- Auto-Update mit Settings-Toggle „Auto-Updates"
+- esp_https_ota für sichere Firmware-Updates
+
+### M9 · „Polish" (parallel zu allem)
+- Touch-Responsiveness-Tuning + Partial-Refresh-Logic
+- Stage 3d Atomic Writes (power-fail-safe write-then-rename)
+- Stage 3e Boot-Integrity-Check (CRC + recovery)
+- Pet-Polish (Pfoten als Halbkreise)
+- Pet-Variants (Wald-Tier / Mond-Geist / Alltagsbegleiter)
+- Markdown Bold/Italic Inline-Render
+- Onboarding-First-Boot-Flow für leeren handle
+
+## Empfohlene Reihenfolge
+
+```
+M1 (Encrypted) ──┐
+                 ├─→ M4 (Friends) ──┐
+M2 (Time) ───────┤                  ├─→ M6 (Map+GPS)
+                 ├─→ M5 (EPUB)      │
+M3 (Battery) ────┘                  │
+                                    │
+M7 (Citywide MeshCore) ─────────────┤
+M8 (OTA) ───────────────────────────┘
+M9 (Polish) — parallel
+```
+
+**Concrete Order:** M1 → M2 → M3 → M5 oder M4 → M6 → M7 → M8 → M9.
