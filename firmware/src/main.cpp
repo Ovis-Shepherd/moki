@@ -272,6 +272,7 @@ typedef struct {
   const char *reset;    // ""/daily/weekly
 } moki_chat_t;
 static const moki_chat_t SAMPLE_CHATS[] = {
+  { "lora",   "#moki-mesh",    "...",                            "live",       0, ""       },
   { "direct", "lina",          "magst du samstag tanzen?",       "vor 8 min",  1, ""       },
   { "group",  "lesekreis",     "walden kap 4 bis freitag ok?",   "vor 2h",     0, "weekly" },
   { "public", "#rhein-neckar", "jemand heute abend am neckar?",  "vor 45 min", 3, "daily"  },
@@ -379,6 +380,7 @@ static void state_init_notes(void) {
 static const char *chat_kind_glyph(const char *kind) {
   if (!strcmp(kind,"direct")) return "1:1";
   if (!strcmp(kind,"group"))  return "GR";
+  if (!strcmp(kind,"lora"))   return "LORA";
   return "PUB";
 }
 static const char *chat_reset_phrase(const char *reset) {
@@ -3654,9 +3656,61 @@ void build_settings(void) {
     lv_obj_set_style_text_letter_space(l, 2, LV_PART_MAIN);
   }
 
+  // LoRa TX-armed toggle
+  lv_obj_t *ll = lv_label_create(scr);
+  lv_label_set_text(ll, "LORA SENDEN");
+  lv_obj_set_style_text_font(ll, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ll, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(ll, 3, LV_PART_MAIN);
+
+  lv_obj_t *lora_strip = lv_obj_create(scr);
+  lv_obj_remove_style_all(lora_strip);
+  lv_obj_set_size(lora_strip, LV_PCT(100), 50);
+  lv_obj_set_flex_flow(lora_strip, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(lora_strip, 8, LV_PART_MAIN);
+
+  static const bool LORA_VAL[] = { false, true };
+  static const char *LORA_LABELS[] = { "AUS · RX-ONLY", "ANTENNE DRAN" };
+  static auto on_lora_picked = [](lv_event_t *e) {
+    g_settings.lora_tx_armed = (bool)(intptr_t)lv_event_get_user_data(e);
+    state_save_settings();
+    show_toast(g_settings.lora_tx_armed ? "TX FREIGEGEBEN" : "RX-ONLY MODUS");
+    switch_screen(SCR_SETTINGS);
+  };
+  for (int i = 0; i < 2; i++) {
+    bool active = (g_settings.lora_tx_armed == LORA_VAL[i]);
+    lv_obj_t *c = lv_obj_create(lora_strip);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_flex_grow(c, 1);
+    lv_obj_set_style_bg_color(c, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(c, lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(c, on_lora_picked, LV_EVENT_CLICKED, (void *)(intptr_t)LORA_VAL[i]);
+    lv_obj_t *l = lv_label_create(c);
+    lv_label_set_text(l, LORA_LABELS[i]);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l,
+        lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+  }
+
+  lv_obj_t *lhint = lv_label_create(scr);
+  lv_label_set_text(lhint,
+    "ohne antenne kann der lora-chip beim senden schaden nehmen.\n"
+    "erst antenne anschrauben, dann freigeben.");
+  lv_obj_set_style_text_font(lhint, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(lhint, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_width(lhint, LV_PCT(100));
+  lv_label_set_long_mode(lhint, LV_LABEL_LONG_WRAP);
+
   // Footer / build info
   lv_obj_t *foot = lv_label_create(scr);
-  lv_label_set_text(foot, "MOKI · BUILD VOM 30. APRIL · v0.4");
+  lv_label_set_text(foot, "MOKI · BUILD VOM 30. APRIL · v0.5");
   lv_obj_set_style_text_font(foot, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(foot, lv_color_hex(MOKI_MID), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(foot, 2, LV_PART_MAIN);
@@ -3683,15 +3737,22 @@ static const chat_msg_t MSGS_RHEIN[] = {
   { "unbekannt · HDB-88dd", "jemand heute abend am neckar?", "vor 45 min" },
 };
 
+extern void open_lora_compose(void);
+static void on_lora_send_clicked(lv_event_t *e) { open_lora_compose(); }
+
 void build_chat_detail(void) {
   if (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT) {
     switch_screen(SCR_CHAT); return;
   }
   const moki_chat_t *c = &SAMPLE_CHATS[g_active_chat];
+  bool is_lora = !strcmp(c->kind, "lora");
   const chat_msg_t *msgs = NULL; int mn = 0;
-  if (g_active_chat == 0) { msgs = MSGS_LINA;       mn = 2; }
-  else if (g_active_chat == 1) { msgs = MSGS_LESEKREIS; mn = 3; }
-  else if (g_active_chat == 2) { msgs = MSGS_RHEIN;     mn = 3; }
+  // Indices shifted by +1 because #moki-mesh is now SAMPLE_CHATS[0]
+  if (!is_lora) {
+    if      (g_active_chat == 1) { msgs = MSGS_LINA;       mn = 2; }
+    else if (g_active_chat == 2) { msgs = MSGS_LESEKREIS;  mn = 3; }
+    else if (g_active_chat == 3) { msgs = MSGS_RHEIN;      mn = 3; }
+  }
 
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
@@ -3737,46 +3798,319 @@ void build_chat_detail(void) {
     lv_obj_set_style_text_letter_space(r, 2, LV_PART_MAIN);
   }
 
-  // Messages (bubble-ish — own messages right, others left)
-  for (int i = 0; i < mn; i++) {
-    bool own = (msgs[i].from[0] == 'l' && !strcmp(msgs[i].from, "levin"));  // none, all are others
-    (void)own;
-    lv_obj_t *bubble = lv_obj_create(scr);
-    lv_obj_remove_style_all(bubble);
-    lv_obj_set_size(bubble, LV_PCT(95), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(bubble, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(bubble, lv_color_hex(MOKI_MID), LV_PART_MAIN);
-    lv_obj_set_style_border_width(bubble, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(bubble, 2, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(bubble, 12, LV_PART_MAIN);
-    lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
+  if (is_lora) {
+    // Show LoRa status + messages from g_lora_msgs ring buffer
+    char status[80];
+    snprintf(status, sizeof(status), "%s · RX %lu · TX %lu · %s",
+             g_lora_status,
+             (unsigned long)g_lora_rx_count,
+             (unsigned long)g_lora_tx_count,
+             g_settings.lora_tx_armed ? "TX FREI" : "RX-ONLY");
+    lv_obj_t *st = lv_label_create(scr);
+    lv_label_set_text(st, status);
+    lv_obj_set_style_text_font(st, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(st, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(st, 1, LV_PART_MAIN);
 
-    char hdr[64]; snprintf(hdr, sizeof(hdr), "%s · %s", msgs[i].from, msgs[i].ts);
-    lv_obj_t *h = lv_label_create(bubble);
-    lv_label_set_text(h, hdr);
-    lv_obj_set_style_text_font(h, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(h, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(h, 1, LV_PART_MAIN);
+    if (g_lora_msg_count == 0) {
+      lv_obj_t *empty = lv_label_create(scr);
+      lv_label_set_text(empty,
+        "noch keine nachrichten empfangen.\n"
+        "antenne dran, dann signale aus dem äther.");
+      lv_obj_set_style_text_font(empty, &moki_fraunces_italic_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(empty, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_width(empty, LV_PCT(100));
+      lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+    } else {
+      // Iterate ring buffer in oldest→newest order
+      int start = (g_lora_msg_count == LORA_MSG_CAP) ? g_lora_msg_head : 0;
+      for (int n = 0; n < g_lora_msg_count; n++) {
+        int idx = (start + n) % LORA_MSG_CAP;
+        const moki_lora_msg_t *m = &g_lora_msgs[idx];
 
-    lv_obj_t *t = lv_label_create(bubble);
-    lv_label_set_text(t, msgs[i].text);
-    lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
-    lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_width(t, LV_PCT(100));
-    lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_pad_top(t, 4, LV_PART_MAIN);
+        lv_obj_t *bubble = lv_obj_create(scr);
+        lv_obj_remove_style_all(bubble);
+        lv_obj_set_size(bubble, LV_PCT(95), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(bubble, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+        lv_obj_set_style_border_width(bubble, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(bubble, 2, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(bubble, 12, LV_PART_MAIN);
+        lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
+
+        char hdr[80];
+        if (m->rssi)
+          snprintf(hdr, sizeof(hdr), "%s · RSSI %d dBm", m->from, m->rssi);
+        else
+          snprintf(hdr, sizeof(hdr), "%s · gesendet", m->from);
+        lv_obj_t *h = lv_label_create(bubble);
+        lv_label_set_text(h, hdr);
+        lv_obj_set_style_text_font(h, &moki_jetbrains_mono_22, LV_PART_MAIN);
+        lv_obj_set_style_text_color(h, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+        lv_obj_set_style_text_letter_space(h, 1, LV_PART_MAIN);
+
+        lv_obj_t *t = lv_label_create(bubble);
+        lv_label_set_text(t, m->text);
+        lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
+        lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+        lv_obj_set_width(t, LV_PCT(100));
+        lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_pad_top(t, 4, LV_PART_MAIN);
+      }
+    }
+
+    lv_obj_t *send = lv_obj_create(scr);
+    lv_obj_remove_style_all(send);
+    lv_obj_set_size(send, LV_PCT(100), 56);
+    lv_obj_set_style_bg_color(send,
+        lv_color_hex(g_settings.lora_tx_armed ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(send, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(send, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(send, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(send, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(send, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(send, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(send, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(send, on_lora_send_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(send);
+    lv_label_set_text(sl, g_settings.lora_tx_armed ? "+ NACHRICHT SENDEN" : "ANTENNE DRAN? IN EINSTELLUNGEN ARMEN");
+    lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sl,
+        lv_color_hex(g_settings.lora_tx_armed ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(sl, 2, LV_PART_MAIN);
+  } else {
+    // Sample-data conversation
+    for (int i = 0; i < mn; i++) {
+      lv_obj_t *bubble = lv_obj_create(scr);
+      lv_obj_remove_style_all(bubble);
+      lv_obj_set_size(bubble, LV_PCT(95), LV_SIZE_CONTENT);
+      lv_obj_set_style_bg_color(bubble, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(bubble, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_border_width(bubble, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(bubble, 2, LV_PART_MAIN);
+      lv_obj_set_style_pad_all(bubble, 12, LV_PART_MAIN);
+      lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
+
+      char hdr[64]; snprintf(hdr, sizeof(hdr), "%s · %s", msgs[i].from, msgs[i].ts);
+      lv_obj_t *h = lv_label_create(bubble);
+      lv_label_set_text(h, hdr);
+      lv_obj_set_style_text_font(h, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(h, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(h, 1, LV_PART_MAIN);
+
+      lv_obj_t *t = lv_label_create(bubble);
+      lv_label_set_text(t, msgs[i].text);
+      lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
+      lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_width(t, LV_PCT(100));
+      lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+      lv_obj_set_style_pad_top(t, 4, LV_PART_MAIN);
+    }
+
+    lv_obj_t *foot = lv_label_create(scr);
+    lv_label_set_text(foot, "ANTWORTEN KOMMT IM NÄCHSTEN UPDATE.");
+    lv_obj_set_style_text_font(foot, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(foot, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(foot, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(foot, 12, LV_PART_MAIN);
   }
-
-  lv_obj_t *foot = lv_label_create(scr);
-  lv_label_set_text(foot, "ANTWORTEN KOMMT IM NÄCHSTEN UPDATE.");
-  lv_obj_set_style_text_font(foot, &moki_jetbrains_mono_22, LV_PART_MAIN);
-  lv_obj_set_style_text_color(foot, lv_color_hex(MOKI_MID), LV_PART_MAIN);
-  lv_obj_set_style_text_letter_space(foot, 2, LV_PART_MAIN);
-  lv_obj_set_style_pad_top(foot, 12, LV_PART_MAIN);
 }
 
 // ----------------------------------------------------------------------------
+// Forward declaration — actual lora_send lives in the LoRa section below.
+static bool lora_send(const char *text);
+
+// ============================================================================
+// LoRa-Compose — small overlay reusing the German keyboard for chat input.
+// ============================================================================
+static char       g_lora_compose[160] = "";
+static lv_obj_t  *g_lora_overlay      = NULL;
+static lv_obj_t  *g_lora_compose_lbl  = NULL;
+
+static void lora_compose_close(void) {
+  if (g_lora_overlay) { lv_obj_del(g_lora_overlay); g_lora_overlay = NULL; g_lora_compose_lbl = NULL; }
+}
+static void on_lora_compose_cancel(lv_event_t *e) {
+  g_lora_compose[0] = 0;
+  lora_compose_close();
+}
+static void on_lora_compose_save(lv_event_t *e) {
+  if (g_lora_compose[0] == 0) { lora_compose_close(); return; }
+  bool ok = lora_send(g_lora_compose);
+  show_toast(ok ? "GESENDET ÜBER LORA" : "TX NICHT FREI · ANTENNE PRÜFEN");
+  g_lora_compose[0] = 0;
+  lora_compose_close();
+  switch_screen(SCR_CHAT_DETAIL);
+}
+static void lora_compose_key_event(const char *key) {
+  size_t len = strlen(g_lora_compose);
+  if (!strcmp(key, "BACK")) {
+    if (len > 0) {
+      do { len--; } while (len > 0 && (((unsigned char)g_lora_compose[len]) & 0xC0) == 0x80);
+      g_lora_compose[len] = 0;
+    }
+  } else if (!strcmp(key, "SPACE")) {
+    if (len + 1 < sizeof(g_lora_compose)) { g_lora_compose[len] = ' '; g_lora_compose[len+1] = 0; }
+  } else {
+    size_t klen = strlen(key);
+    if (len + klen + 1 < sizeof(g_lora_compose)) {
+      memcpy(g_lora_compose + len, key, klen);
+      g_lora_compose[len + klen] = 0;
+    }
+  }
+  if (g_lora_compose_lbl)
+    lv_label_set_text(g_lora_compose_lbl, g_lora_compose[0] ? g_lora_compose : "…");
+}
+static void on_lora_key_clicked(lv_event_t *e) {
+  lora_compose_key_event((const char *)lv_event_get_user_data(e));
+}
+
+void open_lora_compose(void) {
+  if (g_lora_overlay) return;
+  g_lora_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(g_lora_overlay);
+  lv_obj_set_size(g_lora_overlay, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_color(g_lora_overlay, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(g_lora_overlay, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_flex_flow(g_lora_overlay, LV_FLEX_FLOW_COLUMN);
+
+  // Header
+  lv_obj_t *hdr = lv_obj_create(g_lora_overlay);
+  lv_obj_remove_style_all(hdr);
+  lv_obj_set_size(hdr, LV_PCT(100), 56);
+  lv_obj_set_style_pad_left(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(hdr, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+  lv_obj_set_style_border_width(hdr, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_t *cancel = lv_label_create(hdr);
+  lv_label_set_text(cancel, "ABBRECHEN");
+  lv_obj_set_style_text_font(cancel, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cancel, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(cancel, 2, LV_PART_MAIN);
+  lv_obj_add_flag(cancel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(cancel, on_lora_compose_cancel, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *t = lv_label_create(hdr);
+  lv_label_set_text(t, "LORA SENDEN");
+  lv_obj_set_style_text_font(t, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(t, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(t, 3, LV_PART_MAIN);
+
+  lv_obj_t *send = lv_label_create(hdr);
+  lv_label_set_text(send, "SENDEN");
+  lv_obj_set_style_text_font(send, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(send, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(send, 2, LV_PART_MAIN);
+  lv_obj_add_flag(send, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(send, on_lora_compose_save, LV_EVENT_CLICKED, NULL);
+
+  // Body
+  lv_obj_t *body = lv_obj_create(g_lora_overlay);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_size(body, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_style_pad_left(body, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(body, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(body, 24, LV_PART_MAIN);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(body, 12, LV_PART_MAIN);
+
+  lv_obj_t *kicker = lv_label_create(body);
+  lv_label_set_text(kicker, "AN MOKI-MESH (868 MHZ)");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  g_lora_compose_lbl = lv_label_create(body);
+  lv_label_set_text(g_lora_compose_lbl, g_lora_compose[0] ? g_lora_compose : "…");
+  lv_obj_set_style_text_font(g_lora_compose_lbl, &moki_fraunces_regular_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(g_lora_compose_lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_side(g_lora_compose_lbl, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(g_lora_compose_lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(g_lora_compose_lbl, 2, LV_PART_MAIN);
+  lv_obj_set_width(g_lora_compose_lbl, LV_PCT(100));
+  lv_label_set_long_mode(g_lora_compose_lbl, LV_LABEL_LONG_WRAP);
+
+  // Compact keyboard
+  lv_obj_t *kb = lv_obj_create(g_lora_overlay);
+  lv_obj_remove_style_all(kb);
+  lv_obj_set_size(kb, LV_PCT(100), 240);
+  lv_obj_set_style_bg_color(kb, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_side(kb, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+  lv_obj_set_style_border_color(kb, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(kb, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(kb, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(kb, 6, LV_PART_MAIN);
+  lv_obj_set_flex_flow(kb, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(kb, 4, LV_PART_MAIN);
+
+  static const char *r1[] = {"q","w","e","r","t","z","u","i","o","p"};
+  static const char *r2[] = {"a","s","d","f","g","h","j","k","l","ä"};
+  static const char *r3[] = {"y","x","c","v","b","n","m","ö","ü","ß"};
+  auto build_kb_row = [&](const char *const *keys) {
+    lv_obj_t *row = lv_obj_create(kb);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 56);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 4, LV_PART_MAIN);
+    for (int i = 0; i < 10; i++) {
+      lv_obj_t *btn = lv_obj_create(row);
+      lv_obj_remove_style_all(btn);
+      lv_obj_set_size(btn, 48, 50);
+      lv_obj_set_style_bg_color(btn, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(btn, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(btn, 2, LV_PART_MAIN);
+      lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(btn, on_lora_key_clicked, LV_EVENT_CLICKED, (void *)keys[i]);
+      lv_obj_t *l = lv_label_create(btn);
+      lv_label_set_text(l, keys[i]);
+      lv_obj_set_style_text_font(l, &moki_fraunces_regular_36, LV_PART_MAIN);
+      lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_center(l);
+    }
+  };
+  build_kb_row(r1); build_kb_row(r2); build_kb_row(r3);
+
+  lv_obj_t *r4 = lv_obj_create(kb);
+  lv_obj_remove_style_all(r4);
+  lv_obj_set_size(r4, LV_PCT(100), 56);
+  lv_obj_set_flex_flow(r4, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(r4, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(r4, 6, LV_PART_MAIN);
+  auto big = [&](const char *txt, const char *kk, int w) {
+    lv_obj_t *btn = lv_obj_create(r4);
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_size(btn, w, 50);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 2, LV_PART_MAIN);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, on_lora_key_clicked, LV_EVENT_CLICKED, (void *)kk);
+    lv_obj_t *l = lv_label_create(btn);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_center(l);
+  };
+  big("ENTF",        "BACK",  100);
+  big("LEERZEICHEN", "SPACE", 280);
+  big(".",           ".",     60);
+}
+
 // ============================================================================
 // LoRa SX1262 — RX-by-default for safety. TX only when antenna confirmed via
 // settings (lora_tx_armed). Power supply for radio + GPS is gated by IO0 of
@@ -4031,6 +4365,24 @@ static void poll_serial(void) {
       } else if (line.startsWith("goto ")) {
         int n = line.substring(5).toInt();
         switch_screen((screen_id_t)n);
+      } else if (line == "lora") {
+        Serial.printf("[lora] status='%s' rx=%lu tx=%lu armed=%d msgs=%d\n",
+                      g_lora_status,
+                      (unsigned long)g_lora_rx_count,
+                      (unsigned long)g_lora_tx_count,
+                      g_settings.lora_tx_armed ? 1 : 0,
+                      g_lora_msg_count);
+      } else if (line.startsWith("lorasend ")) {
+        // Inject a fake received message (for UI testing without a 2nd device)
+        const String text = line.substring(9);
+        lora_push_msg("test", text.c_str(), -42);
+        Serial.println(F("[lora] injected fake rx"));
+      } else if (line == "loraarm") {
+        g_settings.lora_tx_armed = true; state_save_settings();
+        Serial.println(F("[lora] tx armed via serial"));
+      } else if (line == "loradisarm") {
+        g_settings.lora_tx_armed = false; state_save_settings();
+        Serial.println(F("[lora] tx disarmed"));
       } else if (line == "dump") {
         Serial.printf("[dump] screen=%d heap=%u psram=%u todos=%d habits=%d\n",
                       (int)current_screen,
