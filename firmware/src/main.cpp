@@ -1444,6 +1444,12 @@ static inline void check_err(enum EpdDrawError err) {
 // LVGL flush callback — converts each LVGL 32-bit pixel to a 4-bit greyscale
 // value (luminance) and writes it into a 4-bit-packed buffer (two pixels per
 // byte: low nibble = even x, high nibble = odd x).
+// Track the dirty area LVGL hands us — flush_timer_cb uses this to do a
+// PARTIAL EPD update instead of the full 540×960. For typing/scrolling a
+// label, the dirty rect is often <50px tall — 10× smaller area means 10×
+// less data through the EPD waveform = visibly snappier updates.
+static volatile int g_dirty_x = 0, g_dirty_y = 0, g_dirty_w = 0, g_dirty_h = 0;
+
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   if (disp_flush_enabled) {
     uint16_t       w   = lv_area_get_width(area);
@@ -1467,31 +1473,60 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
       }
       t32++;
     }
+
+    // Push this chunk into the framebuffer at its actual position. Multiple
+    // chunks per render union into a single dirty rect for the EPD update.
+    EpdRect rect = { .x = area->x1, .y = area->y1, .width = w, .height = h };
+    epd_draw_rotated_image(rect, decodebuffer, epd_hl_get_framebuffer(&hl));
+
+    // Union with any previous chunk(s) in this same render cycle.
+    if (g_dirty_w == 0) {
+      g_dirty_x = rect.x; g_dirty_y = rect.y;
+      g_dirty_w = rect.width; g_dirty_h = rect.height;
+    } else {
+      int x2 = (rect.x + rect.width)  > (g_dirty_x + g_dirty_w)  ? rect.x + rect.width  : g_dirty_x + g_dirty_w;
+      int y2 = (rect.y + rect.height) > (g_dirty_y + g_dirty_h)  ? rect.y + rect.height : g_dirty_y + g_dirty_h;
+      if (rect.x < g_dirty_x) g_dirty_x = rect.x;
+      if (rect.y < g_dirty_y) g_dirty_y = rect.y;
+      g_dirty_w = x2 - g_dirty_x;
+      g_dirty_h = y2 - g_dirty_y;
+    }
   }
   lv_disp_flush_ready(disp);
 }
 
 static void flush_timer_cb(lv_timer_t *t) {
-  EpdRect render_area = {
-      .x = 0, .y = 0,
-      .width  = (int)epd_rotated_display_width(),
-      .height = (int)epd_rotated_display_height(),
+  // Bail out if no chunks were captured (defensive — shouldn't happen).
+  if (g_dirty_w == 0 || g_dirty_h == 0) {
+    lv_timer_pause(flush_timer);
+    return;
+  }
+
+  // Use the union of all chunks captured in disp_flush as the EPD update area.
+  // Massive win over hardcoded full-screen: typing a key only updates ~50px tall.
+  EpdRect dirty = {
+    .x = g_dirty_x, .y = g_dirty_y,
+    .width = g_dirty_w, .height = g_dirty_h
   };
-  epd_draw_rotated_image(render_area, decodebuffer, epd_hl_get_framebuffer(&hl));
+
   epd_poweron();
-  // Speed strategy: our disp_flush already threshold-snaps colors to pure
-  // black/white (y8<80 → 0, y8>175 → 255), so the framebuffer is effectively
-  // 1-bit by the time it reaches the EPD. MODE_DU is the 1-bit fast mode
-  // (~150ms vs MODE_GC16's ~750ms) and gives identical visual output for
-  // our binary content. Every 8 updates we kick a MODE_GC16 cycle to clear
-  // any ghosting that accumulates from the differential MODE_DU updates.
+  // MODE_DU (1-bit, ~150ms for full screen — proportionally less for partials)
+  // is fine because disp_flush threshold-snaps to pure black/white. Every 8th
+  // flush we run a MODE_GC16 full-screen pass to flush ghosting.
   static uint32_t flush_count = 0;
   bool full_refresh = ((flush_count & 7) == 0);
-  EpdDrawMode mode = full_refresh ? MODE_GC16 : MODE_DU;
-  check_err(epd_hl_update_screen(&hl, mode, epd_ambient_temperature()));
+  if (full_refresh) {
+    check_err(epd_hl_update_screen(&hl, MODE_GC16, epd_ambient_temperature()));
+    Serial.println(F("[epd] full GC16 cleanup"));
+  } else {
+    check_err(epd_hl_update_area(&hl, MODE_DU, epd_ambient_temperature(), dirty));
+  }
   epd_poweroff();
-  if (full_refresh) Serial.println(F("[epd] flush done (MODE_GC16 cleanup)"));
   flush_count++;
+
+  // Reset dirty rect for the next render cycle.
+  g_dirty_x = g_dirty_y = g_dirty_w = g_dirty_h = 0;
+
   lv_timer_pause(flush_timer);
 }
 
