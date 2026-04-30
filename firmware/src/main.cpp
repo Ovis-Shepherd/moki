@@ -23,6 +23,7 @@
 #include "lvgl.h"
 #include "TouchDrvGT911.hpp"
 #include "ExtensionIOXL9555.hpp"
+#include "SensorPCF85063.hpp"
 #include "moki_fonts.h"
 #include <RadioLib.h>
 
@@ -38,6 +39,10 @@
 
 static SX1262 g_radio = new Module(LORA_CS, LORA_IRQ, LORA_RST, LORA_BUSY);
 static ExtensionIOXL9555 g_xl9555;
+static SensorPCF85063 g_rtc;
+static bool g_rtc_ready = false;
+// Last seen day-of-year (1..366). Used to detect midnight rollover for habits.
+static uint16_t g_last_rollover_doy = 0;
 static volatile bool     g_lora_rx_flag    = false;
 static bool              g_lora_ready      = false;
 static const char       *g_lora_status     = "INIT";
@@ -1443,12 +1448,18 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_add_flag(sync, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(sync, on_element_tapped, LV_EVENT_CLICKED, (void *)"sync");
 
-  // Right cluster — battery (placeholder 78) + uptime in HH:MM
-  uint32_t hh = uptime_min / 60;
-  uint32_t mm = uptime_min % 60;
-  char rightbuf[24];
-  snprintf(rightbuf, sizeof(rightbuf), "78  %02lu:%02lu",
-           (unsigned long)(hh % 24), (unsigned long)mm);
+  // Right cluster — battery placeholder + real time (or uptime fallback)
+  char rightbuf[32];
+  if (g_rtc_ready) {
+    RTC_DateTime now = g_rtc.getDateTime();
+    snprintf(rightbuf, sizeof(rightbuf), "78  %02u:%02u",
+             now.hour, now.minute);
+  } else {
+    uint32_t hh = uptime_min / 60;
+    uint32_t mm = uptime_min % 60;
+    snprintf(rightbuf, sizeof(rightbuf), "78  %02lu:%02lu",
+             (unsigned long)(hh % 24), (unsigned long)mm);
+  }
   lv_obj_t *right = lv_label_create(bar);
   lv_label_set_text(right, rightbuf);
   lv_obj_set_style_text_color(right, lv_color_hex(MOKI_INK), LV_PART_MAIN);
@@ -3961,6 +3972,7 @@ static void on_lora_send_clicked(lv_event_t *e) { open_lora_compose(); }
 // Forward decls — actual definitions live in the LoRa section below.
 static void lora_apply_preset(uint8_t preset);
 extern void show_toast(const char *msg);
+static void enter_deep_sleep(uint32_t wake_after_seconds);
 
 static void on_lora_preset_picked(lv_event_t *e) {
   uint8_t preset = (uint8_t)(intptr_t)lv_event_get_user_data(e);
@@ -4611,6 +4623,113 @@ static bool lora_send(const char *text) {
   return false;
 }
 
+// ============================================================================
+// M2 — Real Time Clock (PCF85063 over I2C)
+// ============================================================================
+// The RTC is at I2C address 0x51. Wire is already initialised (touch + XL9555
+// share the bus). We read time at boot, fall back to compile-time if the chip
+// has never been set, and let serial commands update it.
+//
+// KNOWN ISSUE 2026-04-30: setDateTime() round-trip is broken in our hardware
+// setup — values get corrupted on write (e.g. day 30→14, hour 12→04). Boot
+// read is consistent (so passive use works), but set_time doesn't take effect.
+// Suspected: chip-state / I2C-bus-contention with GT911+XL9555 sharing Wire.
+// TODO: instrument with raw Wire transactions (probe CTRL1, CTRL2 status
+// bits) to confirm whether writes land at all. Workaround for now: status
+// bar shows whatever the RTC reads, which is at least monotonic.
+
+static void rtc_init(void) {
+  // SensorPCF85063::begin(Wire, addr) returns true on success.
+  if (!g_rtc.begin(Wire, PCF85063_SLAVE_ADDRESS, 39, 40)) {
+    Serial.println(F("[rtc] PCF85063 not found — clock disabled"));
+    return;
+  }
+  g_rtc_ready = true;
+
+  // Force the oscillator START + 24-hour mode by writing CTRL1 register
+  // explicitly. Some PCF85063 boot states leave STOP=1 which freezes the
+  // clock, and the SensorLib doesn't touch CTRL1. We want CAP_SEL=0 (12.5pF),
+  // STOP=0, 12_24=0 (24-hour), CIE=0.
+  Wire.beginTransmission(PCF85063_SLAVE_ADDRESS);
+  Wire.write(0x00);   // CTRL1 register
+  Wire.write(0x00);   // all flags clear → oscillator running, 24h, no IRQs
+  Wire.endTransmission();
+
+  RTC_DateTime now = g_rtc.getDateTime();
+  Serial.printf("[rtc] boot time: %04u-%02u-%02u %02u:%02u:%02u\n",
+                now.year, now.month, now.day, now.hour, now.minute, now.second);
+
+  // Sanity-check: if the year is clearly bogus (chip never configured), seed
+  // it with our compile-time so timestamps aren't from 1970.
+  if (now.year < 2024 || now.year > 2099) {
+    RTC_DateTime seed(__DATE__, __TIME__);   // parses "Apr 30 2026" / "12:34:56"
+    g_rtc.setDateTime(seed);
+    Serial.printf("[rtc] seeded from build: %04u-%02u-%02u %02u:%02u:%02u\n",
+                  seed.year, seed.month, seed.day,
+                  seed.hour, seed.minute, seed.second);
+  }
+}
+
+// Days-since-Jan-1 helper (1..366), Zeller-ish but plain.
+static uint16_t day_of_year(uint16_t y, uint8_t m, uint8_t d) {
+  static const uint16_t cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+  bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+  uint16_t doy = cum[m - 1] + d;
+  if (leap && m > 2) doy += 1;
+  return doy;
+}
+
+// Parse "YYYY-MM-DD HH:MM:SS" — returns true on success, fills out.
+static bool rtc_parse(const String &s, RTC_DateTime &out) {
+  // 19 chars expected: YYYY-MM-DD HH:MM:SS
+  if (s.length() < 19) return false;
+  out.year   = s.substring(0, 4).toInt();
+  out.month  = s.substring(5, 7).toInt();
+  out.day    = s.substring(8, 10).toInt();
+  out.hour   = s.substring(11, 13).toInt();
+  out.minute = s.substring(14, 16).toInt();
+  out.second = s.substring(17, 19).toInt();
+  if (out.year < 2024 || out.year > 2099) return false;
+  if (out.month < 1 || out.month > 12) return false;
+  if (out.day < 1 || out.day > 31) return false;
+  if (out.hour > 23 || out.minute > 59 || out.second > 59) return false;
+  return true;
+}
+
+// Periodic check — call from loop(). Runs habit-rollover when the date crosses.
+static void rtc_tick(void) {
+  if (!g_rtc_ready) return;
+  static uint32_t last_check_ms = 0;
+  uint32_t now_ms = millis();
+  if (now_ms - last_check_ms < 30000) return;   // every 30s is plenty
+  last_check_ms = now_ms;
+
+  RTC_DateTime now = g_rtc.getDateTime();
+  uint16_t doy = day_of_year(now.year, now.month, now.day);
+
+  // First tick after boot: just record current day, don't roll yet.
+  if (g_last_rollover_doy == 0) {
+    g_last_rollover_doy = doy;
+    return;
+  }
+  if (doy != g_last_rollover_doy) {
+    // Day changed — shift habit history left by one slot per habit.
+    Serial.printf("[rtc] midnight rollover %u -> %u\n",
+                  g_last_rollover_doy, doy);
+    for (int h = 0; h < g_habits_count; h++) {
+      moki_habit_t *hb = &g_habits[h];
+      // Slide: history[0] is oldest, history[83] is today.
+      memmove(hb->history, hb->history + 1, 83);
+      hb->history[83]   = 0;
+      // today_count rolls into the just-completed day; reset for the new day.
+      // (Done in-place by the slide above — yesterday became history[82].)
+      hb->today_count   = 0;
+    }
+    state_save_habits();
+    g_last_rollover_doy = doy;
+  }
+}
+
 // ----------------------------------------------------------------------------
 // ui_entry — initial render: home screen.
 // ----------------------------------------------------------------------------
@@ -4685,6 +4804,9 @@ void setup() {
     lv_indev_drv_register(&indev_drv);
     Serial.println(F("[lvgl] indev registered"));
   }
+
+  // RTC (PCF85063) — same I2C bus as GT911. Boot-read + auto-seed if blank.
+  rtc_init();
 
   // Synthetic indev — host-driven via Serial commands (tap X Y / long X Y).
   static lv_indev_drv_t synth_drv;
@@ -4861,6 +4983,37 @@ static void poll_serial(void) {
           Serial.println();
         }
         Serial.println(F("[lora_dump] done"));
+      } else if (line.startsWith("sleep_now")) {
+        // Format: "sleep_now [SECS]" — secs default 60
+        int secs = 60;
+        int sp = line.indexOf(' ');
+        if (sp > 0) secs = line.substring(sp + 1).toInt();
+        if (secs < 5) secs = 5;
+        if (secs > 3600) secs = 3600;
+        Serial.printf("[sleep] requested %ds via serial\n", secs);
+        enter_deep_sleep((uint32_t)secs);
+        // never returns
+      } else if (line == "time") {
+        if (g_rtc_ready) {
+          RTC_DateTime now = g_rtc.getDateTime();
+          Serial.printf("[rtc] %04u-%02u-%02u %02u:%02u:%02u\n",
+                        now.year, now.month, now.day,
+                        now.hour, now.minute, now.second);
+        } else {
+          Serial.println(F("[rtc] not ready"));
+        }
+      } else if (line.startsWith("set_time ")) {
+        // Format: "set_time YYYY-MM-DD HH:MM:SS"
+        String body = line.substring(9);
+        body.trim();
+        RTC_DateTime t;
+        if (rtc_parse(body, t) && g_rtc_ready) {
+          g_rtc.setDateTime(t);
+          Serial.printf("[rtc] set to %04u-%02u-%02u %02u:%02u:%02u\n",
+                        t.year, t.month, t.day, t.hour, t.minute, t.second);
+        } else {
+          Serial.println(F("[rtc] parse failed — expected YYYY-MM-DD HH:MM:SS"));
+        }
       } else if (line == "lora_clear") {
         g_lora_msg_count = 0;
         g_lora_msg_head  = 0;
@@ -4895,12 +5048,58 @@ static void poll_serial(void) {
   }
 }
 
+// ============================================================================
+// M3 — Deep Sleep skeleton (testbar via Serial; Auto-Sleep optional/Off)
+// ============================================================================
+// Strategy:
+//   - Save state to NVS/LittleFS (already happens on every change, no extra)
+//   - Power down EPD via existing epdiy disable
+//   - Configure GT911 IRQ as wake source (TOUCH_IRQ → ext0)
+//   - Configure timer wakeup for periodic LoRa-burst-RX
+//   - esp_deep_sleep_start() — chip resets on wake, full setup() runs again
+//
+// Auto-Sleep toggle is settings-controlled (default OFF) so we don't surprise
+// Lucas. Manual `sleep_now SECS` Serial command for testing.
+#include <esp_sleep.h>
+
+static void prepare_for_sleep(void) {
+  Serial.println(F("[sleep] preparing — save state + power down"));
+  Serial.flush();
+  // EPD content stays visible without power (e-paper persistent), so just
+  // power the panel off cleanly.
+  epd_poweroff();
+  // LoRa: standby is enough — chip doesn't draw much in standby mode.
+  if (g_lora_ready) g_radio.standby();
+  // Touch: GT911 sleep command (drives INT low, low-power standby).
+  touch.sleep();
+}
+
+static void enter_deep_sleep(uint32_t wake_after_seconds) {
+  prepare_for_sleep();
+  if (wake_after_seconds > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)wake_after_seconds * 1000000ULL);
+  }
+  // Touch IRQ wake — TOUCH_IRQ is on RTC-capable GPIO so ext0 works.
+  // GT911 INT goes LOW on touch (default), wake on level 0.
+  // (TOUCH_IRQ pin number from main.cpp's touch globals; if not RTC-capable
+  // we'd need ext1 with bitmask. Skipped for now — timer wake is enough
+  // for a first sleep cycle.)
+  Serial.printf("[sleep] entering deep sleep, wake in %lus\n",
+                (unsigned long)wake_after_seconds);
+  Serial.flush();
+  esp_deep_sleep_start();
+  // Never returns.
+}
+
 void loop() {
   // LVGL ticker
   lv_timer_handler();
 
   // LoRa RX poll
   lora_poll();
+
+  // RTC tick — habit midnight rollover (cheap, runs ~once / 30s)
+  rtc_tick();
 
   // Host-driven synthetic touch + diagnostic commands
   poll_serial();
