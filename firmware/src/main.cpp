@@ -320,9 +320,9 @@ static void state_init_notes(void) {
 }
 
 static const char *chat_kind_glyph(const char *kind) {
-  if (!strcmp(kind,"direct")) return "◯";
-  if (!strcmp(kind,"group"))  return "◑";
-  return "◉";
+  if (!strcmp(kind,"direct")) return "1:1";
+  if (!strcmp(kind,"group"))  return "GR";
+  return "PUB";
 }
 static const char *chat_reset_phrase(const char *reset) {
   if (!strcmp(reset,"daily"))  return "noch heute · dann leer";
@@ -340,11 +340,13 @@ static const char *cat_label(const char *cat) {
   return cat;
 }
 static const char *cat_mark(const char *cat) {
-  if (!strcmp(cat,"home"))   return "◯";
-  if (!strcmp(cat,"plants")) return "◐";
-  if (!strcmp(cat,"work"))   return "◑";
-  if (!strcmp(cat,"self"))   return "◉";
-  if (!strcmp(cat,"social")) return "◈";
+  // Cat-marks need to live in our font glyph set (ASCII + selected unicode).
+  // Use single-letter abbreviations where geometric-shapes glyphs are absent.
+  if (!strcmp(cat,"home"))   return "H";
+  if (!strcmp(cat,"plants")) return "P";
+  if (!strcmp(cat,"work"))   return "W";
+  if (!strcmp(cat,"self"))   return "S";
+  if (!strcmp(cat,"social")) return "F";
   return "·";
 }
 
@@ -353,7 +355,8 @@ static const char *cat_mark(const char *cat) {
 // ============================================================================
 typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
                SCR_MOOD, SCR_PROFILE,
-               SCR_NOTE_NEW, SCR_NOTE_EDIT } screen_id_t;
+               SCR_NOTE_NEW, SCR_NOTE_EDIT,
+               SCR_CHAT_DETAIL } screen_id_t;
 typedef enum { DO_HABITS = 0, DO_TODOS, DO_CALENDAR } do_tab_t;
 typedef enum { READ_BOOK = 0, READ_FEED, READ_NOTES } read_tab_t;
 typedef enum { MAP_MAP   = 0, MAP_NEARBY }            map_tab_t;
@@ -1034,9 +1037,22 @@ static lv_obj_t *create_moki_canvas(lv_obj_t *parent) {
   lv_point_t mp[] = { {94,140}, {100,144}, {106,140} };
   lv_canvas_draw_line(cv, mp, 3, &mouth);
 
-  // ---- Paws (ellipses cx=40,60 cy=86 rx=6 ry=3.5, fill=INK) ----
-  lv_canvas_draw_rect(cv,  68, 165, 24, 14, &body);
-  lv_canvas_draw_rect(cv, 108, 165, 24, 14, &body);
+  // ---- Paws — small filled rounded shapes at the body bottom ----
+  lv_draw_rect_dsc_t paw;
+  lv_draw_rect_dsc_init(&paw);
+  paw.bg_color = lv_color_hex(MOKI_INK);
+  paw.bg_opa   = LV_OPA_COVER;
+  paw.radius   = 7;            // half-height, rounds the corners cleanly
+  lv_canvas_draw_rect(cv,  68, 168, 26, 14, &paw);
+  lv_canvas_draw_rect(cv, 106, 168, 26, 14, &paw);
+
+  // ---- Subtle ground shadow under the body ----
+  lv_draw_rect_dsc_t shadow;
+  lv_draw_rect_dsc_init(&shadow);
+  shadow.bg_color = lv_color_hex(0x6F6F6F);   // mid-grey, survives threshold
+  shadow.bg_opa   = LV_OPA_COVER;
+  shadow.radius   = 4;
+  lv_canvas_draw_rect(cv, 56, 184, 88, 6, &shadow);
 
   return cv;
 }
@@ -1353,7 +1369,22 @@ static void switch_screen(screen_id_t to) {
     case SCR_PROFILE:  build_profile();  break;
     case SCR_NOTE_NEW: build_note_new(); break;
     case SCR_NOTE_EDIT:build_note_edit();break;
+    case SCR_CHAT_DETAIL:
+      // Build chat detail (declared later)
+      extern void build_chat_detail(void);
+      build_chat_detail();
+      break;
   }
+}
+
+static int g_active_chat = -1;
+static void on_chat_open(lv_event_t *e) {
+  g_active_chat = (int)(intptr_t)lv_event_get_user_data(e);
+  switch_screen(SCR_CHAT_DETAIL);
+}
+static void on_chat_back(lv_event_t *e) {
+  g_active_chat = -1;
+  switch_screen(SCR_CHAT);
 }
 
 static void on_mood_pill_clicked(lv_event_t *e) {
@@ -2377,7 +2408,9 @@ static void build_chat_row(lv_obj_t *parent, const moki_chat_t *c) {
   lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
   lv_obj_set_style_pad_column(row, 14, LV_PART_MAIN);
   lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(row, on_element_tapped, LV_EVENT_CLICKED, (void *)c->name);
+  // Identify by index — find c in SAMPLE_CHATS
+  int idx = (int)(c - SAMPLE_CHATS);
+  lv_obj_add_event_cb(row, on_chat_open, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
 
   // Kind glyph
   lv_obj_t *g = lv_label_create(row);
@@ -3094,6 +3127,119 @@ static void note_key_event(const char *key) {
 
   if (g_note_body_label)
     lv_label_set_text(g_note_body_label, g_note_body_buf);
+}
+
+// ============================================================================
+// CHAT DETAIL — single conversation thread (read-only, sample messages)
+// ============================================================================
+typedef struct { const char *from; const char *text; const char *ts; } chat_msg_t;
+
+static const chat_msg_t MSGS_LINA[] = {
+  { "lina", "hey", "vor 22 min" },
+  { "lina", "magst du samstag tanzen?", "vor 8 min" },
+};
+static const chat_msg_t MSGS_LESEKREIS[] = {
+  { "tom",  "hat jemand das buch durch?", "vor 3h" },
+  { "lina", "nein noch nicht", "vor 2h" },
+  { "lina", "walden kap 4 bis freitag ok?", "vor 2h" },
+};
+static const chat_msg_t MSGS_RHEIN[] = {
+  { "unbekannt · HDB-22ee", "empfehlung café mit guter milch?", "vor 3h" },
+  { "juno",                 "café frieda", "vor 2h" },
+  { "unbekannt · HDB-88dd", "jemand heute abend am neckar?", "vor 45 min" },
+};
+
+void build_chat_detail(void) {
+  if (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT) {
+    switch_screen(SCR_CHAT); return;
+  }
+  const moki_chat_t *c = &SAMPLE_CHATS[g_active_chat];
+  const chat_msg_t *msgs = NULL; int mn = 0;
+  if (g_active_chat == 0) { msgs = MSGS_LINA;       mn = 2; }
+  else if (g_active_chat == 1) { msgs = MSGS_LESEKREIS; mn = 3; }
+  else if (g_active_chat == 2) { msgs = MSGS_RHEIN;     mn = 3; }
+
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 12, LV_PART_MAIN);
+
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_chat_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← ZURÜCK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  lv_obj_t *kicker = lv_label_create(scr);
+  char k[48]; snprintf(k, sizeof(k), "%s · %s",
+                       chat_kind_glyph(c->kind),
+                       !strcmp(c->kind,"direct") ? "DIREKT" :
+                       !strcmp(c->kind,"group")  ? "GRUPPE" : "ÖFFENTLICH");
+  lv_label_set_text(kicker, k);
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(scr);
+  lv_label_set_text(title, c->name);
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  if (c->reset && c->reset[0]) {
+    lv_obj_t *r = lv_label_create(scr);
+    lv_label_set_text(r, chat_reset_phrase(c->reset));
+    lv_obj_set_style_text_font(r, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(r, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(r, 2, LV_PART_MAIN);
+  }
+
+  // Messages (bubble-ish — own messages right, others left)
+  for (int i = 0; i < mn; i++) {
+    bool own = (msgs[i].from[0] == 'l' && !strcmp(msgs[i].from, "levin"));  // none, all are others
+    (void)own;
+    lv_obj_t *bubble = lv_obj_create(scr);
+    lv_obj_remove_style_all(bubble);
+    lv_obj_set_size(bubble, LV_PCT(95), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(bubble, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bubble, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+    lv_obj_set_style_border_width(bubble, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(bubble, 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(bubble, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
+
+    char hdr[64]; snprintf(hdr, sizeof(hdr), "%s · %s", msgs[i].from, msgs[i].ts);
+    lv_obj_t *h = lv_label_create(bubble);
+    lv_label_set_text(h, hdr);
+    lv_obj_set_style_text_font(h, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(h, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(h, 1, LV_PART_MAIN);
+
+    lv_obj_t *t = lv_label_create(bubble);
+    lv_label_set_text(t, msgs[i].text);
+    lv_obj_set_style_text_font(t, &moki_fraunces_regular_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_width(t, LV_PCT(100));
+    lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_pad_top(t, 4, LV_PART_MAIN);
+  }
+
+  lv_obj_t *foot = lv_label_create(scr);
+  lv_label_set_text(foot, "ANTWORTEN KOMMT IM NÄCHSTEN UPDATE.");
+  lv_obj_set_style_text_font(foot, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(foot, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(foot, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(foot, 12, LV_PART_MAIN);
 }
 
 // ----------------------------------------------------------------------------
