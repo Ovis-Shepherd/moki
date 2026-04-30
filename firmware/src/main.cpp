@@ -4121,6 +4121,82 @@ void build_settings(void) {
   lv_obj_set_width(lhint, LV_PCT(100));
   lv_label_set_long_mode(lhint, LV_LABEL_LONG_WRAP);
 
+  // ── Auto-Sleep (M3) ─────────────────────────────────────────────────
+  lv_obj_t *asl = lv_label_create(scr);
+  lv_label_set_text(asl, "AUTO-SCHLAF NACH IDLE");
+  lv_obj_set_style_text_font(asl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(asl, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(asl, 3, LV_PART_MAIN);
+
+  lv_obj_t *as_strip = lv_obj_create(scr);
+  lv_obj_remove_style_all(as_strip);
+  lv_obj_set_size(as_strip, LV_PCT(100), 50);
+  lv_obj_set_flex_flow(as_strip, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(as_strip, 8, LV_PART_MAIN);
+
+  static const uint8_t AS_VAL[]    = { 0,    1,    5,    15 };
+  static const char *AS_LABEL[]    = { "AUS","1 MIN","5 MIN","15 MIN" };
+  static auto on_as_picked = [](lv_event_t *e) {
+    uint8_t v = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    g_settings.auto_sleep_min = v;
+    state_save_settings();
+    mark_activity();
+    show_toast(v == 0 ? "AUTO-SCHLAF AUS" : "AUTO-SCHLAF AKTIV");
+    switch_screen(SCR_SETTINGS);
+  };
+  for (int i = 0; i < 4; i++) {
+    bool active = (g_settings.auto_sleep_min == AS_VAL[i]);
+    lv_obj_t *c = lv_obj_create(as_strip);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_flex_grow(c, 1);
+    lv_obj_set_style_bg_color(c, lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(c, lv_color_hex(active ? MOKI_INK : MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(c, on_as_picked, LV_EVENT_CLICKED, (void *)(intptr_t)AS_VAL[i]);
+    lv_obj_t *l = lv_label_create(c);
+    lv_label_set_text(l, AS_LABEL[i]);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l,
+        lv_color_hex(active ? MOKI_PAPER : MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
+  }
+
+  // ── Channel + Identity (M7) ────────────────────────────────────────
+  lv_obj_t *chl = lv_label_create(scr);
+  lv_label_set_text(chl, "MESH-KANAL");
+  lv_obj_set_style_text_font(chl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(chl, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(chl, 3, LV_PART_MAIN);
+
+  char chan_buf[80];
+  snprintf(chan_buf, sizeof(chan_buf), "%s · psk %.6s…",
+           g_settings.mesh_channel_name, g_settings.mesh_channel_psk_b64);
+  lv_obj_t *ch_val = lv_label_create(scr);
+  lv_label_set_text(ch_val, chan_buf);
+  lv_obj_set_style_text_font(ch_val, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ch_val, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_width(ch_val, LV_PCT(100));
+
+  // Identity: first 4 hex bytes of secret as a stable visual fingerprint.
+  char id_buf[80];
+  if (g_identity_ready) {
+    snprintf(id_buf, sizeof(id_buf), "ID · %02x%02x%02x%02x",
+             g_identity_secret[0], g_identity_secret[1],
+             g_identity_secret[2], g_identity_secret[3]);
+  } else {
+    snprintf(id_buf, sizeof(id_buf), "ID · noch nicht generiert");
+  }
+  lv_obj_t *id_lbl = lv_label_create(scr);
+  lv_label_set_text(id_lbl, id_buf);
+  lv_obj_set_style_text_font(id_lbl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(id_lbl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(id_lbl, 2, LV_PART_MAIN);
+
   // Footer / build info
   lv_obj_t *foot = lv_label_create(scr);
   lv_label_set_text(foot, "MOKI · BUILD VOM 30. APRIL · v0.5");
