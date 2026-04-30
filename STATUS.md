@@ -370,6 +370,91 @@ ui_entry() → switch_screen(SCR_HOME)
 
 ---
 
+## Session 2026-04-30 (autonom) — DELIVERED
+
+Lucas hat zum Schluss autonomous-Mode aktiviert. Folgende Roadmap-Meilensteine
+sind seitdem **landed + auf beiden Mokis verifiziert**:
+
+### M2 — RTC (read-only nutzbar)
+- PCF85063 init + boot-read + status-bar-display ✅
+- Habit-midnight-rollover via rtc_tick (alle 30s) ✅
+- ⚠️ set_time: chip-level bug, registers 0x06/0x07 nehmen keine writes an
+  → in Bug Tracker dokumentiert, set-via-Wire bypass + per-register tested,
+  beide schlugen fehl. Workaround: status-bar zeigt was Chip liefert.
+
+### M3 — Deep Sleep (skeleton + auto-toggle)
+- enter_deep_sleep mit timer + Touch-IRQ wake (ext0 auf GPIO3) ✅
+- Auto-Sleep-after-Idle: settings-toggle in Settings-UI (AUS/1/5/15 min) ✅
+- Activity-Tracking via touch state-change + mark_activity()
+- Wakeup-Cycle: timer = sync_interval_min * 60s
+
+### M7 — Citywide MeshCore (KOMPLETT END-TO-END)
+- 🎉 **Zwei Mokis chatten verschlüsselt via MeshCore + Public-PSK** 🎉
+- Identity deterministisch aus g_identity_secret (32 Byte) — gleiche Pubkey
+  über Reboots hinweg
+- "moki" Channel mit configurable PSK in Settings (Default: MeshCore Public)
+- Sender-Parsing: Wire-format `<sender>: <body>` wird sauber gesplittet
+- on_lora_compose_save() routet jetzt durch moki_mesh_send (war vorher
+  legacy lora_send) — Touch-Compose nutzt MeshCore
+- Serial-Tools: `mesh_send`, `set_channel`, `set_psk`, `channel`
+- Verifiziert auf BEIDEN Geräten (`/dev/cu.usbmodem2101` + `/dev/cu.usbmodem101`):
+  ```
+  A: [mesh] tx 'levin': 'hallo aus channel test' (queued)
+  B: [mesh] channel msg (flood, 0 hops): levin: hallo aus channel test
+  ```
+
+### M5-Lite — Pageable Book Reader
+- Walden-Excerpt eingebettet in PROGMEM (~3500 Zeichen, ~3 Seiten)
+- Char-basierte Pagination + Word-Boundary-Trimming
+- Bookmark via NVS (`book_p` key) — Lesefortschritt persistent
+- ZURÜCK / WEITER Buttons mit Click-Handlers + Disabled-State an Rändern
+- Page-Indikator zeigt echte "N / total"
+- Stage 7-Full (echtes EPUB von SD) bleibt offen
+
+### Settings-UI Erweiterung
+- Auto-Schlaf-Picker (4 Chips)
+- Mesh-Kanal-Anzeige (channel name + first 6 chars of PSK)
+- Identity-Fingerprint (first 4 hex bytes of secret)
+- PSK + Channel-Editing via Touch-Keyboard noch deferred
+
+### Build Infrastructure
+- Vendored: MeshCore 1.10.0, rweather/Crypto, ed25519, RadioLib 7.6.0,
+  densaugeo/Base64
+- T5 S3 Pro variant: variants/lilygo_t5_s3_epaper_pro/target.{h,cpp}
+- platformio.ini: MOKI_USE_MESHCORE, RADIOLIB_GODMODE, MAX_GROUP_CHANNELS,
+  MAX_CONTACTS, full pin map for the variant
+
+### Commits dieser Session
+```
+1dd0433  settings UI for auto-sleep + mesh channel + identity
+0fa7cfb  M5-Lite — pageable book reader (Walden embedded)
+57018fc  M3 polish — touch IRQ wake + auto-sleep toggle
+8d0fd31  M7 polish — settings-driven channel + sender parsing
+e477234  M7 complete — two Mokis chat encrypted via MeshCore
+4a03126  M7 step 2-5 — MeshCore live, identity + channel ready
+56144cf  M7 step 1 — link target.cpp, MeshCore globals available
+050ac43  STATUS: Bug Tracker + roadmap pivot (M1 → M7 first)
+63ee9f1  M2 RTC + M3 deep-sleep skeleton
+3540b7b  roadmap restructured into 9 milestones
+a271471  stage 2c-mobile + stage 3 persistence + lora scan tooling
+717eb77  vendor MeshCore stack + RadioLib 7.6 + T5 variant
+f4876c0  rtc bug deeper than expected — bypass + diagnostic + bug update
+```
+
+### Roadmap-Status nach dieser Session
+- ✅ Stage 3a/b/c — Persistence + LittleFS + Identity
+- ✅ M2 — Time (read-only OK, write bug deferred)
+- ✅ M3 — Deep Sleep + Auto-Sleep
+- ✅ M7 — MeshCore Citywide ⭐ KEY MILESTONE
+- ✅ M5-Lite — Pageable Reader
+- 🟡 Stage 3d/3e — Atomic writes + integrity check
+- 🔴 M4 — Friends (BLE), 4-6h
+- 🔴 M5-Full — EPUB + microSD, 6-8h
+- 🔴 M6 — GPS + Map full, 8-12h
+- 🔴 M8 — OTA Updates, 4-6h
+
+---
+
 ## Roadmap — 8 Milestones (2026-04-30 revised)
 
 **Pivot 2026-04-30:** M1 (lokale Moki↔Moki AES) entfällt — wenn 2 User zusammen
