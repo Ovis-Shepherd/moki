@@ -4721,6 +4721,34 @@ static uint16_t day_of_year(uint16_t y, uint8_t m, uint8_t d) {
   return doy;
 }
 
+// Direct Wire write bypassing SensorLib (whose setDateTime is broken on our
+// hardware — see Bug Tracker). One register at a time — block-writes were
+// silently dropping HOUR (0x06) and DAY (0x07) on this hardware (likely a
+// shared-bus contention with GT911/XL9555 — repeated single transactions
+// land reliably).
+static bool rtc_set_direct(uint16_t year, uint8_t month, uint8_t day,
+                           uint8_t hour, uint8_t minute, uint8_t second) {
+  auto dec2bcd = [](uint8_t v) -> uint8_t {
+    return ((v / 10) << 4) | (v % 10);
+  };
+  auto write_reg = [](uint8_t reg, uint8_t val) -> bool {
+    Wire.beginTransmission(PCF85063_SLAVE_ADDRESS);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+  };
+  bool ok = true;
+  ok &= write_reg(0x04, dec2bcd(second) & 0x7F);
+  ok &= write_reg(0x05, dec2bcd(minute));
+  ok &= write_reg(0x06, dec2bcd(hour));
+  ok &= write_reg(0x07, dec2bcd(day));
+  ok &= write_reg(0x08, 0);                       // weekday placeholder
+  ok &= write_reg(0x09, dec2bcd(month));
+  ok &= write_reg(0x0A, dec2bcd((uint8_t)(year % 100)));
+  if (!ok) Serial.println(F("[rtc] one or more register writes failed"));
+  return ok;
+}
+
 // Parse "YYYY-MM-DD HH:MM:SS" — returns true on success, fills out.
 static bool rtc_parse(const String &s, RTC_DateTime &out) {
   // 19 chars expected: YYYY-MM-DD HH:MM:SS
@@ -5062,15 +5090,32 @@ static void poll_serial(void) {
         } else {
           Serial.println(F("[rtc] not ready"));
         }
+      } else if (line == "rtc_raw") {
+        // Diagnostic: dump all 11 PCF85063 registers (0x00..0x0A) raw.
+        Wire.beginTransmission(PCF85063_SLAVE_ADDRESS);
+        Wire.write(0x00);
+        if (Wire.endTransmission(false) == 0) {
+          Wire.requestFrom(PCF85063_SLAVE_ADDRESS, (uint8_t)11);
+          Serial.print(F("[rtc_raw] regs 00-0A: "));
+          for (int i = 0; i < 11 && Wire.available(); i++) {
+            Serial.printf("%02x ", Wire.read());
+          }
+          Serial.println();
+        } else {
+          Serial.println(F("[rtc_raw] no ACK from chip"));
+        }
       } else if (line.startsWith("set_time ")) {
         // Format: "set_time YYYY-MM-DD HH:MM:SS"
         String body = line.substring(9);
         body.trim();
         RTC_DateTime t;
         if (rtc_parse(body, t) && g_rtc_ready) {
-          g_rtc.setDateTime(t);
-          Serial.printf("[rtc] set to %04u-%02u-%02u %02u:%02u:%02u\n",
-                        t.year, t.month, t.day, t.hour, t.minute, t.second);
+          // Use direct Wire bypass — SensorLib's setDateTime is broken
+          // on our hardware (Bug Tracker entry).
+          if (rtc_set_direct(t.year, t.month, t.day, t.hour, t.minute, t.second)) {
+            Serial.printf("[rtc] set to %04u-%02u-%02u %02u:%02u:%02u\n",
+                          t.year, t.month, t.day, t.hour, t.minute, t.second);
+          }
         } else {
           Serial.println(F("[rtc] parse failed — expected YYYY-MM-DD HH:MM:SS"));
         }

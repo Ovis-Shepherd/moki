@@ -273,16 +273,25 @@ Wenn ein Item gefixt ist: hier rauslöschen + ggf. inline-`TODO`-Kommentar im
 Code entfernen. Wenn neuer Bug auftritt: hier reinpacken.
 
 ### 🔴 Priorität: BLOCKING / KORRUPT
-- **PCF85063 set_time round-trip broken**
-  - Symptom: `set_time 2026-04-30 12:00:00` → readback `2026-04-14 04:00:00`
-  - Effekt: Zeit kann nicht gesetzt werden, RTC bleibt bei boot-time
-  - Time advances? **NEIN** — Oszillator scheint zu stoppen
-  - Versucht: CTRL1=0x00 explizit gesetzt → keine Änderung
-  - Verdacht: I2C-Bus-Contention mit GT911+XL9555 ODER Chip-State broken
-  - Nächster Schritt: Logic-Analyzer auf SDA/SCL, raw-CTRL2/Status-Read,
-    `Wire.endTransmission()` Returncode prüfen
-  - Code-Ort: `firmware/src/main.cpp` `rtc_init()` + KNOWN ISSUE comment
-  - Workaround heute: Status-Bar zeigt einfach was Chip liefert (boot-fixed)
+- **PCF85063 HOUR + DAY registers refuse writes (chip-level mystery)**
+  - Symptom: `set_time 2026-04-30 18:00:00` → registers store HOUR=0x02 DAY=0x14
+    (instead of 0x18 / 0x30). MIN/MONTH/YEAR writes work fine.
+  - Sec advances normally (chip runs), so oscillator IS active. CTRL1=0x00.
+  - Tried (none worked):
+    1. SensorLib's setDateTime → broken
+    2. Direct Wire block-write 7 bytes → same failure pattern
+    3. Per-register single-byte writes → same failure pattern
+    4. CTRL1 explicit reset to 0x00 → no change
+    5. Reading registers raw confirms: HOUR (0x06) + DAY (0x07) writes
+       silently dropped, others land. Specific to those two registers.
+  - Code: `firmware/src/main.cpp` `rtc_set_direct()` + `rtc_raw` serial cmd
+    for live diagnostic.
+  - Workaround heute: Status-Bar zeigt was Chip liefert (boot-fixed time).
+    Habit-rollover via `rtc_tick` runs but won't trigger because day-of-year
+    never changes.
+  - Next-step ideas: try I2C clock speed change (currently 100kHz), check
+    chip variant (PCF85063A vs PCF85063TP), ask LILYGO community, or just
+    swap to NTP-via-WiFi when M8 lands.
 
 ### 🟡 Priorität: WORKAROUNDS / COSMETIC
 - **GPIO ISR service already installed** Warnung beim LoRa-Init
