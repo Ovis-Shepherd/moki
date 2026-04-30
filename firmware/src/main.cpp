@@ -1496,12 +1496,16 @@ static void flush_timer_cb(lv_timer_t *t) {
 }
 
 static void disp_render_start_cb(struct _lv_disp_drv_t *disp_drv) {
+  // Push to EPD ASAP after LVGL finishes rendering. Original 200ms timer
+  // period silently added 0..200ms latency to every interactive update.
+  // 30ms is the minimum we need to coalesce tightly-coupled invalidations
+  // (e.g., during a single LVGL refresh cycle) without throwing away
+  // typing snappiness.
   if (flush_timer == NULL) {
-    flush_timer = lv_timer_create(flush_timer_cb, 200, NULL);
-    lv_timer_ready(flush_timer);
-  } else {
-    lv_timer_resume(flush_timer);
+    flush_timer = lv_timer_create(flush_timer_cb, 30, NULL);
   }
+  lv_timer_resume(flush_timer);
+  lv_timer_ready(flush_timer);   // make it fire on the very next lv_timer_handler tick
 }
 
 static void lv_port_disp_init(void) {
