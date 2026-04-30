@@ -1026,8 +1026,21 @@ static void state_load_mood(void) {
   Serial.printf("[persist] loaded mood='%s'\n", g_active_mood);
 }
 
+// Forward decl for the dock-handler shortcut to lora chat.
+extern int g_active_chat;
+
 static void on_dock_clicked(lv_event_t *e) {
   intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+  // Special-case "chat" (idx 3): jump directly to the LoRa-mesh chat detail
+  // since that's the only real chat right now. The mockup-list at SCR_CHAT
+  // is still reachable via long-press in future, but doesn't deserve to be
+  // the primary destination.
+  if (idx == 3) {
+    g_active_chat = 0;   // first SAMPLE_CHATS entry = #moki-mesh
+    Serial.println(F("[nav] dock chat → SCR_CHAT_DETAIL (lora)"));
+    switch_screen(SCR_CHAT_DETAIL);
+    return;
+  }
   static const screen_id_t mapping[] = { SCR_HOME, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP };
   if (idx >= 0 && idx < 5) {
     Serial.printf("[nav] dock → screen %d\n", (int)mapping[idx]);
@@ -1993,6 +2006,22 @@ static lv_obj_t *build_screen_chrome(lv_obj_t *scr, int active_dock_idx) {
 // ----------------------------------------------------------------------------
 // switch_screen — clears current and rebuilds the requested one.
 // ----------------------------------------------------------------------------
+// Recursively turn off elastic + momentum scrolling on every scrollable
+// child of `obj`. E-Ink can't render motion smoothly — every overshoot or
+// inertial-fling animation forces partial-refreshes that pile up and cause
+// a full-clear flash. Direct 1:1 finger-tracking + instant stop is the
+// only thing that feels right on this display.
+static void eink_tune_scroll(lv_obj_t *obj) {
+  if (!obj) return;
+  lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_ELASTIC);
+  lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+  lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+  uint32_t n = lv_obj_get_child_cnt(obj);
+  for (uint32_t i = 0; i < n; i++) {
+    eink_tune_scroll(lv_obj_get_child(obj, i));
+  }
+}
+
 static void switch_screen(screen_id_t to) {
   lv_obj_clean(lv_scr_act());
   current_screen = to;
@@ -2009,6 +2038,8 @@ static void switch_screen(screen_id_t to) {
     case SCR_CHAT_DETAIL: { extern void build_chat_detail(void); build_chat_detail(); break; }
     case SCR_SETTINGS:    { extern void build_settings(void);    build_settings();    break; }
   }
+  // After building, disable elastic + momentum scroll on the whole tree.
+  eink_tune_scroll(lv_scr_act());
 }
 
 // ----------------------------------------------------------------------------
@@ -2042,14 +2073,16 @@ static void show_toast(const char *text) {
   lv_timer_set_repeat_count(g_toast_timer, 1);
 }
 
-static int g_active_chat = -1;
+int g_active_chat = -1;   // non-static so dock-handler can set it directly
 static void on_chat_open(lv_event_t *e) {
   g_active_chat = (int)(intptr_t)lv_event_get_user_data(e);
   switch_screen(SCR_CHAT_DETAIL);
 }
 static void on_chat_back(lv_event_t *e) {
   g_active_chat = -1;
-  switch_screen(SCR_CHAT);
+  // Back from chat-detail goes home — the mockup-chat-list at SCR_CHAT
+  // is no longer the primary chat surface (dock chat → chat-detail direct).
+  switch_screen(SCR_HOME);
 }
 
 static void on_mood_pill_clicked(lv_event_t *e) {
