@@ -659,6 +659,7 @@ typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
                SCR_PIN_NOTE,
                SCR_WIFI,
                SCR_WIFI_PSK,
+               SCR_OTA,
                SCR_SETTINGS } screen_id_t;
 
 // LoRa preset IDs — mirrored in lora_apply_preset()
@@ -3059,6 +3060,7 @@ static void switch_screen(screen_id_t to) {
     case SCR_PIN_NOTE:    { extern void build_pin_note(void);    build_pin_note();    break; }
     case SCR_WIFI:        { extern void build_wifi(void);        build_wifi();        break; }
     case SCR_WIFI_PSK:    { extern void build_wifi_psk(void);    build_wifi_psk();    break; }
+    case SCR_OTA:         { extern void build_ota_screen(void);  build_ota_screen();  break; }
     case SCR_SETTINGS:    { extern void build_settings(void);    build_settings();    break; }
   }
   // After building, disable elastic + momentum scroll on the whole tree.
@@ -6581,6 +6583,134 @@ static void build_pin_edit_screen(const char *title, const char *initial) {
   lv_obj_add_event_cb(kb, on_pin_edit_kb_event, LV_EVENT_ALL, NULL);
 }
 
+// ── OTA-Update-Screen (M8.8) ─────────────────────────────────────────────
+// Vollbild "Update läuft …" Status. Zeigt Progress, blockt während download
+// und triggert reboot bei Erfolg.
+#ifdef MOKI_WIFI
+static lv_obj_t *g_ota_status_label = nullptr;
+
+static void ota_ui_status(const char *txt) {
+  if (g_ota_status_label) {
+    lv_label_set_text(g_ota_status_label, txt);
+    // LVGL rendern damit der User es sieht bevor ota_pull blockiert
+    for (int i = 0; i < 5; i++) { lv_timer_handler(); delay(20); }
+  }
+  Serial.printf("[ota_ui] %s\n", txt);
+}
+
+static void on_ota_back(lv_event_t *e) {
+  switch_screen(SCR_WIFI);
+}
+
+static void on_ota_start(lv_event_t *e) {
+  if (!g_wifi.connected) {
+    ota_ui_status("kein WLAN — bitte zuerst verbinden");
+    return;
+  }
+  if (!g_ota_url[0]) {
+    ota_ui_status("keine update-url konfiguriert");
+    return;
+  }
+  ota_ui_status("verbinde mit github …");
+  bool ok = ota_pull(g_ota_url);
+  if (ok) {
+    ota_ui_status("update OK · neustart …");
+    // ota_pull macht ESP.restart() bei Erfolg, hier sollten wir nie ankommen
+  } else {
+    ota_ui_status("update fehlgeschlagen — versuch's nochmal");
+  }
+}
+
+void build_ota_screen(void) {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 32, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 32, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 18, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 18, LV_PART_MAIN);
+
+  // Header back
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_ota_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← WLAN");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  // Kicker
+  lv_obj_t *kicker = lv_label_create(scr);
+  lv_label_set_text(kicker, "FIRMWARE-UPDATE");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  // Title
+  lv_obj_t *title = lv_label_create(scr);
+  lv_label_set_text(title, "neueste version aus dem netz holen");
+  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_width(title, LV_PCT(100));
+  lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+
+  // Quelle
+  lv_obj_t *src = lv_label_create(scr);
+  char b[180];
+  snprintf(b, sizeof(b), "Quelle:\n%s", g_ota_url);
+  lv_label_set_text(src, b);
+  lv_obj_set_style_text_font(src, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(src, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_width(src, LV_PCT(100));
+  lv_label_set_long_mode(src, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_line_space(src, 4, LV_PART_MAIN);
+
+  // Status (wird live aktualisiert)
+  lv_obj_t *status = lv_label_create(scr);
+  if (!g_wifi.connected) {
+    lv_label_set_text(status, "→ kein WLAN. erst Profil → WLAN verbinden.");
+    lv_obj_set_style_text_color(status, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  } else {
+    lv_label_set_text(status, "bereit. drück »JETZT UPDATEN«.");
+    lv_obj_set_style_text_color(status, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  }
+  lv_obj_set_style_text_font(status, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_obj_set_width(status, LV_PCT(100));
+  lv_label_set_long_mode(status, LV_LABEL_LONG_WRAP);
+  lv_obj_set_flex_grow(status, 1);
+  g_ota_status_label = status;
+
+  // Update-Button
+  lv_obj_t *btn = lv_obj_create(scr);
+  lv_obj_remove_style_all(btn);
+  lv_obj_set_size(btn, LV_PCT(100), 64);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(g_wifi.connected ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  if (g_wifi.connected) {
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, on_ota_start, LV_EVENT_CLICKED, NULL);
+  }
+  lv_obj_t *bt = lv_label_create(btn);
+  lv_label_set_text(bt, "JETZT UPDATEN");
+  lv_obj_set_style_text_font(bt, &moki_jetbrains_mono_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bt, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bt, 3, LV_PART_MAIN);
+  lv_obj_add_flag(bt, LV_OBJ_FLAG_EVENT_BUBBLE);
+}
+#else
+void build_ota_screen(void) { switch_screen(SCR_PROFILE); }
+#endif
+
 // ── WiFi-Setup-Screens (M8.8) ────────────────────────────────────────────
 #ifdef MOKI_WIFI
 // Scratch state für Picked-SSID + PSK-Edit
@@ -6621,6 +6751,10 @@ static void on_wifi_pick(lv_event_t *e) {
 static void on_wifi_disconnect(lv_event_t *e) {
   wifi_clear_creds();
   switch_screen(SCR_WIFI);
+}
+
+static void on_wifi_open_ota(lv_event_t *e) {
+  switch_screen(SCR_OTA);
 }
 
 void build_wifi(void) {
@@ -6693,15 +6827,22 @@ void build_wifi(void) {
   }
 
   if (g_wifi.enabled) {
-    lv_obj_t *dc = lv_obj_create(status);
+    // Action-Reihe: TRENNEN | UPDATEN (wenn connected)
+    lv_obj_t *actions = lv_obj_create(status);
+    lv_obj_remove_style_all(actions);
+    lv_obj_set_size(actions, LV_PCT(100), 50);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(actions, 12, LV_PART_MAIN);
+
+    // TRENNEN
+    lv_obj_t *dc = lv_obj_create(actions);
     lv_obj_remove_style_all(dc);
-    lv_obj_set_size(dc, LV_SIZE_CONTENT, 38);
+    lv_obj_set_flex_grow(dc, 1);
+    lv_obj_set_height(dc, 50);
     lv_obj_set_style_bg_color(dc, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(dc, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(dc, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_obj_set_style_border_width(dc, 1, LV_PART_MAIN);
-    lv_obj_set_style_pad_left(dc, 14, LV_PART_MAIN);
-    lv_obj_set_style_pad_right(dc, 14, LV_PART_MAIN);
     lv_obj_set_flex_flow(dc, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(dc, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -6709,10 +6850,31 @@ void build_wifi(void) {
     lv_obj_add_event_cb(dc, on_wifi_disconnect, LV_EVENT_CLICKED, NULL);
     lv_obj_t *dl = lv_label_create(dc);
     lv_label_set_text(dl, "TRENNEN");
-    lv_obj_set_style_text_font(dl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_font(dl, &moki_jetbrains_mono_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(dl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(dl, 2, LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(dl, 3, LV_PART_MAIN);
     lv_obj_add_flag(dl, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    // UPDATE — nur wenn aktiv connected (nicht nur enabled)
+    if (g_wifi.connected) {
+      lv_obj_t *up = lv_obj_create(actions);
+      lv_obj_remove_style_all(up);
+      lv_obj_set_flex_grow(up, 1);
+      lv_obj_set_height(up, 50);
+      lv_obj_set_style_bg_color(up, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(up, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_flex_flow(up, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(up, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(up, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(up, on_wifi_open_ota, LV_EVENT_CLICKED, NULL);
+      lv_obj_t *ul = lv_label_create(up);
+      lv_label_set_text(ul, "UPDATE");
+      lv_obj_set_style_text_font(ul, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(ul, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(ul, 3, LV_PART_MAIN);
+      lv_obj_add_flag(ul, LV_OBJ_FLAG_EVENT_BUBBLE);
+    }
   }
 
   // Liste der gefundenen Netzwerke (Sync-Scan, blockt ~3s)
