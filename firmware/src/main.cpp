@@ -788,6 +788,19 @@ static void lora_persist_load(void) {
   size_t total = f.size();
   size_t rec   = sizeof(moki_lora_msg_t);
   if (total < rec) { f.close(); return; }
+
+  // Schema sanity check — if file size isn't a clean multiple of the
+  // current record size, the struct layout changed since these records
+  // were written (e.g. a new field appended). Drop the log to avoid
+  // misalignment and start fresh.
+  if ((total % rec) != 0) {
+    f.close();
+    LittleFS.remove(LORA_LOG_PATH);
+    Serial.printf("[fs] lora.log size %u not multiple of record %u — discarded (schema changed)\n",
+                  (unsigned)total, (unsigned)rec);
+    return;
+  }
+
   size_t n_rec = total / rec;
   // Read only the most-recent LORA_MSG_CAP records into the ring buffer.
   size_t skip = (n_rec > LORA_MSG_CAP) ? (n_rec - LORA_MSG_CAP) : 0;
@@ -797,6 +810,10 @@ static void lora_persist_load(void) {
     moki_lora_msg_t m;
     size_t got = f.read((uint8_t *)&m, rec);
     if (got != rec) break;
+    // Defensive clamp — if channel_idx is out of valid range (e.g. migrated
+    // legacy record where the field was uninitialised), treat as direct-msg
+    // bucket so it shows up regardless of which channel is selected.
+    if (m.channel_idx < -2 || m.channel_idx > 3) m.channel_idx = -1;
     g_lora_msgs[g_lora_msg_head] = m;
     g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
     if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
@@ -4643,10 +4660,11 @@ void build_chat_detail(void) {
       lv_obj_add_flag(cog, LV_OBJ_FLAG_CLICKABLE);
       lv_obj_add_event_cb(cog, on_lora_advanced_toggle, LV_EVENT_CLICKED, NULL);
       lv_obj_t *cl = lv_label_create(cog);
-      lv_label_set_text(cl, "*");   // glyph proxy for cog (no font support for ⚙)
-      lv_obj_set_style_text_font(cl, &moki_jetbrains_mono_28, LV_PART_MAIN);
+      lv_label_set_text(cl, "···");   // three dots — "more options" idiom (font has no ⚙ glyph)
+      lv_obj_set_style_text_font(cl, &moki_jetbrains_mono_22, LV_PART_MAIN);
       lv_obj_set_style_text_color(cl,
           lv_color_hex(g_show_lora_advanced ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(cl, 1, LV_PART_MAIN);
       for (int ci = 0; ci < g_num_channels; ci++) {
         bool active = (ci == g_settings.mesh_active_channel);
         lv_obj_t *c = lv_obj_create(ch_strip);
