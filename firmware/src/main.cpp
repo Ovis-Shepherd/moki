@@ -6885,11 +6885,26 @@ void build_wifi(void) {
   lv_obj_set_style_text_letter_space(kicker2, 3, LV_PART_MAIN);
   lv_obj_set_style_pad_top(kicker2, 8, LV_PART_MAIN);
 
-  // WiFi.scanNetworks() — synchroner Scan, blockiert ~3s. OK für E-Ink-UI.
-  // Vorher SSID-Strings zwischenspeichern, sonst sind sie nach scanDelete
-  // weg. Wir speichern bis zu 12 Netze.
-  WiFi.mode(WIFI_STA);
-  int n = WiFi.scanNetworks(false, false, false, 200);
+  // WiFi.scanNetworks() — synchroner Scan. Robust:
+  // 1. Mode auf STA setzen (falls aus WIFI_OFF kommend)
+  // 2. Disconnect für sauberen State (sonst kann Scan failen wenn versucht
+  //    wird aktiv zu connecten zu altem AP)
+  // 3. ~250ms warten damit Radio bereit ist
+  // 4. Scan mit explizit längeren Channel-Zeiten (default ist OK aber lieber
+  //    sicher als 0 Ergebnisse)
+  // Vorher SSID-Strings zwischenspeichern, sonst sind sie nach scanDelete weg.
+  if (WiFi.getMode() != WIFI_STA) {
+    Serial.println(F("[wifi] enabling STA for scan ..."));
+    WiFi.mode(WIFI_STA);
+    WiFi.onEvent(wifi_event_cb);
+    delay(500);   // Radio cold-start: Calibration + RF-init braucht ~400ms
+  }
+  WiFi.disconnect(false, true);   // clear driver config, keep our NVS
+  delay(200);
+  Serial.println(F("[wifi] starting scan ..."));
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false,
+                             /*passive=*/false, /*max_ms_per_chan=*/400);
+  Serial.printf("[wifi] scan found %d networks\n", n);
   if (n < 0) n = 0;
   if (n > 12) n = 12;
 
