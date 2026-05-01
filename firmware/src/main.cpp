@@ -657,6 +657,8 @@ typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
                SCR_PIN_DETAIL,
                SCR_PIN_RENAME,
                SCR_PIN_NOTE,
+               SCR_WIFI,
+               SCR_WIFI_PSK,
                SCR_SETTINGS } screen_id_t;
 
 // LoRa preset IDs — mirrored in lora_apply_preset()
@@ -3055,6 +3057,8 @@ static void switch_screen(screen_id_t to) {
     case SCR_PIN_DETAIL:  { extern void build_pin_detail(void);  build_pin_detail();  break; }
     case SCR_PIN_RENAME:  { extern void build_pin_rename(void);  build_pin_rename();  break; }
     case SCR_PIN_NOTE:    { extern void build_pin_note(void);    build_pin_note();    break; }
+    case SCR_WIFI:        { extern void build_wifi(void);        build_wifi();        break; }
+    case SCR_WIFI_PSK:    { extern void build_wifi_psk(void);    build_wifi_psk();    break; }
     case SCR_SETTINGS:    { extern void build_settings(void);    build_settings();    break; }
   }
   // After building, disable elastic + momentum scroll on the whole tree.
@@ -4033,6 +4037,34 @@ static void build_profile(void) {
   lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
+
+#ifdef MOKI_WIFI
+  // WLAN link
+  lv_obj_t *wifi_link = lv_obj_create(scr);
+  lv_obj_remove_style_all(wifi_link);
+  lv_obj_set_size(wifi_link, LV_PCT(100), 56);
+  lv_obj_set_style_border_color(wifi_link, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(wifi_link, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(wifi_link, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(wifi_link, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(wifi_link, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(wifi_link, LV_OBJ_FLAG_CLICKABLE);
+  static auto open_wifi_cb = [](lv_event_t *) {
+    Serial.println(F("[nav] open wifi"));
+    switch_screen(SCR_WIFI);
+  };
+  lv_obj_add_event_cb(wifi_link, open_wifi_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *wl = lv_label_create(wifi_link);
+  char wbuf[40];
+  if (g_wifi.connected)      snprintf(wbuf, sizeof(wbuf), "WLAN · %s →", g_wifi.ssid);
+  else if (g_wifi.enabled)   snprintf(wbuf, sizeof(wbuf), "WLAN · suche … →");
+  else                       snprintf(wbuf, sizeof(wbuf), "WLAN · einrichten →");
+  lv_label_set_text(wl, wbuf);
+  lv_obj_set_style_text_font(wl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(wl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(wl, 3, LV_PART_MAIN);
+#endif
 
   // ── DISKOVERY: announce me to the mesh ───────────────────────────────
   // Manual self-advert button — useful right after setting handle/joining
@@ -6548,6 +6580,292 @@ static void build_pin_edit_screen(const char *title, const char *initial) {
   lv_obj_set_style_text_font(kb, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_add_event_cb(kb, on_pin_edit_kb_event, LV_EVENT_ALL, NULL);
 }
+
+// ── WiFi-Setup-Screens (M8.8) ────────────────────────────────────────────
+#ifdef MOKI_WIFI
+// Scratch state für Picked-SSID + PSK-Edit
+static char     g_wifi_pick_ssid[33] = "";
+static lv_obj_t *g_wifi_psk_ta = nullptr;
+
+static void on_wifi_back(lv_event_t *e) {
+  switch_screen(SCR_PROFILE);
+}
+
+static void on_wifi_psk_back(lv_event_t *e) {
+  switch_screen(SCR_WIFI);
+}
+
+static void on_wifi_psk_save(lv_event_t *e) {
+  if (!g_wifi_psk_ta || !g_wifi_pick_ssid[0]) {
+    switch_screen(SCR_WIFI); return;
+  }
+  const char *psk = lv_textarea_get_text(g_wifi_psk_ta);
+  wifi_set_creds(g_wifi_pick_ssid, psk ? psk : "");
+  switch_screen(SCR_WIFI);
+}
+
+static void on_wifi_psk_kb_event(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY)  { on_wifi_psk_save(NULL); }
+  if (code == LV_EVENT_CANCEL) { on_wifi_psk_back(NULL); }
+}
+
+static void on_wifi_pick(lv_event_t *e) {
+  const char *ssid = (const char *)lv_event_get_user_data(e);
+  if (!ssid) return;
+  strncpy(g_wifi_pick_ssid, ssid, sizeof(g_wifi_pick_ssid) - 1);
+  g_wifi_pick_ssid[sizeof(g_wifi_pick_ssid) - 1] = 0;
+  switch_screen(SCR_WIFI_PSK);
+}
+
+static void on_wifi_disconnect(lv_event_t *e) {
+  wifi_clear_creds();
+  switch_screen(SCR_WIFI);
+}
+
+void build_wifi(void) {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 28, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 12, LV_PART_MAIN);
+
+  // Header
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_wifi_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← PROFIL");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  lv_obj_t *kicker = lv_label_create(scr);
+  lv_label_set_text(kicker, "WLAN");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  // Status-Block
+  lv_obj_t *status = lv_obj_create(scr);
+  lv_obj_remove_style_all(status);
+  lv_obj_set_size(status, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(status, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_top(status, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(status, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(status, 4, LV_PART_MAIN);
+  lv_obj_set_style_border_side(status, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(status, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(status, 1, LV_PART_MAIN);
+
+  lv_obj_t *t = lv_label_create(status);
+  if (g_wifi.connected) {
+    char b[80];
+    snprintf(b, sizeof(b), "verbunden mit %s", g_wifi.ssid);
+    lv_label_set_text(t, b);
+    lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  } else if (g_wifi.enabled) {
+    char b[80];
+    snprintf(b, sizeof(b), "verbinde mit %s …", g_wifi.ssid);
+    lv_label_set_text(t, b);
+    lv_obj_set_style_text_color(t, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  } else {
+    lv_label_set_text(t, "nicht verbunden");
+    lv_obj_set_style_text_color(t, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  }
+  lv_obj_set_style_text_font(t, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_width(t, LV_PCT(100));
+  lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+
+  if (g_wifi.connected && g_wifi.ip[0]) {
+    lv_obj_t *ipl = lv_label_create(status);
+    char b[40];
+    snprintf(b, sizeof(b), "ip %s · rssi %d dBm", g_wifi.ip, WiFi.RSSI());
+    lv_label_set_text(ipl, b);
+    lv_obj_set_style_text_font(ipl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ipl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  }
+
+  if (g_wifi.enabled) {
+    lv_obj_t *dc = lv_obj_create(status);
+    lv_obj_remove_style_all(dc);
+    lv_obj_set_size(dc, LV_SIZE_CONTENT, 38);
+    lv_obj_set_style_bg_color(dc, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(dc, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(dc, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(dc, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(dc, 14, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(dc, 14, LV_PART_MAIN);
+    lv_obj_set_flex_flow(dc, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(dc, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(dc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dc, on_wifi_disconnect, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dl = lv_label_create(dc);
+    lv_label_set_text(dl, "TRENNEN");
+    lv_obj_set_style_text_font(dl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(dl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(dl, 2, LV_PART_MAIN);
+    lv_obj_add_flag(dl, LV_OBJ_FLAG_EVENT_BUBBLE);
+  }
+
+  // Liste der gefundenen Netzwerke (Sync-Scan, blockt ~3s)
+  lv_obj_t *kicker2 = lv_label_create(scr);
+  lv_label_set_text(kicker2, "VERFÜGBARE NETZE");
+  lv_obj_set_style_text_font(kicker2, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker2, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker2, 3, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(kicker2, 8, LV_PART_MAIN);
+
+  // WiFi.scanNetworks() — synchroner Scan, blockiert ~3s. OK für E-Ink-UI.
+  // Vorher SSID-Strings zwischenspeichern, sonst sind sie nach scanDelete
+  // weg. Wir speichern bis zu 12 Netze.
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, false, false, 200);
+  if (n < 0) n = 0;
+  if (n > 12) n = 12;
+
+  static char scan_ssids[12][33];
+  static int  scan_rssi[12];
+  static int  scan_count = 0;
+  scan_count = n;
+  for (int i = 0; i < n; i++) {
+    String s = WiFi.SSID(i);
+    strncpy(scan_ssids[i], s.c_str(), sizeof(scan_ssids[i]) - 1);
+    scan_ssids[i][sizeof(scan_ssids[i]) - 1] = 0;
+    scan_rssi[i] = WiFi.RSSI(i);
+  }
+
+  if (n == 0) {
+    lv_obj_t *empty = lv_label_create(scr);
+    lv_label_set_text(empty, "(keine Netze gefunden)");
+    lv_obj_set_style_text_font(empty, &moki_fraunces_italic_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(empty, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  }
+
+  for (int i = 0; i < scan_count; i++) {
+    lv_obj_t *row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 56);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, on_wifi_pick, LV_EVENT_CLICKED, scan_ssids[i]);
+
+    lv_obj_t *l = lv_label_create(row);
+    lv_label_set_text(l, scan_ssids[i]);
+    lv_obj_set_style_text_font(l, &moki_fraunces_italic_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    // Signal-Stärke als Glyph
+    int rssi = scan_rssi[i];
+    const char *bars = (rssi > -55) ? "▮▮▮"
+                     : (rssi > -70) ? "▮▮·"
+                     : (rssi > -82) ? "▮··"
+                                    : "···";
+    lv_obj_t *r = lv_label_create(row);
+    lv_label_set_text(r, bars);
+    lv_obj_set_style_text_font(r, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(r, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_add_flag(r, LV_OBJ_FLAG_EVENT_BUBBLE);
+  }
+
+  WiFi.scanDelete();
+}
+
+void build_wifi_psk(void) {
+  if (!g_wifi_pick_ssid[0]) {
+    switch_screen(SCR_WIFI); return;
+  }
+
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+
+  // Header
+  lv_obj_t *hdr = lv_obj_create(scr);
+  lv_obj_remove_style_all(hdr);
+  lv_obj_set_size(hdr, LV_PCT(100), 56);
+  lv_obj_set_style_pad_left(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *back = lv_obj_create(hdr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, 100, 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_wifi_psk_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← ZURÜCK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_add_flag(bl, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  char title[40];
+  snprintf(title, sizeof(title), "WLAN · %s", g_wifi_pick_ssid);
+  lv_obj_t *kicker = lv_label_create(hdr);
+  lv_label_set_text(kicker, title);
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 2, LV_PART_MAIN);
+
+  lv_obj_t *save = lv_obj_create(hdr);
+  lv_obj_remove_style_all(save);
+  lv_obj_set_size(save, 100, 36);
+  lv_obj_set_style_bg_color(save, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(save, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_flex_flow(save, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(save, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(save, on_wifi_psk_save, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *sl = lv_label_create(save);
+  lv_label_set_text(sl, "OK");
+  lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
+  lv_obj_add_flag(sl, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  // Textarea (PSK in plain — kein **** Maskieren erstmal)
+  lv_obj_t *ta = lv_textarea_create(scr);
+  lv_obj_set_size(ta, LV_PCT(100), 80);
+  lv_obj_set_style_text_font(ta, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ta, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(ta, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_border_width(ta, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(ta, 16, LV_PART_MAIN);
+  lv_textarea_set_one_line(ta, true);
+  lv_textarea_set_placeholder_text(ta, "passwort eingeben");
+  g_wifi_psk_ta = ta;
+
+  // Keyboard
+  lv_obj_t *kb = lv_keyboard_create(scr);
+  lv_keyboard_set_textarea(kb, ta);
+  lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_obj_set_size(kb, LV_PCT(100), 380);
+  lv_obj_set_style_text_font(kb, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_add_event_cb(kb, on_wifi_psk_kb_event, LV_EVENT_ALL, NULL);
+}
+#else
+// Stub-Builder wenn WiFi nicht im Build aktiv
+void build_wifi(void)     { switch_screen(SCR_PROFILE); }
+void build_wifi_psk(void) { switch_screen(SCR_PROFILE); }
+#endif // MOKI_WIFI
 
 void build_pin_rename(void) {
   if (g_active_pin < 0 || g_active_pin >= (int)g_pins_n) {
