@@ -1100,12 +1100,22 @@ static void wifi_clear_creds(void) {
 // User-konfigurierbare Default-URL für `ota_release`. Ideal: GitHub
 // Releases /latest/download/firmware.bin — bleibt stabil, Mac muss nicht
 // laufen. NVS-key: "ota_url".
+// Default-URL (kompiliert eingebrannt). Kann via `ota_url <url>` überschrieben
+// werden. Setzt damit auch das Henne-Ei-Problem von langen Befehlen via
+// USB-CDC RX Buffer Limit (~64 Bytes) elegant außer Kraft.
+static const char OTA_DEFAULT_URL[] =
+  "https://github.com/Ovis-Shepherd/moki/releases/latest/download/firmware.bin";
 static char g_ota_url[160] = "";
 
 static void ota_url_load(void) {
   g_prefs.begin("moki", true);
   g_prefs.getString("ota_url", g_ota_url, sizeof(g_ota_url));
   g_prefs.end();
+  if (!g_ota_url[0]) {
+    strncpy(g_ota_url, OTA_DEFAULT_URL, sizeof(g_ota_url) - 1);
+    g_ota_url[sizeof(g_ota_url) - 1] = 0;
+    Serial.printf("[ota] using default URL: %s\n", g_ota_url);
+  }
 }
 static void ota_url_save(const char *url) {
   strncpy(g_ota_url, url, sizeof(g_ota_url) - 1);
@@ -7782,6 +7792,7 @@ static void ui_entry(void) {
 // ----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  Serial.setRxBufferSize(1024);   // default 64 schneidet lange Befehle (ota_url)
 
   uint32_t deadline = millis() + 2000;
   while (!Serial && millis() < deadline) {
@@ -8249,6 +8260,14 @@ static void poll_serial(void) {
         }
       } else if (line == "ota_url_get") {
         Serial.printf("[ota] url='%s'\n", g_ota_url[0] ? g_ota_url : "(unset)");
+      } else if (line == "ota_url_reset") {
+        // NVS-Wert löschen → fällt auf compiled-in Default zurück
+        g_prefs.begin("moki", false);
+        g_prefs.remove("ota_url");
+        g_prefs.end();
+        strncpy(g_ota_url, OTA_DEFAULT_URL, sizeof(g_ota_url) - 1);
+        g_ota_url[sizeof(g_ota_url) - 1] = 0;
+        Serial.printf("[ota] reset → %s\n", g_ota_url);
 #endif // MOKI_WIFI
       } else if (line == "info") {
         // Eine-Zeile-Snapshot für schnelle Diagnose
