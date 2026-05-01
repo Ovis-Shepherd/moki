@@ -32,6 +32,7 @@ extern WRAPPER_CLASS radio_driver;
 
 // Bridge into Moki's existing ring buffer (defined in main.cpp).
 extern "C" void moki_lora_push_msg_external(const char *from, const char *text, int16_t rssi);
+extern "C" void moki_lora_push_msg_channel(const char *from, const char *text, int16_t rssi, int channel_idx);
 
 // Identity secret from Stage 3c (in main.cpp).
 extern uint8_t g_identity_secret[32];
@@ -127,7 +128,8 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   void onContactPathUpdated(const ContactInfo& contact) override {}
   void onMessageRecv(const ContactInfo& contact, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
     Serial.printf("[mesh] direct msg from %s: %s\n", contact.name, text);
-    moki_lora_push_msg_external(contact.name, text, 0);
+    // channel_idx = -1 → direct-message bucket (separate from any group channel)
+    moki_lora_push_msg_channel(contact.name, text, 0, -1);
   }
   void onCommandDataRecv(const ContactInfo& contact, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {}
   void onSignedMessageRecv(const ContactInfo& contact, mesh::Packet* pkt, uint32_t sender_timestamp, const uint8_t *sender_prefix, const char *text) override {}
@@ -167,25 +169,24 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
                   ch_name, pkt->isRouteDirect() ? "direct" : "flood",
                   pkt->path_len, text);
 
-    // Sender format: "<name>: <body>"
+    // Sender format: "<name>: <body>" — split off the prefix.
     const char *colon = strstr(text, ": ");
-    if (colon && (colon - text) < 18) {
-      // "<sender> · <ch>" so the bubble header shows both source AND room.
-      char from[24];
+    char sender[24];
+    const char *body;
+    if (colon && (colon - text) < 23) {
       size_t name_len = colon - text;
-      if (name_len >= 18) name_len = 17;
-      memcpy(from, text, name_len);
-      from[name_len] = ' ';
-      from[name_len + 1] = ':';
-      from[name_len + 2] = '#';
-      strncpy(&from[name_len + 3], ch_name, sizeof(from) - name_len - 4);
-      from[sizeof(from) - 1] = 0;
-      moki_lora_push_msg_external(from, colon + 2, 0);
+      if (name_len >= sizeof(sender)) name_len = sizeof(sender) - 1;
+      memcpy(sender, text, name_len);
+      sender[name_len] = 0;
+      body = colon + 2;
     } else {
-      char from[24];
-      snprintf(from, sizeof(from), "mesh:#%s", ch_name);
-      moki_lora_push_msg_external(from, text, 0);
+      strncpy(sender, "mesh", sizeof(sender) - 1);
+      sender[sizeof(sender) - 1] = 0;
+      body = text;
     }
+    // File the message into the proper channel bucket so the chat-detail
+    // tab filter shows it only under the matching #channel chip.
+    moki_lora_push_msg_channel(sender, body, 0, ch_idx);
   }
 
 public:

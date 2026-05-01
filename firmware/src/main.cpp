@@ -594,12 +594,18 @@ static inline void mark_activity(void) { g_last_activity_ms = millis(); }
 
 // LoRa-Chat ring buffer of recent messages.
 // Body is stored as raw bytes (may contain non-printable / non-NUL-terminated).
+//
+// channel_idx tagging:
+//    0..3   — MeshCore channel index (matches g_channels[idx])
+//    -1     — local sent (no remote channel — TX echo)
+//    -2     — foreign-protocol RX (Meshtastic, raw, etc.)
 typedef struct {
   uint32_t ts_ms;
   int16_t  rssi;
   int8_t   snr_x10;   // SNR * 10 — e.g. -75 = -7.5 dB
   uint8_t  len;       // raw byte length (≤ sizeof(text))
   uint8_t  preset;    // LORA_PRESET_* active when received
+  int8_t   channel_idx; // see comment above
   char     from[24];
   char     text[160]; // raw payload bytes (NOT NUL-terminated guaranteed)
 } moki_lora_msg_t;
@@ -615,7 +621,7 @@ static void lora_persist_append(const moki_lora_msg_t *m);
 // MyMesh subclass can dump received channel-messages into our existing
 // ring buffer + UI.
 extern "C" void moki_lora_push_msg_external(const char *from, const char *text, int16_t rssi) {
-  // Mirrors lora_push_msg() but accessible from another translation unit.
+  // Backward-compat shim — defaults to "active channel" tagging.
   moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
   strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
   size_t tlen = strlen(text);
@@ -625,6 +631,28 @@ extern "C" void moki_lora_push_msg_external(const char *from, const char *text, 
   m->rssi   = rssi;
   m->snr_x10 = 0;
   m->preset  = g_settings.lora_preset;
+  m->channel_idx = (int8_t)g_settings.mesh_active_channel;
+  m->ts_ms  = millis();
+  g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
+  if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
+  lora_persist_append(m);
+  g_lora_rx_count++;
+}
+
+// Channel-tagged variant — moki_mesh.cpp uses this so each MeshCore
+// channel's messages get filed into the correct tab.
+extern "C" void moki_lora_push_msg_channel(const char *from, const char *text,
+                                            int16_t rssi, int channel_idx) {
+  moki_lora_msg_t *m = &g_lora_msgs[g_lora_msg_head];
+  strncpy(m->from, from, sizeof(m->from)-1); m->from[sizeof(m->from)-1] = 0;
+  size_t tlen = strlen(text);
+  if (tlen > sizeof(m->text)) tlen = sizeof(m->text);
+  memcpy(m->text, text, tlen);
+  m->len    = (uint8_t)tlen;
+  m->rssi   = rssi;
+  m->snr_x10 = 0;
+  m->preset  = g_settings.lora_preset;
+  m->channel_idx = (int8_t)channel_idx;
   m->ts_ms  = millis();
   g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
   if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
@@ -676,6 +704,11 @@ static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
   m->rssi   = rssi;
   m->snr_x10 = 0;
   m->preset  = g_settings.lora_preset;
+  // Local TX echo — tag with currently-active channel so it appears in the
+  // right tab. Direct messages (DM) override later.
+  m->channel_idx = (rssi == 0)
+                   ? (int8_t)g_settings.mesh_active_channel
+                   : -2;   // raw RX with rssi → foreign-protocol bucket
   m->ts_ms  = millis();
   g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
   if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
@@ -720,6 +753,7 @@ static void lora_push_msg_raw(const char *from, const uint8_t *raw, size_t len,
   m->rssi    = rssi;
   m->snr_x10 = (int8_t)(snr * 10.0f);
   m->preset  = g_settings.lora_preset;
+  m->channel_idx = -2;   // raw RX = foreign-protocol bucket
   m->ts_ms   = millis();
   g_lora_msg_head = (g_lora_msg_head + 1) % LORA_MSG_CAP;
   if (g_lora_msg_count < LORA_MSG_CAP) g_lora_msg_count++;
@@ -4512,6 +4546,14 @@ static void on_mesh_channel_picked(lv_event_t *e) {
   switch_screen(SCR_CHAT_DETAIL);
 }
 
+// Advanced/preset toggle — lets power users still reach the
+// moki/narrow/legacy/mtast preset picker. Default users never see it.
+static bool g_show_lora_advanced = false;
+static void on_lora_advanced_toggle(lv_event_t *e) {
+  g_show_lora_advanced = !g_show_lora_advanced;
+  switch_screen(SCR_CHAT_DETAIL);
+}
+
 void build_chat_detail(void) {
   if (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT) {
     switch_screen(SCR_CHAT); return;
@@ -4571,13 +4613,40 @@ void build_chat_detail(void) {
   }
 
   if (is_lora) {
-    // ── Channel-Picker (1..4 chips, current active channel highlighted) ──
+    // ── Channel-Picker row (with cog on the right for advanced settings) ──
     if (g_num_channels > 0) {
-      lv_obj_t *ch_strip = lv_obj_create(scr);
+      lv_obj_t *row = lv_obj_create(scr);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), 50);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+      lv_obj_set_style_pad_column(row, 6, LV_PART_MAIN);
+      lv_obj_t *ch_strip = lv_obj_create(row);
       lv_obj_remove_style_all(ch_strip);
-      lv_obj_set_size(ch_strip, LV_PCT(100), 50);
+      lv_obj_set_flex_grow(ch_strip, 1);
+      lv_obj_set_height(ch_strip, 50);
       lv_obj_set_flex_flow(ch_strip, LV_FLEX_FLOW_ROW);
       lv_obj_set_style_pad_column(ch_strip, 6, LV_PART_MAIN);
+
+      // Cog/advanced button on the right — shows/hides the preset picker.
+      lv_obj_t *cog = lv_obj_create(row);
+      lv_obj_remove_style_all(cog);
+      lv_obj_set_size(cog, 50, 50);
+      lv_obj_set_style_bg_color(cog,
+          lv_color_hex(g_show_lora_advanced ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(cog, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(cog, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(cog, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(cog, 2, LV_PART_MAIN);
+      lv_obj_set_flex_flow(cog, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(cog, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(cog, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(cog, on_lora_advanced_toggle, LV_EVENT_CLICKED, NULL);
+      lv_obj_t *cl = lv_label_create(cog);
+      lv_label_set_text(cl, "*");   // glyph proxy for cog (no font support for ⚙)
+      lv_obj_set_style_text_font(cl, &moki_jetbrains_mono_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(cl,
+          lv_color_hex(g_show_lora_advanced ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
       for (int ci = 0; ci < g_num_channels; ci++) {
         bool active = (ci == g_settings.mesh_active_channel);
         lv_obj_t *c = lv_obj_create(ch_strip);
@@ -4607,7 +4676,8 @@ void build_chat_detail(void) {
       }
     }
 
-    // ── Preset-Picker (4 chips, current preset highlighted) ──────────────
+    // ── Preset-Picker — only when advanced toggle is on ──────────────────
+    if (g_show_lora_advanced) {
     lv_obj_t *preset_strip = lv_obj_create(scr);
     lv_obj_remove_style_all(preset_strip);
     lv_obj_set_size(preset_strip, LV_PCT(100), 50);
@@ -4638,6 +4708,7 @@ void build_chat_detail(void) {
           lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
       lv_obj_set_style_text_letter_space(l, 1, LV_PART_MAIN);
     }
+    }   // end if (g_show_lora_advanced)
 
     // ── Big stat tile: RX-Count + last RSSI/SNR + secs since last RX ─────
     lv_obj_t *stat = lv_obj_create(scr);
@@ -4703,11 +4774,22 @@ void build_chat_detail(void) {
       lv_obj_set_width(empty, LV_PCT(100));
       lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
     } else {
-      // Iterate ring buffer in oldest→newest order
+      // Filter messages by the currently-active channel — each #channel
+      // chip in the strip above is its own room. Foreign-protocol messages
+      // (Meshtastic / raw, channel_idx=-2) are visible only when the
+      // advanced toggle is on.
+      int filter_idx = (int)g_settings.mesh_active_channel;
       int start = (g_lora_msg_count == LORA_MSG_CAP) ? g_lora_msg_head : 0;
+      int rendered = 0;
       for (int n = 0; n < g_lora_msg_count; n++) {
         int idx = (start + n) % LORA_MSG_CAP;
         const moki_lora_msg_t *m = &g_lora_msgs[idx];
+
+        // Channel filter: -1 = direct (always visible), -2 = foreign (only
+        // when advanced is on), 0..3 = matches active channel only.
+        if (m->channel_idx == -2 && !g_show_lora_advanced) continue;
+        if (m->channel_idx >= 0 && m->channel_idx != filter_idx) continue;
+        rendered++;
 
         lv_obj_t *bubble = lv_obj_create(scr);
         lv_obj_remove_style_all(bubble);
