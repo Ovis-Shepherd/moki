@@ -459,8 +459,123 @@ static const char MOKI_BOOK_TEXT[] PROGMEM =
 #define BOOK_PAGE_KEY "book_p"
 static int g_book_page = 0;
 
-// -1 = read from embedded MOKI_BOOK_TEXT, otherwise index into g_books[]
-static int g_book_active_idx = -1;
+// Active book selector:
+//   -2 = embedded MOKI_MANUAL_TEXT (Bedienungsanleitung)
+//   -1 = embedded MOKI_BOOK_TEXT (Walden)
+//    0..N = index into g_books[] (SD-card .txt files)
+static int g_book_active_idx = -2;   // default to manual on first boot
+
+// Bedienungsanleitung — embedded so it's always available even without SD.
+static const char MOKI_MANUAL_TEXT[] PROGMEM =
+  "willkommen.\n\n"
+  "moki ist dein kleiner companion. anti-smartphone. e-ink, leise, "
+  "langsam. nur das nötigste, schön gemacht. dieser kurze leitfaden "
+  "zeigt dir wie alles zusammenhängt.\n\n"
+
+  "das gehäuse.\n\n"
+  "vorderseite: e-ink display, kapazitiver touch (ein finger). "
+  "rechte seite: usb-c zum laden. unten: micro-sd slot für bücher und "
+  "karten. die antenne ragt nach oben heraus — niemals senden ohne sie, "
+  "der lora-chip nimmt sonst schaden.\n\n"
+
+  "navigation.\n\n"
+  "unten am rand siehst du fünf reiter: heim, tun, lesen, chat, karte. "
+  "tap, um zu wechseln. der aktive reiter hat eine 1.5px linie unter dem "
+  "text.\n\n"
+
+  "heim.\n\n"
+  "der startbildschirm. moki begrüsst dich, du siehst statistiken zu "
+  "todos, gewohnheiten und tag. tap auf eine kachel öffnet die jeweilige "
+  "ansicht. unten gibt es eine stimmungs-anzeige (mood) — tap, um deine "
+  "stimmung zu setzen.\n\n"
+
+  "tun.\n\n"
+  "drei tabs: todos, gewohnheiten, kalender. todos sind einfache "
+  "aufgaben mit kategorie und deadline. gewohnheiten haben einen + "
+  "und – button und eine 12-wochen heatmap. tag wechselt automatisch um "
+  "mitternacht. kalender zeigt deine termine.\n\n"
+
+  "lesen.\n\n"
+  "drei tabs: buch, feed, notizen. buch ist genau das, was du gerade "
+  "liest. lege .txt-dateien in /books/ auf der sd-karte ab — moki "
+  "indexiert sie beim booten und zeigt sie als chips oben. dein "
+  "lesefortschritt wird pro buch gespeichert.\n\n"
+
+  "notizen sind kurze markdown-texte. tap +, um eine neue zu beginnen. "
+  "drei vorlagen: tagebuch, sachen, anders. unterstützte syntax: "
+  "# überschrift, ## zwischenüberschrift, - listenpunkt, > zitat, --- "
+  "trennlinie.\n\n"
+
+  "chat.\n\n"
+  "moki kommuniziert per lora — ein langsamer funkstandard, der "
+  "kilometer überbrückt aber nur ein paar nachrichten pro minute "
+  "schafft. das ist absicht: keine flut, keine push-tyrannei.\n\n"
+
+  "der chat reiter zeigt deine räume und deine moki-freunde. ein raum "
+  "ist ein verschlüsselter kanal, an dem mehrere mokis teilnehmen "
+  "können. tap auf einen raum öffnet ihn — du siehst die letzten "
+  "nachrichten und kannst eine eigene tippen.\n\n"
+
+  "moki-freunde sind andere mokis, die du im mesh entdeckt hast. tap "
+  "auf einen namen öffnet eine direktnachricht — nur ihr beide könnt "
+  "sie lesen. wenn du selbst entdeckt werden willst, gehe ins profil "
+  "und drücke 'mich im mesh zeigen'.\n\n"
+
+  "antenne.\n\n"
+  "die lora-antenne muss angeschraubt sein, bevor du tx-fähig bist. "
+  "ohne antenne darf moki nur empfangen — das verhindert chip-schäden. "
+  "in den einstellungen findest du den schalter 'antenne dran'. erst "
+  "dann kannst du senden.\n\n"
+
+  "ein hinweis zur reichweite: ohne hindernisse erreicht moki etwa zwei "
+  "kilometer auf 869 mhz. mit den repeatern des rhein-neckar-mesh "
+  "decken deine nachrichten ganz heidelberg ab — auch wenn dein freund "
+  "auf der anderen seite des neckars sitzt. die nachricht hopst über "
+  "mehrere repeater, völlig automatisch.\n\n"
+
+  "karte.\n\n"
+  "moki kennt grob seine umgebung. wenn die gps-antenne aktiv ist (und "
+  "du draussen bist), siehst du deine eigene position in der mitte und "
+  "in der nähe befindliche freunde, sofern sie ihre position teilen. "
+  "die karte ist bewusst minimalistisch — keine bunten labels, nur "
+  "wesentliches.\n\n"
+
+  "einstellungen.\n\n"
+  "im profil-screen findest du den eingang zu den einstellungen. dort "
+  "regelst du:\n\n"
+
+  "sync-intervall: wie oft moki versucht, sich mit dem mesh zu syncen. "
+  "kürzer = aktueller, länger = mehr akku.\n\n"
+
+  "auto-schlaf: nach wieviel minuten leerlauf moki in den tiefschlaf "
+  "geht. tap aufs display weckt ihn wieder. 1 min = sehr sparsam, aus "
+  "= immer ansprechbar aber teurer akku.\n\n"
+
+  "antenne dran: tx-freigabe wie oben beschrieben.\n\n"
+
+  "akku.\n\n"
+  "ein voll geladener akku reicht je nach einstellung zwischen einer "
+  "woche (kurze sync-intervalle, kein auto-schlaf) und vier wochen "
+  "(maximale sparsamkeit). usb-c lädt in zwei stunden voll.\n\n"
+
+  "datenschutz.\n\n"
+  "alle mesh-nachrichten sind ende-zu-ende verschlüsselt mit aes-128. "
+  "deine identität ist ein lokal generiertes ed25519-schlüsselpaar — "
+  "nie auf irgendeinen server hochgeladen. du kannst eigene private "
+  "kanäle mit einem geheimen psk anlegen, dann sieht euch niemand "
+  "anders.\n\n"
+
+  "tipps.\n\n"
+  "moki ist designed für kurze interaktion. du sollst kein konzept von "
+  "sucht entwickeln. ein paar minuten todos checken, ein paar seiten "
+  "lesen, eine notiz tippen, eine nachricht schreiben — dann zur seite "
+  "legen.\n\n"
+
+  "wenn etwas nicht funktioniert, hilft fast immer ein neustart. der "
+  "reset-button ist auf der seite versteckt. todos, notizen, freunde "
+  "und einstellungen überleben einen reboot.\n\n"
+
+  "viel freude.";
 static moki_note_t g_notes[MAX_NOTES];
 static int g_notes_count = 0;
 
@@ -991,7 +1106,8 @@ static void state_load_book_page(void) {
 // ── M5-Full step 2: file-backed pagination ────────────────────────────────
 // Returns total length of the active book (PROGMEM length OR SD file size).
 static size_t book_total_length(void) {
-  if (g_book_active_idx < 0) return strlen_P(MOKI_BOOK_TEXT);
+  if (g_book_active_idx == -2) return strlen_P(MOKI_MANUAL_TEXT);
+  if (g_book_active_idx == -1) return strlen_P(MOKI_BOOK_TEXT);
   if (!g_sd_ready) return 0;
   if (g_book_active_idx >= g_book_count) return 0;
   File f = SD.open(g_books[g_book_active_idx].path);
@@ -1002,14 +1118,14 @@ static size_t book_total_length(void) {
 }
 
 // Reads up to `want` bytes starting at byte offset `start` into out_buf.
-// Works for both embedded text and SD-files. NUL-terminates.
+// Works for embedded books and SD-files. NUL-terminates.
 static size_t book_read_chunk(size_t start, size_t want, char *out_buf, size_t buf_size) {
   if (want > buf_size - 1) want = buf_size - 1;
-  if (g_book_active_idx < 0) {
-    // PROGMEM source
-    size_t total = strlen_P(MOKI_BOOK_TEXT);
+  if (g_book_active_idx == -2 || g_book_active_idx == -1) {
+    const char *src = (g_book_active_idx == -2) ? MOKI_MANUAL_TEXT : MOKI_BOOK_TEXT;
+    size_t total = strlen_P(src);
     if (start + want > total) want = (start < total) ? total - start : 0;
-    memcpy_P(out_buf, MOKI_BOOK_TEXT + start, want);
+    memcpy_P(out_buf, src + start, want);
     out_buf[want] = 0;
     return want;
   }
@@ -1024,28 +1140,29 @@ static size_t book_read_chunk(size_t start, size_t want, char *out_buf, size_t b
 }
 
 // Tap on a book in the list — switch active book + reset page + bookmark.
-// Per-book bookmark scheme: NVS key "book_p_<idx>".
+// Bookmark scheme: NVS key "book_p_<idx>" for SD books; "book_p" for Walden;
+// "book_p_m" for the manual.
+static const char *bookmark_key_for(int idx, char *buf, size_t buf_size) {
+  if (idx == -2) return "book_p_m";
+  if (idx == -1) return "book_p";
+  snprintf(buf, buf_size, "book_p_%d", idx);
+  return buf;
+}
+
 static void book_select(int idx) {
-  if (idx < -1 || idx >= g_book_count) return;
-  // Save current page under its own key first
-  if (g_book_active_idx >= 0) {
-    char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
-    g_prefs.begin("moki", false);
-    g_prefs.putUInt(k, (uint32_t)g_book_page);
-    g_prefs.end();
-  } else {
-    state_save_book_page();   // legacy embedded
-  }
+  if (idx < -2 || idx >= g_book_count) return;
+  // Save current page under its current key
+  char buf[16];
+  const char *cur_key = bookmark_key_for(g_book_active_idx, buf, sizeof(buf));
+  g_prefs.begin("moki", false);
+  g_prefs.putUInt(cur_key, (uint32_t)g_book_page);
+  g_prefs.end();
   // Switch + load new page
   g_book_active_idx = idx;
-  if (idx >= 0) {
-    char k[16]; snprintf(k, sizeof(k), "book_p_%d", idx);
-    g_prefs.begin("moki", true);
-    g_book_page = (int)g_prefs.getUInt(k, 0);
-    g_prefs.end();
-  } else {
-    state_load_book_page();
-  }
+  const char *new_key = bookmark_key_for(idx, buf, sizeof(buf));
+  g_prefs.begin("moki", true);
+  g_book_page = (int)g_prefs.getUInt(new_key, 0);
+  g_prefs.end();
 }
 
 // ── Mesh-Identity (32-byte secret) ───────────────────────────────────────
@@ -2790,8 +2907,9 @@ static void build_read_content(lv_obj_t *parent) {
   make_tab_button(bar, "notizen", current_read_tab == READ_NOTES, on_read_tab_clicked, READ_NOTES);
 
   if (current_read_tab == READ_BOOK) {
-    // Book selector — only render when SD has books
-    if (g_book_count > 0) {
+    // Book selector — always render so embedded books (manual + walden) are
+    // accessible even without SD card.
+    {
       lv_obj_t *picker = lv_obj_create(col);
       lv_obj_remove_style_all(picker);
       lv_obj_set_size(picker, LV_PCT(100), LV_SIZE_CONTENT);
@@ -2806,9 +2924,9 @@ static void build_read_content(lv_obj_t *parent) {
         switch_screen(SCR_READ);
       };
 
-      // Embedded fallback chip
-      {
-        bool active = (g_book_active_idx == -1);
+      // Helper to add a chip — defined inline to avoid name pollution
+      auto add_chip = [&](int idx, const char *label) {
+        bool active = (g_book_active_idx == idx);
         lv_obj_t *c = lv_obj_create(picker);
         lv_obj_remove_style_all(c);
         lv_obj_set_size(c, LV_SIZE_CONTENT, 40);
@@ -2824,39 +2942,21 @@ static void build_read_content(lv_obj_t *parent) {
         lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(c, on_book_picked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
+        lv_obj_add_event_cb(c, on_book_picked_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)idx);
         lv_obj_t *l = lv_label_create(c);
-        lv_label_set_text(l, "walden");
+        lv_label_set_text(l, label);
         lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
         lv_obj_set_style_text_color(l,
             lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
         lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
-      }
+      };
+
+      add_chip(-2, "anleitung");
+      add_chip(-1, "walden");
 
       for (int bi = 0; bi < g_book_count; bi++) {
-        bool active = (g_book_active_idx == bi);
-        lv_obj_t *c = lv_obj_create(picker);
-        lv_obj_remove_style_all(c);
-        lv_obj_set_size(c, LV_SIZE_CONTENT, 40);
-        lv_obj_set_style_bg_color(c,
-            lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_border_color(c, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-        lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
-        lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
-        lv_obj_set_style_pad_left(c, 12, LV_PART_MAIN);
-        lv_obj_set_style_pad_right(c, 12, LV_PART_MAIN);
-        lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(c, on_book_picked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)bi);
-        lv_obj_t *l = lv_label_create(c);
-        lv_label_set_text(l, g_books[bi].title);
-        lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
-        lv_obj_set_style_text_color(l,
-            lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
-        lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+        add_chip(bi, g_books[bi].title);
       }
     }
 
@@ -2868,9 +2968,10 @@ static void build_read_content(lv_obj_t *parent) {
     if (g_book_page < 0) g_book_page = 0;
 
     // Title
-    const char *book_title = (g_book_active_idx >= 0)
-                             ? g_books[g_book_active_idx].title
-                             : "Walden";
+    const char *book_title;
+    if (g_book_active_idx == -2)      book_title = "Anleitung";
+    else if (g_book_active_idx == -1) book_title = "Walden";
+    else                              book_title = g_books[g_book_active_idx].title;
     lv_obj_t *book = lv_label_create(col);
     lv_label_set_text(book, book_title);
     lv_obj_set_style_text_font(book, &moki_fraunces_italic_36, LV_PART_MAIN);
