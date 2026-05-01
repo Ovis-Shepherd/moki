@@ -1049,8 +1049,12 @@ static void wifi_event_cb(WiFiEvent_t event) {
 }
 
 static void wifi_init(void) {
+  // WiFi lazy-init: claimt sich beim ersten WiFi.mode(WIFI_STA) ~20KB DRAM
+  // dauerhaft. Wenn keine Creds: nicht init'en — sonst hat ein späterer
+  // Scan-Versuch nicht genug Heap fürs net80211-Subsystem (ESP_ERR_NO_MEM).
+  // Erste WiFi-Aktion (Scan oder Connect) macht die Init dann lazy.
   if (!g_wifi.enabled) {
-    Serial.println(F("[wifi] no creds — STA off (set via 'wifi_set SSID PSK')"));
+    Serial.println(F("[wifi] no creds — STA off (lazy init on first use)"));
     return;
   }
   WiFi.mode(WIFI_STA);
@@ -6713,8 +6717,12 @@ void build_ota_screen(void) { switch_screen(SCR_PROFILE); }
 
 // ── WiFi-Setup-Screens (M8.8) ────────────────────────────────────────────
 #ifdef MOKI_WIFI
-// Scratch state für Picked-SSID + PSK-Edit
-static char     g_wifi_pick_ssid[33] = "";
+// Scratch state für Picked-SSID + PSK-Edit. Dual-Mode: scan-pick ODER manueller
+// SSID-Eintrag (für den Fall dass Scan nicht klappt — DRAM-Knappheit).
+typedef enum { WIFI_EDIT_PSK = 0, WIFI_EDIT_SSID = 1 } wifi_edit_mode_t;
+static char             g_wifi_pick_ssid[33] = "";
+static char             g_wifi_pick_psk[65] = "";
+static wifi_edit_mode_t g_wifi_edit_mode = WIFI_EDIT_PSK;
 static lv_obj_t *g_wifi_psk_ta = nullptr;
 
 static void on_wifi_back(lv_event_t *e) {
@@ -6726,11 +6734,26 @@ static void on_wifi_psk_back(lv_event_t *e) {
 }
 
 static void on_wifi_psk_save(lv_event_t *e) {
-  if (!g_wifi_psk_ta || !g_wifi_pick_ssid[0]) {
+  if (!g_wifi_psk_ta) {
     switch_screen(SCR_WIFI); return;
   }
-  const char *psk = lv_textarea_get_text(g_wifi_psk_ta);
-  wifi_set_creds(g_wifi_pick_ssid, psk ? psk : "");
+  const char *txt = lv_textarea_get_text(g_wifi_psk_ta);
+  if (!txt) txt = "";
+
+  if (g_wifi_edit_mode == WIFI_EDIT_SSID) {
+    // SSID gerade eingegeben — wechsel zu PSK-Edit
+    strncpy(g_wifi_pick_ssid, txt, sizeof(g_wifi_pick_ssid) - 1);
+    g_wifi_pick_ssid[sizeof(g_wifi_pick_ssid) - 1] = 0;
+    g_wifi_edit_mode = WIFI_EDIT_PSK;
+    switch_screen(SCR_WIFI_PSK);
+    return;
+  }
+
+  // PSK-Edit: jetzt connecten
+  if (!g_wifi_pick_ssid[0]) {
+    switch_screen(SCR_WIFI); return;
+  }
+  wifi_set_creds(g_wifi_pick_ssid, txt);
   switch_screen(SCR_WIFI);
 }
 
@@ -6745,6 +6768,14 @@ static void on_wifi_pick(lv_event_t *e) {
   if (!ssid) return;
   strncpy(g_wifi_pick_ssid, ssid, sizeof(g_wifi_pick_ssid) - 1);
   g_wifi_pick_ssid[sizeof(g_wifi_pick_ssid) - 1] = 0;
+  g_wifi_edit_mode = WIFI_EDIT_PSK;
+  switch_screen(SCR_WIFI_PSK);
+}
+
+static void on_wifi_pick_manual(lv_event_t *e) {
+  // SSID manuell eingeben (für Fall dass Scan nicht klappt)
+  g_wifi_pick_ssid[0] = 0;
+  g_wifi_edit_mode = WIFI_EDIT_SSID;
   switch_screen(SCR_WIFI_PSK);
 }
 
@@ -6921,7 +6952,7 @@ void build_wifi(void) {
 
   if (n == 0) {
     lv_obj_t *empty = lv_label_create(scr);
-    lv_label_set_text(empty, "(keine Netze gefunden)");
+    lv_label_set_text(empty, "(keine Netze gefunden — manuell unten eingeben)");
     lv_obj_set_style_text_font(empty, &moki_fraunces_italic_22, LV_PART_MAIN);
     lv_obj_set_style_text_color(empty, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   }
@@ -6959,10 +6990,31 @@ void build_wifi(void) {
   }
 
   WiFi.scanDelete();
+
+  // Manual-SSID-Eingabe als Fallback. Auch wenn Scan-Liste leer ist oder
+  // Lucas's Netz versteckt ist (hidden SSID).
+  lv_obj_t *manual = lv_obj_create(scr);
+  lv_obj_remove_style_all(manual);
+  lv_obj_set_size(manual, LV_PCT(100), 56);
+  lv_obj_set_style_border_color(manual, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(manual, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(manual, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(manual, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(manual, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(manual, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(manual, on_wifi_pick_manual, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *ml = lv_label_create(manual);
+  lv_label_set_text(ml, "+ NETZWERK MANUELL EINGEBEN");
+  lv_obj_set_style_text_font(ml, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ml, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(ml, 2, LV_PART_MAIN);
+  lv_obj_add_flag(ml, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
 
 void build_wifi_psk(void) {
-  if (!g_wifi_pick_ssid[0]) {
+  // Dual-Mode: WIFI_EDIT_SSID (manuell SSID eingeben) oder WIFI_EDIT_PSK (Passwort)
+  if (g_wifi_edit_mode == WIFI_EDIT_PSK && !g_wifi_pick_ssid[0]) {
     switch_screen(SCR_WIFI); return;
   }
 
@@ -6994,7 +7046,11 @@ void build_wifi_psk(void) {
   lv_obj_add_flag(bl, LV_OBJ_FLAG_EVENT_BUBBLE);
 
   char title[40];
-  snprintf(title, sizeof(title), "WLAN · %s", g_wifi_pick_ssid);
+  if (g_wifi_edit_mode == WIFI_EDIT_SSID) {
+    snprintf(title, sizeof(title), "WLAN · netzwerkname");
+  } else {
+    snprintf(title, sizeof(title), "WLAN · %s", g_wifi_pick_ssid);
+  }
   lv_obj_t *kicker = lv_label_create(hdr);
   lv_label_set_text(kicker, title);
   lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_18, LV_PART_MAIN);
@@ -7027,7 +7083,11 @@ void build_wifi_psk(void) {
   lv_obj_set_style_border_width(ta, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(ta, 16, LV_PART_MAIN);
   lv_textarea_set_one_line(ta, true);
-  lv_textarea_set_placeholder_text(ta, "passwort eingeben");
+  if (g_wifi_edit_mode == WIFI_EDIT_SSID) {
+    lv_textarea_set_placeholder_text(ta, "ssid eingeben (z.B. MeinIPhone)");
+  } else {
+    lv_textarea_set_placeholder_text(ta, "passwort eingeben");
+  }
   g_wifi_psk_ta = ta;
 
   // Keyboard
@@ -8711,6 +8771,24 @@ static void poll_serial(void) {
         }
       } else if (line == "wifi_clear") {
         wifi_clear_creds();
+      } else if (line == "wifi_scan") {
+        // Debug: WiFi.scanNetworks + Liste in Serial dumpen
+        if (WiFi.getMode() != WIFI_STA) {
+          WiFi.mode(WIFI_STA);
+          WiFi.onEvent(wifi_event_cb);
+          delay(500);
+        }
+        WiFi.disconnect(false, true);
+        delay(200);
+        Serial.println(F("[wifi_scan] starting ..."));
+        int n = WiFi.scanNetworks(false, false, false, 400);
+        Serial.printf("[wifi_scan] found %d\n", n);
+        for (int i = 0; i < n && i < 20; i++) {
+          Serial.printf("  [%d] '%s'  rssi=%d  ch=%d  enc=%d\n", i,
+                        WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+                        WiFi.channel(i), WiFi.encryptionType(i));
+        }
+        WiFi.scanDelete();
       } else if (line == "wifi_status") {
         Serial.printf("[wifi] enabled=%d connected=%d ssid='%s' ip=%s rssi=%d\n",
                       g_wifi.enabled, g_wifi.connected,
