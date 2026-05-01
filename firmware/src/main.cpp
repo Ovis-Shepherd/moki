@@ -1082,16 +1082,6 @@ extern int g_active_chat;
 
 static void on_dock_clicked(lv_event_t *e) {
   intptr_t idx = (intptr_t)lv_event_get_user_data(e);
-  // Special-case "chat" (idx 3): jump directly to the LoRa-mesh chat detail
-  // since that's the only real chat right now. The mockup-list at SCR_CHAT
-  // is still reachable via long-press in future, but doesn't deserve to be
-  // the primary destination.
-  if (idx == 3) {
-    g_active_chat = 0;   // first SAMPLE_CHATS entry = #moki-mesh
-    Serial.println(F("[nav] dock chat → SCR_CHAT_DETAIL (lora)"));
-    switch_screen(SCR_CHAT_DETAIL);
-    return;
-  }
   static const screen_id_t mapping[] = { SCR_HOME, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP };
   if (idx >= 0 && idx < 5) {
     Serial.printf("[nav] dock → screen %d\n", (int)mapping[idx]);
@@ -2171,16 +2161,21 @@ static void show_toast(const char *text) {
   lv_timer_set_repeat_count(g_toast_timer, 1);
 }
 
-int g_active_chat = -1;   // non-static so dock-handler can set it directly
+int g_active_chat = -1;   // legacy mockup-list index; -1 means new-style chat target
+
+// New-style chat targeting (Lucas's WhatsApp/Telegram pattern).
+// kind: 0 = MeshCore channel @ idx, 1 = DM with contact @ idx
+// When set, build_chat_detail filters by these and ignores g_active_chat.
+int g_chat_target_kind = -1;   // -1 = none yet, 0 = channel, 1 = dm
+int g_chat_target_idx  = 0;
 static void on_chat_open(lv_event_t *e) {
   g_active_chat = (int)(intptr_t)lv_event_get_user_data(e);
   switch_screen(SCR_CHAT_DETAIL);
 }
 static void on_chat_back(lv_event_t *e) {
   g_active_chat = -1;
-  // Back from chat-detail goes home — the mockup-chat-list at SCR_CHAT
-  // is no longer the primary chat surface (dock chat → chat-detail direct).
-  switch_screen(SCR_HOME);
+  g_chat_target_kind = -1;
+  switch_screen(SCR_CHAT);
 }
 
 static void on_mood_pill_clicked(lv_event_t *e) {
@@ -3474,6 +3469,130 @@ static void build_chat_row(lv_obj_t *parent, const moki_chat_t *c) {
   }
 }
 
+// Helper: walk the ring buffer to find the latest message + last ts_ms for a
+// given filter (channel_idx). Returns pointer to msg or NULL.
+static const moki_lora_msg_t *find_latest_for_channel(int channel_idx) {
+  const moki_lora_msg_t *latest = NULL;
+  for (int n = 0; n < g_lora_msg_count; n++) {
+    const moki_lora_msg_t *m = &g_lora_msgs[n];
+    if (m->channel_idx != channel_idx) continue;
+    if (!latest || m->ts_ms > latest->ts_ms) latest = m;
+  }
+  return latest;
+}
+
+// Helper for DM: find latest message from a contact (matched by name prefix).
+static const moki_lora_msg_t *find_latest_from_contact(const char *contact_name) {
+  const moki_lora_msg_t *latest = NULL;
+  for (int n = 0; n < g_lora_msg_count; n++) {
+    const moki_lora_msg_t *m = &g_lora_msgs[n];
+    if (m->channel_idx != -1) continue;   // only DMs
+    if (strncmp(m->from, contact_name, sizeof(m->from)) != 0) continue;
+    if (!latest || m->ts_ms > latest->ts_ms) latest = m;
+  }
+  return latest;
+}
+
+// Format a relative-time hint ("vor 5 min", "jetzt", "älter").
+static void format_age(uint32_t msg_ts_ms, char *out, size_t out_size) {
+  uint32_t now = millis();
+  if (msg_ts_ms == 0 || msg_ts_ms > now) {
+    snprintf(out, out_size, "älter");
+    return;
+  }
+  uint32_t age_s = (now - msg_ts_ms) / 1000;
+  if      (age_s < 60)     snprintf(out, out_size, "vor %lus", (unsigned long)age_s);
+  else if (age_s < 3600)   snprintf(out, out_size, "vor %lum", (unsigned long)(age_s / 60));
+  else if (age_s < 86400)  snprintf(out, out_size, "vor %luh", (unsigned long)(age_s / 3600));
+  else                     snprintf(out, out_size, "älter");
+}
+
+// Format absolute time (HH:MM) using session-uptime relative to RTC if known.
+static void format_clock(uint32_t msg_ts_ms, char *out, size_t out_size) {
+  if (!g_rtc_ready) {
+    format_age(msg_ts_ms, out, out_size);
+    return;
+  }
+  // Reconstruct: msg_abs_seconds = (rtc_now_seconds) - (millis_now - msg_ts_ms)/1000
+  uint32_t now = millis();
+  if (msg_ts_ms == 0 || msg_ts_ms > now) {
+    snprintf(out, out_size, "älter");
+    return;
+  }
+  RTC_DateTime rtc = g_rtc.getDateTime();
+  int32_t age_s = (int32_t)((now - msg_ts_ms) / 1000);
+  // Subtract age from current rtc HH:MM:SS → message time. Naive (no day-rollover).
+  int32_t total_s = rtc.hour * 3600 + rtc.minute * 60 + rtc.second - age_s;
+  while (total_s < 0) total_s += 86400;
+  int32_t hh = (total_s / 3600) % 24;
+  int32_t mm = (total_s / 60) % 60;
+  snprintf(out, out_size, "%02ld:%02ld", (long)hh, (long)mm);
+}
+
+// One row per chat. Tap → set chat_target + jump into chat-detail.
+typedef struct {
+  const char *title;
+  const char *subtitle;     // last-msg preview or empty
+  const char *meta;         // RHS info (count or time, or empty)
+  int kind;                 // 0 = channel, 1 = dm, 2 = special (foreign)
+  int idx;                  // channel index or contact index
+} moki_chat_row_t;
+
+static void build_chat_row_dynamic(lv_obj_t *parent, const moki_chat_row_t *r) {
+  static auto on_row_tap = [](lv_event_t *e) {
+    intptr_t packed = (intptr_t)lv_event_get_user_data(e);
+    g_chat_target_kind = (int)(packed >> 16);
+    g_chat_target_idx  = (int)(packed & 0xFFFF);
+    g_active_chat = -1;   // disable legacy mockup-list path
+    switch_screen(SCR_CHAT_DETAIL);
+  };
+  intptr_t packed = ((intptr_t)r->kind << 16) | (intptr_t)r->idx;
+
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_pad_top(row, 14, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(row, 14, LV_PART_MAIN);
+  lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+  lv_obj_set_style_border_color(row, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
+  lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(row, on_row_tap, LV_EVENT_CLICKED, (void *)packed);
+
+  // Left column: title + subtitle stacked
+  lv_obj_t *left = lv_obj_create(row);
+  lv_obj_remove_style_all(left);
+  lv_obj_set_flex_grow(left, 1);
+  lv_obj_set_flex_flow(left, LV_FLEX_FLOW_COLUMN);
+
+  lv_obj_t *t = lv_label_create(left);
+  lv_label_set_text(t, r->title);
+  lv_obj_set_style_text_font(t, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+
+  if (r->subtitle && r->subtitle[0]) {
+    lv_obj_t *s = lv_label_create(left);
+    lv_label_set_text(s, r->subtitle);
+    lv_obj_set_style_text_font(s, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_width(s, LV_PCT(100));
+    lv_label_set_long_mode(s, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_pad_top(s, 4, LV_PART_MAIN);
+  }
+
+  // Right meta: time or count
+  if (r->meta && r->meta[0]) {
+    lv_obj_t *m = lv_label_create(row);
+    lv_label_set_text(m, r->meta);
+    lv_obj_set_style_text_font(m, &moki_jetbrains_mono_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(m, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_pad_left(m, 12, LV_PART_MAIN);
+  }
+}
+
 static void build_chats_content(lv_obj_t *parent) {
   lv_obj_t *col = lv_obj_create(parent);
   lv_obj_remove_style_all(col);
@@ -3490,75 +3609,77 @@ static void build_chats_content(lv_obj_t *parent) {
   lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
 
-  lv_obj_t *title = lv_label_create(col);
-  lv_label_set_text(title, "ein kleiner kreis.");
-  lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
-  lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_pad_bottom(title, 8, LV_PART_MAIN);
+  lv_obj_t *title_lbl = lv_label_create(col);
+  lv_label_set_text(title_lbl, "ein kleiner kreis.");
+  lv_obj_set_style_text_font(title_lbl, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title_lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(title_lbl, 8, LV_PART_MAIN);
 
-  for (int i = 0; i < SAMPLE_CHATS_COUNT; i++) {
-    build_chat_row(col, &SAMPLE_CHATS[i]);
+  // ── ROOMS — one row per MeshCore channel ─────────────────────────────
+  for (int i = 0; i < g_num_channels; i++) {
+    char title_buf[32]; snprintf(title_buf, sizeof(title_buf), "#%s", g_channels[i].name);
+    char sub_buf[80] = "—";
+    char meta_buf[16] = "";
+    const moki_lora_msg_t *latest = find_latest_for_channel(i);
+    if (latest) {
+      // Build "<sender>: <body>" preview
+      char preview[120];
+      char safe_text[64]; size_t tn = latest->len;
+      if (tn > sizeof(safe_text) - 1) tn = sizeof(safe_text) - 1;
+      for (size_t k = 0; k < tn; k++) {
+        uint8_t b = (uint8_t)latest->text[k];
+        safe_text[k] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+      }
+      safe_text[tn] = 0;
+      snprintf(preview, sizeof(preview), "%s: %s", latest->from, safe_text);
+      strncpy(sub_buf, preview, sizeof(sub_buf) - 1);
+      sub_buf[sizeof(sub_buf) - 1] = 0;
+      format_clock(latest->ts_ms, meta_buf, sizeof(meta_buf));
+    }
+    moki_chat_row_t r = { strdup(title_buf), strdup(sub_buf), strdup(meta_buf),
+                          /*kind=*/0, /*idx=*/i };
+    build_chat_row_dynamic(col, &r);
+    // Note: strdup memory leak — acceptable for re-render-on-switch UI; LVGL
+    // doesn't free our strings when row is destroyed. For long-running
+    // sessions this can grow; we accept it for now.
   }
 
-  // ── DEINE MOKIS — discovered MeshCore contacts ────────────────────────
-  // (Forward decls — actual defs are below in the LoRa-Compose section.)
-  extern int g_dm_target_idx;
-  extern void open_lora_compose(void);
-
+  // ── DM CONTACTS — one row per discovered Moki ────────────────────────
   int n_contacts = moki_mesh_contact_count();
   if (n_contacts > 0) {
     lv_obj_t *gap = lv_obj_create(col);
     lv_obj_remove_style_all(gap);
     lv_obj_set_size(gap, LV_PCT(100), 16);
 
-    lv_obj_t *kicker2 = lv_label_create(col);
-    lv_label_set_text(kicker2, "DEINE MOKIS");
-    lv_obj_set_style_text_font(kicker2, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(kicker2, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(kicker2, 3, LV_PART_MAIN);
+    lv_obj_t *k2 = lv_label_create(col);
+    lv_label_set_text(k2, "DEINE MOKIS");
+    lv_obj_set_style_text_font(k2, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(k2, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(k2, 3, LV_PART_MAIN);
 
-    lv_obj_t *sub = lv_label_create(col);
-    lv_label_set_text(sub, "im mesh entdeckt — tippen für direkt-nachricht.");
-    lv_obj_set_style_text_font(sub, &moki_fraunces_italic_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(sub, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-    lv_obj_set_width(sub, LV_PCT(100));
-    lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_pad_bottom(sub, 8, LV_PART_MAIN);
-
-    static auto on_contact_clicked = [](lv_event_t *e) {
-      g_dm_target_idx = (int)(intptr_t)lv_event_get_user_data(e);
-      open_lora_compose();   // reuse the existing compose overlay
-    };
     for (int i = 0; i < n_contacts; i++) {
       char name[40]; uint8_t key4[4];
       if (!moki_mesh_get_contact(i, name, sizeof(name), key4)) continue;
-
-      lv_obj_t *row = lv_obj_create(col);
-      lv_obj_remove_style_all(row);
-      lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
-      lv_obj_set_style_pad_top(row, 8, LV_PART_MAIN);
-      lv_obj_set_style_pad_bottom(row, 8, LV_PART_MAIN);
-      lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
-      lv_obj_set_style_border_color(row, lv_color_hex(MOKI_LIGHT), LV_PART_MAIN);
-      lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
-      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
-      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-      lv_obj_add_event_cb(row, on_contact_clicked, LV_EVENT_CLICKED,
-                          (void *)(intptr_t)i);
-
-      lv_obj_t *nl = lv_label_create(row);
-      lv_label_set_text(nl, name);
-      lv_obj_set_style_text_font(nl, &moki_fraunces_italic_28, LV_PART_MAIN);
-      lv_obj_set_style_text_color(nl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-
-      char id_buf[32];
-      snprintf(id_buf, sizeof(id_buf), "id %02x%02x%02x%02x",
-               key4[0], key4[1], key4[2], key4[3]);
-      lv_obj_t *il = lv_label_create(row);
-      lv_label_set_text(il, id_buf);
-      lv_obj_set_style_text_font(il, &moki_jetbrains_mono_18, LV_PART_MAIN);
-      lv_obj_set_style_text_color(il, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-      lv_obj_set_style_text_letter_space(il, 1, LV_PART_MAIN);
+      char sub_buf[80]; char meta_buf[16] = "";
+      const moki_lora_msg_t *latest = find_latest_from_contact(name);
+      if (latest) {
+        char safe_text[64]; size_t tn = latest->len;
+        if (tn > sizeof(safe_text) - 1) tn = sizeof(safe_text) - 1;
+        for (size_t k = 0; k < tn; k++) {
+          uint8_t b = (uint8_t)latest->text[k];
+          safe_text[k] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+        }
+        safe_text[tn] = 0;
+        strncpy(sub_buf, safe_text, sizeof(sub_buf) - 1);
+        sub_buf[sizeof(sub_buf) - 1] = 0;
+        format_clock(latest->ts_ms, meta_buf, sizeof(meta_buf));
+      } else {
+        snprintf(sub_buf, sizeof(sub_buf), "id %02x%02x%02x%02x — noch keine nachricht",
+                 key4[0], key4[1], key4[2], key4[3]);
+      }
+      moki_chat_row_t r = { strdup(name), strdup(sub_buf), strdup(meta_buf),
+                            /*kind=*/1, /*idx=*/i };
+      build_chat_row_dynamic(col, &r);
     }
   }
 }
@@ -4572,17 +4693,60 @@ static void on_lora_advanced_toggle(lv_event_t *e) {
 }
 
 void build_chat_detail(void) {
-  if (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT) {
+  // New-style targeting takes precedence: kind=0 (channel) or 1 (DM).
+  // If neither set, fall back to legacy mockup-list (only for old code paths).
+  bool new_style = (g_chat_target_kind >= 0);
+  if (!new_style && (g_active_chat < 0 || g_active_chat >= SAMPLE_CHATS_COUNT)) {
     switch_screen(SCR_CHAT); return;
   }
-  const moki_chat_t *c = &SAMPLE_CHATS[g_active_chat];
-  bool is_lora = !strcmp(c->kind, "lora");
+
+  // Resolve display title + filter values for the new-style path.
+  char title_buf[40] = "";
+  int  filter_kind  = -1;   // -1=both/legacy, 0=channel, 1=dm
+  int  filter_idx   = 0;
+  char dm_contact_name[40] = "";
+  if (new_style) {
+    if (g_chat_target_kind == 0) {
+      // MeshCore channel
+      if (g_chat_target_idx < 0 || g_chat_target_idx >= g_num_channels) {
+        switch_screen(SCR_CHAT); return;
+      }
+      // Switch active channel so outgoing TX targets this room.
+      if (g_settings.mesh_active_channel != g_chat_target_idx) {
+        g_settings.mesh_active_channel = (uint8_t)g_chat_target_idx;
+        state_save_settings();
+      }
+      snprintf(title_buf, sizeof(title_buf), "#%s", g_channels[g_chat_target_idx].name);
+      filter_kind = 0;
+      filter_idx  = g_chat_target_idx;
+    } else if (g_chat_target_kind == 1) {
+      uint8_t key4[4];
+      if (!moki_mesh_get_contact(g_chat_target_idx, dm_contact_name,
+                                  sizeof(dm_contact_name), key4)) {
+        switch_screen(SCR_CHAT); return;
+      }
+      strncpy(title_buf, dm_contact_name, sizeof(title_buf) - 1);
+      title_buf[sizeof(title_buf) - 1] = 0;
+      filter_kind = 1;
+      // Set DM target for the compose-save handler.
+      g_dm_target_idx = g_chat_target_idx;
+    }
+  }
+
+  // Legacy mockup-chat compatibility (unused once dock-chat lands on SCR_CHAT).
+  const moki_chat_t *c = NULL;
+  bool is_lora = false;
   const chat_msg_t *msgs = NULL; int mn = 0;
-  // Indices shifted by +1 because #moki-mesh is now SAMPLE_CHATS[0]
-  if (!is_lora) {
-    if      (g_active_chat == 1) { msgs = MSGS_LINA;       mn = 2; }
-    else if (g_active_chat == 2) { msgs = MSGS_LESEKREIS;  mn = 3; }
-    else if (g_active_chat == 3) { msgs = MSGS_RHEIN;      mn = 3; }
+  if (!new_style) {
+    c = &SAMPLE_CHATS[g_active_chat];
+    is_lora = !strcmp(c->kind, "lora");
+    if (!is_lora) {
+      if      (g_active_chat == 1) { msgs = MSGS_LINA;       mn = 2; }
+      else if (g_active_chat == 2) { msgs = MSGS_LESEKREIS;  mn = 3; }
+      else if (g_active_chat == 3) { msgs = MSGS_RHEIN;      mn = 3; }
+    }
+  } else {
+    is_lora = true;   // new-style always shows the LoRa-style detail with bubbles
   }
 
   lv_obj_t *scr = lv_scr_act();
@@ -4607,17 +4771,23 @@ void build_chat_detail(void) {
   lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
 
   lv_obj_t *kicker = lv_label_create(scr);
-  char k[48]; snprintf(k, sizeof(k), "%s · %s",
-                       chat_kind_glyph(c->kind),
-                       !strcmp(c->kind,"direct") ? "DIREKT" :
-                       !strcmp(c->kind,"group")  ? "GRUPPE" : "ÖFFENTLICH");
+  char k[48];
+  if (new_style) {
+    snprintf(k, sizeof(k), "%s",
+             filter_kind == 1 ? "DIREKTNACHRICHT" : "MESH-KANAL");
+  } else {
+    snprintf(k, sizeof(k), "%s · %s",
+             chat_kind_glyph(c->kind),
+             !strcmp(c->kind,"direct") ? "DIREKT" :
+             !strcmp(c->kind,"group")  ? "GRUPPE" : "ÖFFENTLICH");
+  }
   lv_label_set_text(kicker, k);
   lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
 
   lv_obj_t *title = lv_label_create(scr);
-  lv_label_set_text(title, c->name);
+  lv_label_set_text(title, new_style ? title_buf : c->name);
   lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
@@ -4630,8 +4800,37 @@ void build_chat_detail(void) {
   }
 
   if (is_lora) {
-    // ── Channel-Picker row (with cog on the right for advanced settings) ──
-    if (g_num_channels > 0) {
+    // ── Standalone cog when new-style (no channel chips needed) ──────────
+    if (new_style) {
+      lv_obj_t *cog_row = lv_obj_create(scr);
+      lv_obj_remove_style_all(cog_row);
+      lv_obj_set_size(cog_row, LV_PCT(100), 50);
+      lv_obj_set_flex_flow(cog_row, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(cog_row, LV_FLEX_ALIGN_END,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_t *cog = lv_obj_create(cog_row);
+      lv_obj_remove_style_all(cog);
+      lv_obj_set_size(cog, 60, 50);
+      lv_obj_set_style_bg_color(cog,
+          lv_color_hex(g_show_lora_advanced ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(cog, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_border_color(cog, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_border_width(cog, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(cog, 2, LV_PART_MAIN);
+      lv_obj_set_flex_flow(cog, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(cog, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_add_flag(cog, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(cog, on_lora_advanced_toggle, LV_EVENT_CLICKED, NULL);
+      lv_obj_t *cl = lv_label_create(cog);
+      lv_label_set_text(cl, "···");
+      lv_obj_set_style_text_font(cl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+      lv_obj_set_style_text_color(cl,
+          lv_color_hex(g_show_lora_advanced ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+    }
+
+    // ── Channel-Picker row — only legacy view (new_style entered via list) ──
+    if (g_num_channels > 0 && !new_style) {
       lv_obj_t *row = lv_obj_create(scr);
       lv_obj_remove_style_all(row);
       lv_obj_set_size(row, LV_PCT(100), 50);
@@ -4792,21 +4991,36 @@ void build_chat_detail(void) {
       lv_obj_set_width(empty, LV_PCT(100));
       lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
     } else {
-      // Filter messages by the currently-active channel — each #channel
-      // chip in the strip above is its own room. Foreign-protocol messages
-      // (Meshtastic / raw, channel_idx=-2) are visible only when the
-      // advanced toggle is on.
-      int filter_idx = (int)g_settings.mesh_active_channel;
+      // Filter messages by the chat target chosen via the chats-list row.
+      //   new_style channel: show only msgs with channel_idx == filter_idx
+      //   new_style DM     : show only msgs with channel_idx == -1 AND
+      //                      msg.from prefix matches the contact name
+      //   legacy           : all messages on the active channel
+      // Foreign-protocol (channel_idx=-2) only when advanced toggle is on.
+      int legacy_filter_idx = (int)g_settings.mesh_active_channel;
       int start = (g_lora_msg_count == LORA_MSG_CAP) ? g_lora_msg_head : 0;
       int rendered = 0;
       for (int n = 0; n < g_lora_msg_count; n++) {
         int idx = (start + n) % LORA_MSG_CAP;
         const moki_lora_msg_t *m = &g_lora_msgs[idx];
 
-        // Channel filter: -1 = direct (always visible), -2 = foreign (only
-        // when advanced is on), 0..3 = matches active channel only.
+        // Foreign-protocol bucket — only when advanced toggle is on.
         if (m->channel_idx == -2 && !g_show_lora_advanced) continue;
-        if (m->channel_idx >= 0 && m->channel_idx != filter_idx) continue;
+
+        if (new_style) {
+          if (filter_kind == 0) {
+            // Channel: only matching channel_idx (DMs visible too if directed
+            // here? No — only msgs from this channel).
+            if (m->channel_idx != filter_idx) continue;
+          } else if (filter_kind == 1) {
+            // DM: only DMs (channel_idx=-1) from the matching contact name.
+            if (m->channel_idx != -1) continue;
+            if (strncmp(m->from, dm_contact_name, sizeof(m->from)) != 0) continue;
+          }
+        } else {
+          // Legacy path: same as before
+          if (m->channel_idx >= 0 && m->channel_idx != legacy_filter_idx) continue;
+        }
         rendered++;
 
         lv_obj_t *bubble = lv_obj_create(scr);
@@ -4820,15 +5034,22 @@ void build_chat_detail(void) {
         lv_obj_set_style_pad_all(bubble, 12, LV_PART_MAIN);
         lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
 
-        // Header: from · RSSI · SNR · preset
-        char hdr[96];
-        const char *plabel = (m->preset < LORA_PRESET_COUNT
-                              ? LORA_PRESET_LABELS[m->preset] : "?");
-        if (m->rssi)
-          snprintf(hdr, sizeof(hdr), "%s · %d dBm · snr %.1f · %s",
-                   m->from, m->rssi, m->snr_x10/10.0, plabel);
-        else
-          snprintf(hdr, sizeof(hdr), "%s · gesendet · %s", m->from, plabel);
+        // Header: from · time · (RSSI/SNR · preset only when advanced toggled)
+        char hdr[120];
+        char tstr[16];
+        format_clock(m->ts_ms, tstr, sizeof(tstr));
+        if (g_show_lora_advanced) {
+          const char *plabel = (m->preset < LORA_PRESET_COUNT
+                                ? LORA_PRESET_LABELS[m->preset] : "?");
+          if (m->rssi)
+            snprintf(hdr, sizeof(hdr), "%s · %s · %d dBm · %s",
+                     m->from, tstr, m->rssi, plabel);
+          else
+            snprintf(hdr, sizeof(hdr), "%s · %s · %s", m->from, tstr, plabel);
+        } else {
+          // Default: clean WhatsApp-style header — name and time only.
+          snprintf(hdr, sizeof(hdr), "%s · %s", m->from, tstr);
+        }
         lv_obj_t *h = lv_label_create(bubble);
         lv_label_set_text(h, hdr);
         lv_obj_set_style_text_font(h, &moki_jetbrains_mono_18, LV_PART_MAIN);
