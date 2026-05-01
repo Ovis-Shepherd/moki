@@ -12,6 +12,13 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <SD.h>
+#include <limits.h>
+#ifdef MOKI_WIFI
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#endif
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -136,7 +143,7 @@ static const sample_habit_def SAMPLE_HABITS_DEF[] = {
 static const int SAMPLE_HABITS_COUNT = sizeof(SAMPLE_HABITS_DEF) / sizeof(SAMPLE_HABITS_DEF[0]);
 
 #define MAX_HABITS 16
-static moki_habit_t g_habits[MAX_HABITS];
+static moki_habit_t *g_habits = nullptr;   // [MAX_HABITS] in PSRAM (heap_caps_calloc)
 static int g_habits_count = 0;
 
 static void state_init_habits(void) {
@@ -165,7 +172,7 @@ static const int SAMPLE_TODOS_COUNT = sizeof(SAMPLE_TODOS) / sizeof(SAMPLE_TODOS
 // SAMPLE_TODOS in setup(). Persistence to LittleFS comes in Stage 3.
 #define MAX_TODOS 32
 #define TODOS_SCHEMA_V 1
-static moki_todo_t g_todos[MAX_TODOS];
+static moki_todo_t *g_todos = nullptr;     // [MAX_TODOS] PSRAM-heap
 static int g_todos_count = 0;
 
 static void state_init_todos(void) {
@@ -262,7 +269,7 @@ static const moki_event_t SAMPLE_EVENTS[] = {
 };
 static const int SAMPLE_EVENTS_COUNT = sizeof(SAMPLE_EVENTS) / sizeof(SAMPLE_EVENTS[0]);
 
-static moki_event_t g_events[MAX_EVENTS];
+static moki_event_t *g_events = nullptr;   // [MAX_EVENTS] PSRAM-heap
 static int g_events_count = 0;
 
 static void state_init_events(void) {
@@ -576,7 +583,7 @@ static const char MOKI_MANUAL_TEXT[] PROGMEM =
   "und einstellungen überleben einen reboot.\n\n"
 
   "viel freude.";
-static moki_note_t g_notes[MAX_NOTES];
+static moki_note_t *g_notes = nullptr;     // [MAX_NOTES] PSRAM-heap (~18KB)
 static int g_notes_count = 0;
 
 typedef struct { const char *id; const char *label; const char *body; } moki_note_template_t;
@@ -646,6 +653,10 @@ typedef enum { SCR_HOME = 0, SCR_DO, SCR_READ, SCR_CHAT, SCR_MAP,
                SCR_MOOD, SCR_PROFILE,
                SCR_NOTE_NEW, SCR_NOTE_EDIT,
                SCR_CHAT_DETAIL,
+               SCR_READER,
+               SCR_PIN_DETAIL,
+               SCR_PIN_RENAME,
+               SCR_PIN_NOTE,
                SCR_SETTINGS } screen_id_t;
 
 // LoRa preset IDs — mirrored in lora_apply_preset()
@@ -729,7 +740,7 @@ typedef struct {
   char     text[160]; // raw payload bytes (NOT NUL-terminated guaranteed)
 } moki_lora_msg_t;
 #define LORA_MSG_CAP 32
-static moki_lora_msg_t g_lora_msgs[LORA_MSG_CAP];
+static moki_lora_msg_t *g_lora_msgs = nullptr;   // [LORA_MSG_CAP] PSRAM-heap
 static int g_lora_msg_count = 0;          // total received (for ring index)
 static int g_lora_msg_head  = 0;          // ring buffer head
 
@@ -785,8 +796,11 @@ extern "C" {
   void moki_mesh_loop(void);
   bool moki_mesh_send(const char *sender_name, const char *text);
   bool moki_mesh_advert(const char *name);
+  bool moki_mesh_advert_with_loc(const char *name, double lat, double lon);
   int  moki_mesh_contact_count();
   bool moki_mesh_get_contact(int idx, char *out_name, int name_size, uint8_t out_pubkey4[4]);
+  bool moki_mesh_get_contact_loc(int idx, float *out_lat, float *out_lon,
+                                 uint32_t *out_last_advert_ts);
   bool moki_mesh_dm(int contact_idx, const char *text);
 }
 
@@ -847,6 +861,561 @@ static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
 static bool g_fs_ready = false;
 static bool g_sd_ready = false;
 
+// ── GPS state (M6 step 1) ────────────────────────────────────────────────
+// Serial2 @ GPS_BAUD_RATE (typ. 9600) auf PIN_GPS_RX/PIN_GPS_TX. NMEA aus
+// dem MIA-M10Q oder L76K Modul. Wir parsen $G[NP]GGA + $G[NP]RMC für
+// (lat, lon, fix, sats, hdop). Update-Rate ~1Hz vom Modul her.
+typedef struct {
+  bool     fix;             // hat Modul gerade einen 2D/3D-Fix?
+  float    lat_deg;         // dezimal, North positiv
+  float    lon_deg;         // dezimal, East positiv
+  uint8_t  sats_used;       // Sats im Fix (aus GGA)
+  uint8_t  sats_tracked;    // Sats mit SNR>0 (aus GSV) — "ich sehe was"
+  uint8_t  hdop_x10;        // HDOP × 10 (z.B. 27 = 2.7)
+  uint32_t fix_ts_ms;       // millis() beim letzten Fix
+  bool     antenna_ok;      // GPTXT,ANTENNA OK gesehen
+} moki_gps_t;
+static moki_gps_t g_gps = { false, 0.0f, 0.0f, 0, 0, 0, 0, false };
+// Per-constellation tracked-sats counters (rebuilt during a GSV burst).
+// Modul sendet GP/GL/GA Blöcke je in mehreren Zeilen. Wir summieren über
+// alle Talker (GP, GL, GA) während eines Sweeps und kopieren bei nächstem
+// GGA in g_gps.sats_tracked.
+static uint8_t g_gsv_running = 0;
+static HardwareSerial GPSSerial(2);
+static char  g_nmea_buf[96];
+static size_t g_nmea_len = 0;
+
+// Convert NMEA "ddmm.mmmm" + "N/S" or "dddmm.mmmm" + "E/W" → decimal degrees
+static float nmea_to_decimal(const char *raw, char hemi, bool is_lon) {
+  if (!raw || !*raw) return 0.0f;
+  float val = atof(raw);
+  int   deg = is_lon ? (int)(val / 100.0f) : (int)(val / 100.0f);
+  float min = val - (float)deg * 100.0f;
+  float dec = (float)deg + min / 60.0f;
+  if (hemi == 'S' || hemi == 'W') dec = -dec;
+  return dec;
+}
+
+// Split a comma-separated NMEA sentence into fields (in-place; mutates buf).
+// Returns count, fills `fields[i]` with pointer to start of i-th field.
+static int nmea_split(char *buf, char **fields, int max_fields) {
+  int n = 0;
+  fields[n++] = buf;
+  for (char *p = buf; *p && n < max_fields; p++) {
+    if (*p == ',') { *p = 0; fields[n++] = p + 1; }
+    else if (*p == '*') { *p = 0; break; }
+  }
+  return n;
+}
+
+// Parse one complete NMEA line (without trailing CR/LF). Updates g_gps.
+// Forward — defined later near map renderer
+static void self_pos_update_from_gps(void);
+
+static void nmea_parse_line(char *line, size_t len) {
+  if (len < 7 || line[0] != '$') return;
+  // Talker-ID + sentence: $GxGGA, $GxRMC etc. We accept any talker (GP, GN, GL).
+  const char *type = line + 3;
+  char *fields[20] = {0};
+  int   nf = nmea_split(line, fields, 20);
+
+  if (memcmp(type, "GGA", 3) == 0 && nf >= 9) {
+    // $..GGA,hhmmss.ss,lat,N,lon,E,fix_quality,sats,hdop,...
+    // GGA kommt einmal pro Sekunde — guter Moment, GSV-Snapshot zu übernehmen.
+    int fix_q = atoi(fields[6]);
+    g_gps.sats_used = (uint8_t)atoi(fields[7]);
+    g_gps.sats_tracked = g_gsv_running;
+    g_gsv_running = 0;
+    float hdop = atof(fields[8]);
+    g_gps.hdop_x10 = (uint8_t)(hdop * 10.0f);
+    if (fix_q > 0 && fields[2][0] && fields[4][0]) {
+      g_gps.lat_deg = nmea_to_decimal(fields[2], fields[3][0], false);
+      g_gps.lon_deg = nmea_to_decimal(fields[4], fields[5][0], true);
+      g_gps.fix     = true;
+      g_gps.fix_ts_ms = millis();
+      self_pos_update_from_gps();
+    }
+  } else if (memcmp(type, "RMC", 3) == 0 && nf >= 7) {
+    // $..RMC,hhmmss.ss,status,lat,N,lon,E,...
+    if (fields[2][0] == 'A' && fields[3][0] && fields[5][0]) {
+      g_gps.lat_deg = nmea_to_decimal(fields[3], fields[4][0], false);
+      g_gps.lon_deg = nmea_to_decimal(fields[5], fields[6][0], true);
+      g_gps.fix     = true;
+      g_gps.fix_ts_ms = millis();
+      self_pos_update_from_gps();
+    } else if (fields[2][0] == 'V') {
+      g_gps.fix = false;
+    }
+  } else if (memcmp(type, "GSV", 3) == 0 && nf >= 4) {
+    // $xxGSV,total_msgs,msg_num,sats_in_view,[prn,el,az,snr]*4,...
+    // Pro Block 4 Sats. SNR ist letztes Feld jedes Sat-Quadrupels. Wir zählen
+    // alle mit nicht-leerem SNR (also tatsächlich getrackt, nicht nur gesehen).
+    for (int i = 4; i + 3 < nf; i += 4) {
+      const char *snr = fields[i + 3];
+      if (snr && snr[0] && snr[0] != '*') g_gsv_running++;
+    }
+  } else if (memcmp(type, "TXT", 3) == 0 && nf >= 5) {
+    // $GPTXT,01,01,01,ANTENNA OK
+    if (strstr(fields[4], "ANTENNA OK")) g_gps.antenna_ok = true;
+  }
+}
+
+static void gps_init(void) {
+  GPSSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+  Serial.printf("[gps] Serial2 begin @ %d (RX=%d, TX=%d)\n",
+                GPS_BAUD_RATE, PIN_GPS_RX, PIN_GPS_TX);
+}
+
+static void gps_loop(void) {
+  while (GPSSerial.available()) {
+    int c = GPSSerial.read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      g_nmea_buf[g_nmea_len] = 0;
+      if (g_nmea_len > 6) nmea_parse_line(g_nmea_buf, g_nmea_len);
+      g_nmea_len = 0;
+      continue;
+    }
+    if (g_nmea_len < sizeof(g_nmea_buf) - 1) {
+      g_nmea_buf[g_nmea_len++] = (char)c;
+    } else {
+      // Overlong line (probably garbage) — reset
+      g_nmea_len = 0;
+    }
+  }
+  // Stale-fix decay: if no fresh data for 10s, mark unfixed
+  if (g_gps.fix && (millis() - g_gps.fix_ts_ms) > 10000) {
+    g_gps.fix = false;
+  }
+}
+
+#ifdef MOKI_WIFI
+// ── WiFi (M8.2) ──────────────────────────────────────────────────────────
+// STA-Mode für OTA-Updates. Credentials in NVS — gesetzt via Serial-Befehl
+// `wifi_set <ssid> <psk>`. Nicht-blockierend: Connect läuft im Hintergrund,
+// wir merken uns nur den State + IP für Status-Logs.
+typedef struct {
+  bool     enabled;
+  bool     connected;
+  char     ssid[33];
+  char     psk[65];
+  char     ip[16];      // dotted-quad als String
+  uint32_t last_connect_attempt_ms;
+} moki_wifi_t;
+static moki_wifi_t g_wifi = { false, false, "", "", "", 0 };
+
+static void wifi_load(void) {
+  g_prefs.begin("moki", true);
+  g_prefs.getString("wifi_ssid", g_wifi.ssid, sizeof(g_wifi.ssid));
+  g_prefs.getString("wifi_psk",  g_wifi.psk,  sizeof(g_wifi.psk));
+  g_wifi.enabled = (g_wifi.ssid[0] != 0);
+  g_prefs.end();
+  Serial.printf("[wifi] loaded creds: ssid='%s' enabled=%d\n",
+                g_wifi.ssid, g_wifi.enabled);
+}
+
+static void wifi_save(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putString("wifi_ssid", g_wifi.ssid);
+  g_prefs.putString("wifi_psk",  g_wifi.psk);
+  g_prefs.end();
+}
+
+static void wifi_event_cb(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
+      IPAddress ip = WiFi.localIP();
+      snprintf(g_wifi.ip, sizeof(g_wifi.ip), "%u.%u.%u.%u",
+               ip[0], ip[1], ip[2], ip[3]);
+      g_wifi.connected = true;
+      Serial.printf("[wifi] connected · ip=%s · rssi=%d\n",
+                    g_wifi.ip, WiFi.RSSI());
+      break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      if (g_wifi.connected) {
+        Serial.println(F("[wifi] disconnected"));
+      }
+      g_wifi.connected = false;
+      g_wifi.ip[0] = 0;
+      break;
+    default:
+      break;
+  }
+}
+
+static void wifi_init(void) {
+  if (!g_wifi.enabled) {
+    Serial.println(F("[wifi] no creds — STA off (set via 'wifi_set SSID PSK')"));
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.onEvent(wifi_event_cb);
+  Serial.printf("[wifi] connecting to '%s' ...\n", g_wifi.ssid);
+  WiFi.begin(g_wifi.ssid, g_wifi.psk);
+  g_wifi.last_connect_attempt_ms = millis();
+}
+
+static void wifi_loop(void) {
+  if (!g_wifi.enabled) return;
+  // Reconnect wenn disconnect älter als 30s
+  if (!g_wifi.connected &&
+      (millis() - g_wifi.last_connect_attempt_ms) > 30000) {
+    Serial.printf("[wifi] reconnect '%s' ...\n", g_wifi.ssid);
+    WiFi.disconnect();
+    WiFi.begin(g_wifi.ssid, g_wifi.psk);
+    g_wifi.last_connect_attempt_ms = millis();
+  }
+}
+
+static void wifi_set_creds(const char *ssid, const char *psk) {
+  strncpy(g_wifi.ssid, ssid, sizeof(g_wifi.ssid) - 1);
+  g_wifi.ssid[sizeof(g_wifi.ssid) - 1] = 0;
+  strncpy(g_wifi.psk, psk, sizeof(g_wifi.psk) - 1);
+  g_wifi.psk[sizeof(g_wifi.psk) - 1] = 0;
+  g_wifi.enabled = true;
+  wifi_save();
+  // Trigger fresh connect
+  WiFi.mode(WIFI_STA);
+  WiFi.onEvent(wifi_event_cb);
+  WiFi.disconnect();
+  WiFi.begin(g_wifi.ssid, g_wifi.psk);
+  g_wifi.last_connect_attempt_ms = millis();
+  Serial.printf("[wifi] creds set, connecting to '%s'\n", g_wifi.ssid);
+}
+
+static void wifi_clear_creds(void) {
+  g_wifi.ssid[0] = 0;
+  g_wifi.psk[0] = 0;
+  g_wifi.enabled = false;
+  g_wifi.connected = false;
+  wifi_save();
+  WiFi.disconnect();
+  WiFi.mode(WIFI_OFF);
+  Serial.println(F("[wifi] cleared, STA off"));
+}
+
+// ── OTA-URL Persistenz (M8.7) ───────────────────────────────────────────
+// User-konfigurierbare Default-URL für `ota_release`. Ideal: GitHub
+// Releases /latest/download/firmware.bin — bleibt stabil, Mac muss nicht
+// laufen. NVS-key: "ota_url".
+static char g_ota_url[160] = "";
+
+static void ota_url_load(void) {
+  g_prefs.begin("moki", true);
+  g_prefs.getString("ota_url", g_ota_url, sizeof(g_ota_url));
+  g_prefs.end();
+}
+static void ota_url_save(const char *url) {
+  strncpy(g_ota_url, url, sizeof(g_ota_url) - 1);
+  g_ota_url[sizeof(g_ota_url) - 1] = 0;
+  g_prefs.begin("moki", false);
+  g_prefs.putString("ota_url", g_ota_url);
+  g_prefs.end();
+  Serial.printf("[ota] url saved: %s\n", g_ota_url);
+}
+
+// ── OTA-Pull (M8.3, M8.7 mit HTTPS) ──────────────────────────────────────
+// Inline-OTA mit HTTPClient + Update.h. Akzeptiert http:// und https:// URLs.
+// Bei https nutzen wir WiFiClientSecure im insecure-Modus (kein Cert-Check) —
+// das spart Root-CA-Bundle und macht GitHub Releases / Cloudflare-Tunnel ohne
+// Konfig erreichbar. Sicherheitsabwägung: Firmware-Blobs werden vom Bootloader
+// per Hash validiert, Man-in-the-Middle könnte aber Update verhindern.
+static bool ota_pull(const char *url) {
+  if (!g_wifi.connected) {
+    Serial.println(F("[ota] no WiFi — abort"));
+    return false;
+  }
+  Serial.printf("[ota] pull %s\n", url);
+  Serial.printf("[ota] free heap=%u psram=%u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+
+  bool is_https = (strncmp(url, "https://", 8) == 0);
+  WiFiClientSecure secure;
+  WiFiClient plain;
+  if (is_https) {
+    secure.setInsecure();   // skip cert validation — simpler, no CA bundle
+  }
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GH-Releases redirect
+  bool began = is_https ? http.begin(secure, url) : http.begin(plain, url);
+  if (!began) {
+    Serial.println(F("[ota] http.begin failed"));
+    return false;
+  }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[ota] HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+  int total = http.getSize();
+  if (total <= 0) {
+    Serial.println(F("[ota] no Content-Length — abort"));
+    http.end();
+    return false;
+  }
+  Serial.printf("[ota] %d bytes, beginning Update.begin()\n", total);
+
+  if (!Update.begin((size_t)total)) {
+    Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  int written = 0;
+  int last_pct = -1;
+  while (http.connected() && written < total) {
+    int avail = stream->available();
+    if (avail <= 0) { delay(1); continue; }
+    int to_read = avail > (int)sizeof(buf) ? (int)sizeof(buf) : avail;
+    int got = stream->readBytes(buf, to_read);
+    if (got <= 0) break;
+    size_t w = Update.write(buf, got);
+    if (w != (size_t)got) {
+      Serial.printf("[ota] Update.write short: %u vs %d\n", (unsigned)w, got);
+      Update.abort();
+      http.end();
+      return false;
+    }
+    written += got;
+    int pct = (written * 100) / total;
+    if (pct != last_pct && pct % 10 == 0) {
+      Serial.printf("[ota] %d%% (%d/%d)\n", pct, written, total);
+      last_pct = pct;
+    }
+  }
+  http.end();
+
+  if (written != total) {
+    Serial.printf("[ota] short read: %d/%d\n", written, total);
+    Update.abort();
+    return false;
+  }
+  if (!Update.end(true)) {
+    Serial.printf("[ota] Update.end failed: %s\n", Update.errorString());
+    return false;
+  }
+  Serial.println(F("[ota] OK — rebooting in 1s"));
+  delay(1000);
+  ESP.restart();
+  return true;
+}
+
+#endif  // MOKI_WIFI
+
+// ── Map data (M6.3 binary blob → PSRAM, M6.4 renderer) ────────────────────
+// moki.map liegt auf LittleFS, wird beim Boot in PSRAM geladen. Format-
+// Header siehe tools/map-pipeline/README.md.
+//
+// Layout im Speicher: header + raw line/point payload nacheinander. Wir
+// behalten den ganzen Buffer und scannen ihn bei jedem Render. Bei 2.3MB
+// und 200K Features ist das auf ESP32-S3 + PSRAM kein Problem.
+typedef enum {
+  MAP_T_RIVER    = 1,
+  MAP_T_MOTORWAY = 2,
+  MAP_T_PRIMARY  = 3,
+  MAP_T_RAIL     = 4,
+  MAP_T_BORDER   = 5,
+} map_line_type_t;
+
+typedef enum {
+  MAP_P_CITY    = 1,
+  MAP_P_TOWN    = 2,
+  MAP_P_VILLAGE = 3,
+  MAP_P_POI     = 4,
+} map_point_type_t;
+
+typedef enum {
+  MAP_Z_COUNTRY = 0,
+  MAP_Z_REGION  = 1,
+  MAP_Z_CITY    = 2,
+} map_zoom_t;
+
+// Index pro Stadt (PSRAM), sortiert nach pop_log DESC. Erlaubt einen
+// Render-Pass in Prioritäts-Reihenfolge → wir können kleine Städte
+// drop'pen, wenn sie zu nah an einer schon gezeichneten Großstadt liegen.
+typedef struct {
+  uint32_t off;       // Byte-Offset in g_map.buf für diesen Stadteintrag
+  int8_t   pop_log;   // Sort-Schlüssel (negativ wegen DESC-Sort)
+} map_pt_idx_t;
+
+typedef struct {
+  uint8_t *buf;          // raw file bytes
+  size_t   buf_len;
+  bool     ready;
+  // Decoded header
+  float    lat_min, lat_max, lon_min, lon_max;
+  uint32_t n_lines;
+  uint32_t n_points;
+  // Offsets into buf (after header)
+  size_t   off_lines;
+  size_t   off_points;
+  // Sorted-by-pop city index (für Label-Collision)
+  map_pt_idx_t *pt_idx;
+  uint32_t      pt_idx_n;
+} moki_map_t;
+static moki_map_t g_map = { nullptr, 0, false, 0,0,0,0, 0,0, 0,0, nullptr, 0 };
+
+static bool map_load(void) {
+  if (!g_fs_ready) {
+    Serial.println(F("[map] LittleFS not ready — skipping"));
+    return false;
+  }
+  File f = LittleFS.open("/moki.map", "r");
+  if (!f) {
+    Serial.println(F("[map] /moki.map not found on LittleFS"));
+    return false;
+  }
+  size_t sz = f.size();
+  if (sz < 32) { f.close(); return false; }
+
+  g_map.buf = (uint8_t *)ps_malloc(sz);
+  if (!g_map.buf) {
+    Serial.printf("[map] ps_malloc(%u) failed\n", (unsigned)sz);
+    f.close();
+    return false;
+  }
+  size_t got = f.read(g_map.buf, sz);
+  f.close();
+  if (got != sz) {
+    Serial.printf("[map] read mismatch: got %u of %u\n",
+                  (unsigned)got, (unsigned)sz);
+    free(g_map.buf); g_map.buf = nullptr; return false;
+  }
+  g_map.buf_len = sz;
+
+  // Parse header
+  if (memcmp(g_map.buf, "MOKI", 4) != 0) {
+    Serial.println(F("[map] bad magic"));
+    free(g_map.buf); g_map.buf = nullptr; return false;
+  }
+  uint8_t version = g_map.buf[4];
+  if (version != 1) {
+    Serial.printf("[map] unsupported version %u\n", (unsigned)version);
+    free(g_map.buf); g_map.buf = nullptr; return false;
+  }
+  memcpy(&g_map.lat_min, g_map.buf + 5,  4);
+  memcpy(&g_map.lat_max, g_map.buf + 9,  4);
+  memcpy(&g_map.lon_min, g_map.buf + 13, 4);
+  memcpy(&g_map.lon_max, g_map.buf + 17, 4);
+  memcpy(&g_map.n_lines,  g_map.buf + 21, 4);
+  memcpy(&g_map.n_points, g_map.buf + 25, 4);
+  // 3B reserved
+  g_map.off_lines = 32;
+
+  // Walk lines to find off_points
+  size_t p = g_map.off_lines;
+  for (uint32_t i = 0; i < g_map.n_lines; i++) {
+    if (p + 4 > sz) {
+      Serial.println(F("[map] truncated lines"));
+      free(g_map.buf); g_map.buf = nullptr; return false;
+    }
+    uint16_t n_pts;
+    memcpy(&n_pts, g_map.buf + p + 2, 2);
+    p += 4 + (size_t)n_pts * 4;
+  }
+  g_map.off_points = p;
+
+  // Build sorted point index (pop_log DESC, also größere Städte zuerst).
+  // qsort verlangt int_compare; wir negieren pop_log um DESC zu kriegen.
+  if (g_map.n_points > 0) {
+    g_map.pt_idx = (map_pt_idx_t *)ps_malloc(sizeof(map_pt_idx_t) * g_map.n_points);
+    if (g_map.pt_idx) {
+      size_t poff = g_map.off_points;
+      uint32_t k = 0;
+      for (uint32_t i = 0; i < g_map.n_points && poff + 8 <= g_map.buf_len; i++) {
+        uint8_t  pop_log  = g_map.buf[poff + 6];
+        uint8_t  name_len = g_map.buf[poff + 7];
+        g_map.pt_idx[k].off     = (uint32_t)poff;
+        g_map.pt_idx[k].pop_log = (int8_t)pop_log;
+        k++;
+        poff += 8 + name_len;
+      }
+      g_map.pt_idx_n = k;
+      // Inline insertion-sort — n_points typ. < 1000, k*n bounded
+      for (uint32_t i = 1; i < g_map.pt_idx_n; i++) {
+        map_pt_idx_t cur = g_map.pt_idx[i];
+        int j = (int)i - 1;
+        while (j >= 0 && g_map.pt_idx[j].pop_log < cur.pop_log) {
+          g_map.pt_idx[j + 1] = g_map.pt_idx[j];
+          j--;
+        }
+        g_map.pt_idx[j + 1] = cur;
+      }
+    } else {
+      Serial.println(F("[map] pt_idx ps_malloc failed — labels will be unsorted"));
+    }
+  }
+
+  g_map.ready = true;
+  Serial.printf("[map] ready: %u lines, %u points (idx=%u), %.2f MB, bbox=[%.3f,%.3f,%.3f,%.3f]\n",
+                (unsigned)g_map.n_lines, (unsigned)g_map.n_points,
+                (unsigned)g_map.pt_idx_n,
+                sz / 1024.0f / 1024.0f,
+                g_map.lat_min, g_map.lat_max, g_map.lon_min, g_map.lon_max);
+  return true;
+}
+
+// Convert a quantized 16-bit lat/lon back to degrees
+static inline float map_q_to_lat(uint16_t q) {
+  return g_map.lat_min + (g_map.lat_max - g_map.lat_min) * q / 65535.0f;
+}
+static inline float map_q_to_lon(uint16_t q) {
+  return g_map.lon_min + (g_map.lon_max - g_map.lon_min) * q / 65535.0f;
+}
+
+// Viewport: was sehen wir gerade?
+typedef struct {
+  float lat_center;
+  float lon_center;
+  uint8_t zoom_idx;          // 0=country, 1=region, 2=city
+  // Computed jeweils beim Render-Aufruf:
+  float px_per_deg_lat;
+  float px_per_deg_lon;
+} moki_viewport_t;
+
+// Default: Heidelberg-Altstadt, city zoom (~11 km × 20 km Sicht — gut zum
+// Radfahren/Spazieren, halb Heidelberg + ein bisschen Umland)
+static moki_viewport_t g_viewport = {
+  /*lat_center*/ 49.4099f,
+  /*lon_center*/ 8.6943f,
+  /*zoom_idx*/   MAP_Z_CITY,
+  /*px_per_deg_*/ 0.0f, 0.0f
+};
+
+// Pixels per degree, je nach zoom_idx. Display ist 540×960 Hochformat.
+static void viewport_compute_scale(moki_viewport_t *v, int screen_w, int screen_h) {
+  // Anvisierte vertikale Sicht (Höhe in Grad) je Zoom-Stufe:
+  static const float view_h_deg[] = {
+    5.0f,      // country: ~550 km vertikal
+    1.0f,      // region:  ~110 km
+    0.10f      // city:    ~11 km
+  };
+  uint8_t z = v->zoom_idx > 2 ? 2 : v->zoom_idx;
+  float h_deg = view_h_deg[z];
+  v->px_per_deg_lat = (float)screen_h / h_deg;
+  // Längengrade werden mit cos(Breite) zusammengezogen → korrekt skaliert,
+  // sonst sieht alles in Norddeutschland gestaucht aus
+  float coslat = cosf(v->lat_center * (float)M_PI / 180.0f);
+  v->px_per_deg_lon = v->px_per_deg_lat * coslat;
+}
+
+// Project (lat, lon) → screen px relative to viewport center at (cx, cy)
+static inline void map_project(const moki_viewport_t *v,
+                                float lat, float lon,
+                                int cx, int cy,
+                                int *out_x, int *out_y) {
+  float dx = (lon - v->lon_center) * v->px_per_deg_lon;
+  float dy = -(lat - v->lat_center) * v->px_per_deg_lat;  // y inverts
+  *out_x = cx + (int)dx;
+  *out_y = cy + (int)dy;
+}
+
 // ── SD-Card book index (M5-Full step 1) ──────────────────────────────────
 // Plain .txt files on microSD, one per book. EPUB-zip parsing comes later.
 // Books live in /books/ at SD root. We index them lazily on tab-open.
@@ -855,7 +1424,7 @@ typedef struct {
   char path[40];   // "/books/walden.txt"
   char title[32];  // pretty filename ("walden")
 } moki_book_t;
-static moki_book_t g_books[MOKI_MAX_BOOKS];
+static moki_book_t *g_books = nullptr;     // [MOKI_MAX_BOOKS] PSRAM-heap
 static int g_book_count = 0;
 
 static void sd_mount(void) {
@@ -1144,23 +1713,101 @@ static size_t book_total_length(void) {
   return sz;
 }
 
+// Replace UTF-8 codepoints that aren't in our Fraunces/JetBrains font glyph
+// sets with ASCII fallbacks, in-place. The fonts cover:
+//   ASCII + ä/ö/ü/ß + Ä/Ö/Ü + middle-dot (·) + en-dash (–) + arrow (→ mono)
+// Everything else (smart quotes „ " ' ', em-dash —, ellipsis …, guillemets
+// « », NBSP) renders as a placeholder rectangle on the e-ink display. We
+// transliterate to plain ASCII so books read cleanly without regenerating
+// the fonts. Returns the new (possibly shorter) length.
+static size_t normalize_utf8_for_font(char *buf, size_t len) {
+  size_t r = 0, w = 0;
+  while (r < len) {
+    unsigned char c = (unsigned char)buf[r];
+    if (c < 0x80) { buf[w++] = buf[r++]; continue; }
+
+    if ((c & 0xE0) == 0xC0) {
+      if (r + 1 >= len) break;   // truncated — drop trailing
+      unsigned char c2 = (unsigned char)buf[r + 1];
+      // Keep all 0xC3 (ä/ö/ü/ß/Ä/Ö/Ü, etc.) and middle-dot.
+      if (c == 0xC3 || (c == 0xC2 && c2 == 0xB7)) {
+        buf[w++] = c; buf[w++] = c2; r += 2; continue;
+      }
+      if (c == 0xC2) {
+        if      (c2 == 0xAB || c2 == 0xBB) buf[w++] = '"';   // « »
+        else if (c2 == 0xA0)               buf[w++] = ' ';   // NBSP
+        // 0xAD soft-hyphen + others: drop
+        r += 2; continue;
+      }
+      r += 2; continue;
+    }
+
+    if ((c & 0xF0) == 0xE0) {
+      if (r + 2 >= len) break;   // truncated
+      unsigned char c2 = (unsigned char)buf[r + 1];
+      unsigned char c3 = (unsigned char)buf[r + 2];
+      // en-dash (–) and arrow (→) are in our fonts — keep
+      if (c == 0xE2 && c2 == 0x80 && c3 == 0x93) {
+        buf[w++] = c; buf[w++] = c2; buf[w++] = c3; r += 3; continue;
+      }
+      if (c == 0xE2 && c2 == 0x86 && c3 == 0x92) {
+        buf[w++] = c; buf[w++] = c2; buf[w++] = c3; r += 3; continue;
+      }
+      // General Punctuation block: 0xE2 0x80 ..
+      if (c == 0xE2 && c2 == 0x80) {
+        switch (c3) {
+          case 0x90: case 0x91: case 0x92:        // hyphen variants
+            buf[w++] = '-'; break;
+          case 0x94: case 0x95:                   // em-dash, horizontal bar → en-dash
+            buf[w++] = 0xE2; buf[w++] = 0x80; buf[w++] = 0x93; break;
+          case 0x98: case 0x99: case 0x9B: case 0x82:  // single quotes
+            buf[w++] = '\''; break;
+          case 0x9A:                              // ‚ → ,
+            buf[w++] = ','; break;
+          case 0x9C: case 0x9D: case 0x9E: case 0x9F:  // double quotes
+            buf[w++] = '"'; break;
+          case 0xA0: case 0xA1: case 0xA2: case 0xA3:  // various spaces
+            buf[w++] = ' '; break;
+          case 0xA6:                              // ellipsis …
+            buf[w++] = '.'; buf[w++] = '.'; buf[w++] = '.'; break;
+          default: break;                         // drop unknown
+        }
+        r += 3; continue;
+      }
+      r += 3; continue;
+    }
+
+    if ((c & 0xF8) == 0xF0) {
+      if (r + 3 >= len) break;
+      r += 4; continue;
+    }
+    r++;
+  }
+  buf[w] = 0;
+  return w;
+}
+
 static size_t book_read_chunk(size_t start, size_t want, char *out_buf, size_t buf_size) {
   if (want > buf_size - 1) want = buf_size - 1;
+  size_t got = 0;
   if (g_book_active_idx == -2 || g_book_active_idx == -1) {
     const char *src = (g_book_active_idx == -2) ? MOKI_MANUAL_TEXT : MOKI_BOOK_TEXT;
     size_t total = strlen_P(src);
     if (start + want > total) want = (start < total) ? total - start : 0;
     memcpy_P(out_buf, src + start, want);
     out_buf[want] = 0;
-    return want;
+    got = want;
+  } else {
+    File f = book_open_active();
+    if (!f) { out_buf[0] = 0; return 0; }
+    if (!f.seek(start)) { f.close(); out_buf[0] = 0; return 0; }
+    got = f.read((uint8_t *)out_buf, want);
+    out_buf[got] = 0;
+    f.close();
   }
-  File f = book_open_active();
-  if (!f) { out_buf[0] = 0; return 0; }
-  if (!f.seek(start)) { f.close(); out_buf[0] = 0; return 0; }
-  size_t got = f.read((uint8_t *)out_buf, want);
-  out_buf[got] = 0;
-  f.close();
-  return got;
+  // Replace smart quotes / ellipsis / em-dash etc. with ASCII fallbacks
+  // so they render properly with the bundled font glyphs.
+  return normalize_utf8_for_font(out_buf, got);
 }
 
 // Tap on a book in the list — switch active book + reset page + bookmark.
@@ -2063,17 +2710,22 @@ static lv_obj_t *build_status_bar(lv_obj_t *parent) {
   lv_obj_add_flag(sync, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(sync, on_element_tapped, LV_EVENT_CLICKED, (void *)"sync");
 
-  // Right cluster — battery placeholder + real time (or uptime fallback)
-  char rightbuf[32];
+  // Right cluster — battery placeholder + WiFi state + real time
+#ifdef MOKI_WIFI
+  const char *wifi_glyph = g_wifi.connected ? " W " : (g_wifi.enabled ? " w " : "   ");
+#else
+  const char *wifi_glyph = "   ";
+#endif
+  char rightbuf[40];
   if (g_rtc_ready) {
     RTC_DateTime now = g_rtc.getDateTime();
-    snprintf(rightbuf, sizeof(rightbuf), "78  %02u:%02u",
-             now.hour, now.minute);
+    snprintf(rightbuf, sizeof(rightbuf), "78%s%02u:%02u",
+             wifi_glyph, now.hour, now.minute);
   } else {
     uint32_t hh = uptime_min / 60;
     uint32_t mm = uptime_min % 60;
-    snprintf(rightbuf, sizeof(rightbuf), "78  %02lu:%02lu",
-             (unsigned long)(hh % 24), (unsigned long)mm);
+    snprintf(rightbuf, sizeof(rightbuf), "78%s%02lu:%02lu",
+             wifi_glyph, (unsigned long)(hh % 24), (unsigned long)mm);
   }
   lv_obj_t *right = lv_label_create(bar);
   lv_label_set_text(right, rightbuf);
@@ -2389,6 +3041,10 @@ static void switch_screen(screen_id_t to) {
     case SCR_NOTE_NEW: build_note_new(); break;
     case SCR_NOTE_EDIT:build_note_edit();break;
     case SCR_CHAT_DETAIL: { extern void build_chat_detail(void); build_chat_detail(); break; }
+    case SCR_READER:      { extern void build_reader(void);      build_reader();      break; }
+    case SCR_PIN_DETAIL:  { extern void build_pin_detail(void);  build_pin_detail();  break; }
+    case SCR_PIN_RENAME:  { extern void build_pin_rename(void);  build_pin_rename();  break; }
+    case SCR_PIN_NOTE:    { extern void build_pin_note(void);    build_pin_note();    break; }
     case SCR_SETTINGS:    { extern void build_settings(void);    build_settings();    break; }
   }
   // After building, disable elastic + momentum scroll on the whole tree.
@@ -2931,174 +3587,102 @@ static void build_read_content(lv_obj_t *parent) {
   make_tab_button(bar, "notizen", current_read_tab == READ_NOTES, on_read_tab_clicked, READ_NOTES);
 
   if (current_read_tab == READ_BOOK) {
-    // Book selector — always render so embedded books (manual + walden) are
-    // accessible even without SD card.
-    {
-      lv_obj_t *picker = lv_obj_create(col);
-      lv_obj_remove_style_all(picker);
-      lv_obj_set_size(picker, LV_PCT(100), LV_SIZE_CONTENT);
-      lv_obj_set_flex_flow(picker, LV_FLEX_FLOW_ROW_WRAP);
-      lv_obj_set_style_pad_column(picker, 6, LV_PART_MAIN);
-      lv_obj_set_style_pad_row(picker, 6, LV_PART_MAIN);
-      lv_obj_set_style_pad_bottom(picker, 8, LV_PART_MAIN);
-
-      static auto on_book_picked_cb = [](lv_event_t *e) {
-        int new_idx = (int)(intptr_t)lv_event_get_user_data(e);
-        book_select(new_idx);
-        switch_screen(SCR_READ);
-      };
-
-      // Helper to add a chip — defined inline to avoid name pollution
-      auto add_chip = [&](int idx, const char *label) {
-        bool active = (g_book_active_idx == idx);
-        lv_obj_t *c = lv_obj_create(picker);
-        lv_obj_remove_style_all(c);
-        lv_obj_set_size(c, LV_SIZE_CONTENT, 40);
-        lv_obj_set_style_bg_color(c,
-            lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_border_color(c, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-        lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
-        lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
-        lv_obj_set_style_pad_left(c, 12, LV_PART_MAIN);
-        lv_obj_set_style_pad_right(c, 12, LV_PART_MAIN);
-        lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(c, on_book_picked_cb, LV_EVENT_CLICKED,
-                            (void *)(intptr_t)idx);
-        lv_obj_t *l = lv_label_create(c);
-        lv_label_set_text(l, label);
-        lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
-        lv_obj_set_style_text_color(l,
-            lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
-        lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
-      };
-
-      add_chip(-2, "anleitung");
-      add_chip(-1, "walden");
-
-      for (int bi = 0; bi < g_book_count; bi++) {
-        add_chip(bi, g_books[bi].title);
-      }
-    }
-
-    // Total pages
-    size_t total = book_total_length();
-    int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
-    if (total_pages < 1) total_pages = 1;
-    if (g_book_page >= total_pages) g_book_page = total_pages - 1;
-    if (g_book_page < 0) g_book_page = 0;
-
-    // Title
-    const char *book_title;
-    if (g_book_active_idx == -2)      book_title = "Anleitung";
-    else if (g_book_active_idx == -1) book_title = "Walden";
-    else                              book_title = g_books[g_book_active_idx].title;
-    lv_obj_t *book = lv_label_create(col);
-    lv_label_set_text(book, book_title);
-    lv_obj_set_style_text_font(book, &moki_fraunces_italic_36, LV_PART_MAIN);
-    lv_obj_set_style_text_color(book, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_style_text_align(book, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_width(book, LV_PCT(100));
-
-    // Read current page
-    static char page_buf[BOOK_CHARS_PER_PAGE + 8];
-    size_t start = g_book_page * BOOK_CHARS_PER_PAGE;
-    size_t want  = BOOK_CHARS_PER_PAGE;
-    if (start + want > total) want = total - start;
-    size_t got = book_read_chunk(start, want, page_buf, sizeof(page_buf));
-    if (got == 0) {
-      strncpy(page_buf, "(leer)", sizeof(page_buf));
-    }
-    // Trim back to last whitespace
-    if (g_book_page < total_pages - 1) {
-      for (int i = (int)got - 1; i > (int)got - 80 && i > 0; i--) {
-        if (page_buf[i] == ' ' || page_buf[i] == '\n') {
-          page_buf[i] = 0;
-          break;
-        }
-      }
-    }
-
-    lv_obj_t *excerpt = lv_label_create(col);
-    lv_label_set_text(excerpt, page_buf);
-    lv_obj_set_style_text_font(excerpt, &moki_fraunces_italic_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(excerpt, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_label_set_long_mode(excerpt, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(excerpt, LV_PCT(100));
-    lv_obj_set_flex_grow(excerpt, 1);
-    lv_obj_set_style_text_line_space(excerpt, 6, LV_PART_MAIN);
-
-    // Page nav with click handlers.
-    lv_obj_t *nav = lv_obj_create(col);
-    lv_obj_remove_style_all(nav);
-    lv_obj_set_size(nav, LV_PCT(100), 50);
-    lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(nav, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
-    lv_obj_set_style_border_color(nav, lv_color_hex(MOKI_MID), LV_PART_MAIN);
-    lv_obj_set_style_border_width(nav, 1, LV_PART_MAIN);
-    lv_obj_set_style_pad_top(nav, 8, LV_PART_MAIN);
-
-    static auto on_book_prev = [](lv_event_t *e) {
-      if (g_book_page > 0) {
-        g_book_page--;
-        if (g_book_active_idx < 0) state_save_book_page();
-        else {
-          char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
-          g_prefs.begin("moki", false);
-          g_prefs.putUInt(k, (uint32_t)g_book_page);
-          g_prefs.end();
-        }
-        switch_screen(SCR_READ);
-      }
-    };
-    static auto on_book_next = [](lv_event_t *e) {
-      size_t total = book_total_length();
-      int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
-      if (g_book_page < total_pages - 1) {
-        g_book_page++;
-        if (g_book_active_idx < 0) state_save_book_page();
-        else {
-          char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
-          g_prefs.begin("moki", false);
-          g_prefs.putUInt(k, (uint32_t)g_book_page);
-          g_prefs.end();
-        }
-        switch_screen(SCR_READ);
-      }
+    // Book list — every book gets its own row (title + source + progress %).
+    // Tap on a row opens SCR_READER for fullscreen reading.
+    static auto on_book_row_cb = [](lv_event_t *e) {
+      int new_idx = (int)(intptr_t)lv_event_get_user_data(e);
+      book_select(new_idx);
+      switch_screen(SCR_READER);
     };
 
-    lv_obj_t *prev = lv_label_create(nav);
-    lv_label_set_text(prev, "← ZURÜCK");
-    lv_obj_set_style_text_font(prev, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(prev,
-        lv_color_hex(g_book_page > 0 ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(prev, 2, LV_PART_MAIN);
-    if (g_book_page > 0) {
-      lv_obj_add_flag(prev, LV_OBJ_FLAG_CLICKABLE);
-      lv_obj_add_event_cb(prev, on_book_prev, LV_EVENT_CLICKED, NULL);
+    auto add_book_row = [&](int idx, const char *title, const char *source_lbl) {
+      // Compute progress for this specific book without disturbing g_book_page.
+      // book_total_length uses g_book_active_idx so we read the page from prefs.
+      int saved_page = 0;
+      if (idx == -2) {
+        g_prefs.begin("moki", true);
+        saved_page = (int)g_prefs.getUInt("book_p_m", 0);
+        g_prefs.end();
+      } else if (idx == -1) {
+        g_prefs.begin("moki", true);
+        saved_page = (int)g_prefs.getUInt(BOOK_PAGE_KEY, 0);
+        g_prefs.end();
+      } else {
+        char k[16]; snprintf(k, sizeof(k), "book_p_%d", idx);
+        g_prefs.begin("moki", true);
+        saved_page = (int)g_prefs.getUInt(k, 0);
+        g_prefs.end();
+      }
+
+      lv_obj_t *row = lv_obj_create(col);
+      lv_obj_remove_style_all(row);
+      lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+      lv_obj_set_style_pad_top(row, 14, LV_PART_MAIN);
+      lv_obj_set_style_pad_bottom(row, 14, LV_PART_MAIN);
+      lv_obj_set_style_pad_row(row, 4, LV_PART_MAIN);
+      lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+      lv_obj_set_style_border_color(row, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+      lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, on_book_row_cb, LV_EVENT_CLICKED,
+                          (void *)(intptr_t)idx);
+
+      lv_obj_t *t = lv_label_create(row);
+      lv_label_set_text(t, title);
+      lv_obj_set_style_text_font(t, &moki_fraunces_italic_28, LV_PART_MAIN);
+      lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+      lv_obj_set_width(t, LV_PCT(100));
+      lv_obj_add_flag(t, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+      // Meta line: source · progress
+      lv_obj_t *meta = lv_label_create(row);
+      lv_obj_set_style_text_font(meta, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(meta, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_obj_set_style_text_letter_space(meta, 1, LV_PART_MAIN);
+      lv_obj_add_flag(meta, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+      // Compute total without switching active book: peek into the right source
+      size_t total_len = 0;
+      if (idx == -2) total_len = strlen_P(MOKI_MANUAL_TEXT);
+      else if (idx == -1) total_len = strlen_P(MOKI_BOOK_TEXT);
+      else if (idx >= 0 && idx < g_book_count) {
+        const char *p = g_books[idx].path;
+        File f;
+        if (strncmp(p, "lfs:", 4) == 0) f = LittleFS.open(p + 4, "r");
+        else if (g_sd_ready)            f = SD.open(p, "r");
+        if (f) { total_len = f.size(); f.close(); }
+      }
+      int total_pages = (int)((total_len + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
+      if (total_pages < 1) total_pages = 1;
+      if (saved_page >= total_pages) saved_page = total_pages - 1;
+      int pct = total_pages > 1 ? (saved_page * 100) / (total_pages - 1) : 0;
+      if (pct > 100) pct = 100;
+      char metabuf[64];
+      snprintf(metabuf, sizeof(metabuf), "%s · S. %d/%d · %d%%",
+               source_lbl, saved_page + 1, total_pages, pct);
+      lv_label_set_text(meta, metabuf);
+    };
+
+    add_book_row(-2, "anleitung", "moki");
+    add_book_row(-1, "walden", "thoreau");
+    for (int bi = 0; bi < g_book_count; bi++) {
+      const char *src = "lfs";
+      if (strncmp(g_books[bi].path, "lfs:", 4) != 0) src = "sd";
+      add_book_row(bi, g_books[bi].title, src);
     }
 
-    char pagebuf[20];
-    snprintf(pagebuf, sizeof(pagebuf), "%d / %d", g_book_page + 1, total_pages);
-    lv_obj_t *page = lv_label_create(nav);
-    lv_label_set_text(page, pagebuf);
-    lv_obj_set_style_text_font(page, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(page, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-
-    lv_obj_t *next = lv_label_create(nav);
-    lv_label_set_text(next, "WEITER →");
-    lv_obj_set_style_text_font(next, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(next,
-        lv_color_hex(g_book_page < total_pages - 1 ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(next, 2, LV_PART_MAIN);
-    if (g_book_page < total_pages - 1) {
-      lv_obj_add_flag(next, LV_OBJ_FLAG_CLICKABLE);
-      lv_obj_add_event_cb(next, on_book_next, LV_EVENT_CLICKED, NULL);
+    if (g_book_count == 0) {
+      lv_obj_t *hint = lv_label_create(col);
+      lv_label_set_text(hint,
+        "Lege .txt-Dateien in /books/ auf eine SD-Karte\n"
+        "oder flashe sie via `pio run -t uploadfs` in den\n"
+        "internen Speicher.");
+      lv_obj_set_style_text_font(hint, &moki_jetbrains_mono_18, LV_PART_MAIN);
+      lv_obj_set_style_text_color(hint, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+      lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+      lv_obj_set_width(hint, LV_PCT(100));
+      lv_obj_set_style_pad_top(hint, 16, LV_PART_MAIN);
     }
   } else if (current_read_tab == READ_FEED) {
     lv_obj_t *stub = lv_label_create(col);
@@ -4061,9 +4645,770 @@ static void build_chats(void) {
 // ----------------------------------------------------------------------------
 // MAP — stylized cartography + "in der nähe" peer list
 // ----------------------------------------------------------------------------
+// Map-Rendering: KEIN lv_canvas. Stattdessen ein leeres lv_obj mit Custom
+// LV_EVENT_DRAW_MAIN Handler — wir zeichnen direkt mit lv_draw_line in den
+// LVGL-Display-Buffer. Spart PSRAM (kein Canvas-Buffer), funktioniert robust
+// auf E-Ink. INDEXED_2BIT-Canvas hatte zwar die Pixel im Speicher, aber die
+// LVGL-Display-Conversion zu unserem 32-bit Buffer wirft das stumm weg.
+static lv_point_t  *g_map_proj_pts = nullptr;   // [2048] PSRAM-heap (8KB)
+static lv_obj_t   *g_map_obj = nullptr;     // map container, for redraw hooks
+// Pan-Drag-Tracking
+static int  g_drag_start_x = 0, g_drag_start_y = 0;
+static float g_drag_start_lat = 0.0f, g_drag_start_lon = 0.0f;
+static bool  g_drag_active = false;
+static uint32_t g_press_start_ms = 0;       // für Long-Press-Erkennung
+
+// ── Self-Position (M6.13) ───────────────────────────────────────────────
+// Ich-Marker auf Karte — auch ohne aktiven GPS-Fix. Wir merken uns:
+//   - source=0: keine Position bekannt → kein Marker
+//   - source=1: aktueller GPS-Fix (frisch)
+//   - source=2: letzter Fix (älter) — wird aus NVS geladen
+//   - source=3: manuell gesetzt via "ich bin hier"-Button
+typedef struct {
+  float    lat;
+  float    lon;
+  uint8_t  source;        // 0/1/2/3
+  uint32_t set_ts_ms;     // millis() beim Setzen
+} moki_self_pos_t;
+static moki_self_pos_t g_self_pos = { 0.0f, 0.0f, 0, 0 };
+
+static void self_pos_save(void) {
+  g_prefs.begin("moki", false);
+  g_prefs.putFloat("self_lat", g_self_pos.lat);
+  g_prefs.putFloat("self_lon", g_self_pos.lon);
+  g_prefs.putUChar("self_src", g_self_pos.source);
+  g_prefs.end();
+}
+
+static void self_pos_load(void) {
+  g_prefs.begin("moki", true);
+  g_self_pos.lat    = g_prefs.getFloat("self_lat", 0.0f);
+  g_self_pos.lon    = g_prefs.getFloat("self_lon", 0.0f);
+  uint8_t src       = g_prefs.getUChar("self_src", 0);
+  g_prefs.end();
+  // Persistierte Source ist immer "stale" beim Boot → degrade fresh→last
+  if (src == 1) src = 2;
+  g_self_pos.source = src;
+  g_self_pos.set_ts_ms = millis();
+  Serial.printf("[self] loaded source=%u lat=%.4f lon=%.4f\n",
+                (unsigned)g_self_pos.source, g_self_pos.lat, g_self_pos.lon);
+}
+
+static void self_pos_update_from_gps(void) {
+  // Wird bei jedem frischen GPS-Fix (1Hz) aufgerufen.
+  static uint32_t last_persist = 0;
+  static uint32_t last_redraw_ms = 0;
+  static float    last_redraw_lat = 0.0f;
+  static float    last_redraw_lon = 0.0f;
+
+  uint8_t prev_source = g_self_pos.source;
+  float   prev_lat    = g_self_pos.lat;
+  float   prev_lon    = g_self_pos.lon;
+
+  g_self_pos.lat       = g_gps.lat_deg;
+  g_self_pos.lon       = g_gps.lon_deg;
+  g_self_pos.source    = 1;   // fresh GPS
+  g_self_pos.set_ts_ms = millis();
+
+  // Persist max alle 60s — schont Flash-Wear
+  if (millis() - last_persist > 60000) {
+    self_pos_save();
+    last_persist = millis();
+  }
+
+  // Map-Invalidate wenn:
+  //   - first-fix (prev_source != 1, also Übergang von 0/2/3 → 1) oder
+  //   - Position um mehr als ~50m bewegt (0.0005°) oder
+  //   - >30s seit letztem Redraw
+  // Bei E-Ink keinesfalls bei jedem 1Hz-Fix neuzeichnen — flackert sonst.
+  bool first_fix    = (prev_source != 1);
+  float dlat        = fabsf(g_self_pos.lat - last_redraw_lat);
+  float dlon        = fabsf(g_self_pos.lon - last_redraw_lon);
+  bool moved        = (dlat > 0.0005f || dlon > 0.0005f);
+  bool stale_redraw = (millis() - last_redraw_ms) > 30000;
+
+  if ((first_fix || moved || stale_redraw) &&
+      g_map_obj && current_screen == SCR_MAP) {
+    lv_obj_invalidate(g_map_obj);
+    last_redraw_ms  = millis();
+    last_redraw_lat = g_self_pos.lat;
+    last_redraw_lon = g_self_pos.lon;
+    if (first_fix) {
+      Serial.printf("[self] FIRST FIX → redraw map · lat=%.4f lon=%.4f\n",
+                    g_self_pos.lat, g_self_pos.lon);
+    }
+  }
+  (void)prev_lat; (void)prev_lon;
+}
+
+static void self_pos_set_manual(float lat, float lon) {
+  g_self_pos.lat       = lat;
+  g_self_pos.lon       = lon;
+  g_self_pos.source    = 3;   // manual
+  g_self_pos.set_ts_ms = millis();
+  self_pos_save();
+}
+
+// ── Pins (M6.8) ─────────────────────────────────────────────────────────
+// Eigene Markierungen auf der Karte. Persistiert auf LittleFS /pins.bin.
+// Format: header (magic "PIN2" + count) + N × pin record.
+#define MOKI_MAX_PINS 32
+typedef struct {
+  float    lat;
+  float    lon;
+  char     name[40];
+  char     note[120];      // Notiz/Beschreibung (optional)
+  uint32_t created_ts;
+} moki_pin_t;
+static moki_pin_t *g_pins = nullptr;       // [MOKI_MAX_PINS] PSRAM-heap (5.5KB)
+static uint8_t    g_pins_n = 0;
+static int        g_active_pin = -1;   // Index des in PIN_DETAIL geöffneten Pins
+
+static void pins_save(void) {
+  if (!g_fs_ready) return;
+  File f = LittleFS.open("/pins.bin", "w");
+  if (!f) return;
+  f.write((const uint8_t *)"PIN2", 4);
+  f.write(&g_pins_n, 1);
+  for (uint8_t i = 0; i < g_pins_n; i++) {
+    f.write((const uint8_t *)&g_pins[i], sizeof(moki_pin_t));
+  }
+  f.close();
+  Serial.printf("[pins] saved %u\n", (unsigned)g_pins_n);
+}
+
+static void pins_load(void) {
+  g_pins_n = 0;
+  if (!g_fs_ready) return;
+  File f = LittleFS.open("/pins.bin", "r");
+  if (!f) return;
+  char magic[4];
+  if (f.read((uint8_t *)magic, 4) != 4) { f.close(); return; }
+  if (memcmp(magic, "PIN2", 4) != 0) {
+    // Alte v1-Datei oder unbekannt → ignorieren (frische Liste)
+    Serial.printf("[pins] schema mismatch, starting fresh\n");
+    f.close(); return;
+  }
+  uint8_t n;
+  if (f.read(&n, 1) != 1 || n > MOKI_MAX_PINS) { f.close(); return; }
+  for (uint8_t i = 0; i < n; i++) {
+    if (f.read((uint8_t *)&g_pins[i], sizeof(moki_pin_t)) != sizeof(moki_pin_t)) {
+      f.close(); return;
+    }
+  }
+  g_pins_n = n;
+  f.close();
+  Serial.printf("[pins] loaded %u\n", (unsigned)g_pins_n);
+}
+
+static bool pins_add(float lat, float lon, const char *name) {
+  if (g_pins_n >= MOKI_MAX_PINS) return false;
+  g_pins[g_pins_n].lat = lat;
+  g_pins[g_pins_n].lon = lon;
+  strncpy(g_pins[g_pins_n].name, name ? name : "ort",
+          sizeof(g_pins[g_pins_n].name) - 1);
+  g_pins[g_pins_n].name[sizeof(g_pins[g_pins_n].name) - 1] = 0;
+  g_pins[g_pins_n].note[0] = 0;
+  g_pins[g_pins_n].created_ts = millis();
+  g_pins_n++;
+  pins_save();
+  return true;
+}
+
+static bool pins_delete(int idx) {
+  if (idx < 0 || idx >= (int)g_pins_n) return false;
+  for (int i = idx; i < (int)g_pins_n - 1; i++) g_pins[i] = g_pins[i + 1];
+  g_pins_n--;
+  pins_save();
+  return true;
+}
+
+static bool pins_rename(int idx, const char *new_name) {
+  if (idx < 0 || idx >= (int)g_pins_n || !new_name) return false;
+  strncpy(g_pins[idx].name, new_name, sizeof(g_pins[idx].name) - 1);
+  g_pins[idx].name[sizeof(g_pins[idx].name) - 1] = 0;
+  pins_save();
+  return true;
+}
+
+static bool pins_set_note(int idx, const char *note) {
+  if (idx < 0 || idx >= (int)g_pins_n) return false;
+  if (!note) note = "";
+  strncpy(g_pins[idx].note, note, sizeof(g_pins[idx].note) - 1);
+  g_pins[idx].note[sizeof(g_pins[idx].note) - 1] = 0;
+  pins_save();
+  return true;
+}
+
+// M6.10 — Pin-Sharing via Mesh
+// Format der DM-Payload: MOKI_PLACE:<lat>:<lon>:<name>|<note>
+// (note optional, alles nach erstem '|' wenn vorhanden)
+static String pin_share_format(const moki_pin_t *p) {
+  String out = "MOKI_PLACE:";
+  out += String(p->lat, 6); out += ":";
+  out += String(p->lon, 6); out += ":";
+  out += p->name;
+  if (p->note[0]) { out += "|"; out += p->note; }
+  return out;
+}
+
+// Wird von moki_mesh.cpp aufgerufen, wenn ein DM mit MOKI_PLACE-Prefix
+// reinkommt. Parsen und automatisch in g_pins[] anhängen.
+extern "C" void moki_pin_share_received(const char *from, const char *payload);
+extern "C" void moki_pin_share_received(const char *from, const char *payload) {
+  if (!payload || !*payload) return;
+  // payload = "<lat>:<lon>:<name>|<note>"
+  String p = payload;
+  int c1 = p.indexOf(':');
+  int c2 = p.indexOf(':', c1 + 1);
+  if (c1 < 0 || c2 < 0) return;
+  float lat = p.substring(0, c1).toFloat();
+  float lon = p.substring(c1 + 1, c2).toFloat();
+  String rest = p.substring(c2 + 1);
+  int pipe = rest.indexOf('|');
+  String name, note;
+  if (pipe >= 0) { name = rest.substring(0, pipe); note = rest.substring(pipe + 1); }
+  else            name = rest;
+
+  // Anhängen mit Quelle im Namen — leichter Anti-Verwechselungs-Hint
+  char display_name[40];
+  snprintf(display_name, sizeof(display_name), "%s · %s",
+           name.c_str(), from ? from : "?");
+
+  if (g_pins_n >= MOKI_MAX_PINS) {
+    Serial.printf("[pin] inbox full — discard from %s '%s'\n", from, name.c_str());
+    return;
+  }
+  if (pins_add(lat, lon, display_name)) {
+    pins_set_note(g_pins_n - 1, note.c_str());
+    Serial.printf("[pin] received from %s: '%s' @ %.4f,%.4f\n",
+                  from, name.c_str(), lat, lon);
+    if (g_map_obj && current_screen == SCR_MAP) lv_obj_invalidate(g_map_obj);
+  }
+}
+
+// Custom-Draw-Handler: zeichnet die Karte direkt in den LVGL-Display-Buffer,
+// wenn der Map-Container neu gerendert werden muss.
+static void map_draw_event_cb(lv_event_t *e) {
+  lv_obj_t *obj = lv_event_get_target(e);
+  lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
+  lv_area_t coords;
+  lv_obj_get_coords(obj, &coords);
+
+  int box_x = coords.x1;
+  int box_y = coords.y1;
+  int box_w = coords.x2 - coords.x1 + 1;
+  int box_h = coords.y2 - coords.y1 + 1;
+  int cx_screen = box_x + box_w / 2;
+  int cy_screen = box_y + box_h / 2;
+
+  // Hintergrund (Papier) füllen
+  lv_draw_rect_dsc_t bg;
+  lv_draw_rect_dsc_init(&bg);
+  bg.bg_color = lv_color_hex(MOKI_PAPER);
+  bg.bg_opa = LV_OPA_COVER;
+  lv_draw_rect(draw_ctx, &bg, &coords);
+
+  if (!g_map.ready) return;
+
+  viewport_compute_scale(&g_viewport, box_w, box_h);
+
+  uint32_t t_start = millis();
+  uint32_t lines_drawn = 0, lines_skipped = 0;
+
+  // ── LINES ───────────────────────────────────────────────────────────────
+  size_t off = g_map.off_lines;
+  for (uint32_t i = 0; i < g_map.n_lines; i++) {
+    if (off + 4 > g_map.buf_len) break;
+    uint8_t  type_id = g_map.buf[off];
+    uint8_t  zoom_min = g_map.buf[off + 1];
+    uint16_t n_pts;
+    memcpy(&n_pts, g_map.buf + off + 2, 2);
+    size_t   data_off = off + 4;
+    size_t   line_size = 4 + (size_t)n_pts * 4;
+
+    if (zoom_min > g_viewport.zoom_idx) { off += line_size; continue; }
+
+    // Line-Type-Filter pro Zoom: bei niedrigerem Zoom weniger Strichgewirr,
+    // Stadt-Detail erst bei CITY-Zoom.
+    //   COUNTRY: nur MOTORWAY + RIVER → Übersicht über Süddeutschland
+    //   REGION:  + PRIMARY → Stadt-Stadt-Verbindungen sichtbar
+    //   CITY:    alles inkl. RAIL
+    if (g_viewport.zoom_idx == MAP_Z_COUNTRY) {
+      if (type_id != MAP_T_MOTORWAY && type_id != MAP_T_RIVER) {
+        off += line_size; continue;
+      }
+    } else if (g_viewport.zoom_idx == MAP_Z_REGION) {
+      // Schiene weg — verdoppelt sonst die Strich-Dichte
+      if (type_id == MAP_T_RAIL) {
+        off += line_size; continue;
+      }
+    }
+
+    // Project + bbox cull (in screen-koordinaten, also bezogen auf cx/cy_screen)
+    int min_sx = INT_MAX, max_sx = INT_MIN;
+    int min_sy = INT_MAX, max_sy = INT_MIN;
+    int n_proj = 0;
+    uint16_t step = 1;
+    if (n_pts > 2048) step = (uint16_t)((n_pts + 2047) / 2048);
+    for (uint16_t j = 0; j < n_pts && n_proj < 2048; j += step) {
+      uint16_t lat_q, lon_q;
+      memcpy(&lat_q, g_map.buf + data_off + (size_t)j * 4 + 0, 2);
+      memcpy(&lon_q, g_map.buf + data_off + (size_t)j * 4 + 2, 2);
+      float lat = map_q_to_lat(lat_q);
+      float lon = map_q_to_lon(lon_q);
+      int sx, sy;
+      map_project(&g_viewport, lat, lon, cx_screen, cy_screen, &sx, &sy);
+      g_map_proj_pts[n_proj].x = (lv_coord_t)sx;
+      g_map_proj_pts[n_proj].y = (lv_coord_t)sy;
+      if (sx < min_sx) min_sx = sx;
+      if (sx > max_sx) max_sx = sx;
+      if (sy < min_sy) min_sy = sy;
+      if (sy > max_sy) max_sy = sy;
+      n_proj++;
+    }
+
+    if (max_sx < box_x || min_sx >= box_x + box_w ||
+        max_sy < box_y || min_sy >= box_y + box_h ||
+        n_proj < 2) {
+      lines_skipped++;
+      off += line_size;
+      continue;
+    }
+
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    dsc.opa = LV_OPA_COVER;
+    dsc.color = lv_color_hex(MOKI_INK);
+    switch (type_id) {
+      case MAP_T_RIVER:
+        dsc.color = lv_color_hex(MOKI_DARK);
+        dsc.width = (g_viewport.zoom_idx == MAP_Z_CITY) ? 4 : 3;
+        break;
+      case MAP_T_MOTORWAY: dsc.width = 2; break;
+      case MAP_T_PRIMARY:  dsc.color = lv_color_hex(MOKI_DARK); dsc.width = 1; break;
+      case MAP_T_RAIL:     dsc.color = lv_color_hex(MOKI_DARK); dsc.width = 1; break;
+      default:             dsc.width = 1; break;
+    }
+
+    // Als Polylinie: pro Segment ein lv_draw_line-Aufruf (LVGL 8.3 hat keinen
+    // direkten polyline draw_ctx-Call ohne canvas).
+    for (int j = 0; j + 1 < n_proj; j++) {
+      lv_draw_line(draw_ctx, &dsc, &g_map_proj_pts[j], &g_map_proj_pts[j + 1]);
+    }
+    lines_drawn++;
+    off += line_size;
+  }
+
+  // ── CITIES (priority-sorted, collision-avoiding) ───────────────────────
+  // Iteriere Städte sortiert nach Bevölkerung (pt_idx). Track gezeichneter
+  // (sx, sy) — wenn neue Stadt zu nah an einer schon gezeichneten ist,
+  // skippen wir komplett. Größere gewinnt.
+  static lv_point_t drawn_cities[64];   // bis zu 64 sichtbare Cities
+  int n_drawn = 0;
+
+  // Mindest-Pixel-Abstand pro Zoom: nicht zu eng, aber bei REGION jetzt
+  // großzügiger weil weniger Striche → Karte verträgt mehr Städte.
+  int min_dist_px = 60;
+  if (g_viewport.zoom_idx == MAP_Z_COUNTRY) min_dist_px = 130;
+  else if (g_viewport.zoom_idx == MAP_Z_REGION) min_dist_px = 95;
+
+  uint8_t min_pop = 0;
+  if (g_viewport.zoom_idx == MAP_Z_COUNTRY)      min_pop = 5;
+  else if (g_viewport.zoom_idx == MAP_Z_REGION)  min_pop = 4;
+  // Bei COUNTRY weiterhin city-only; bei REGION dürfen größere place=town
+  // (>50K, pop_log≥4 ist 10K+ — also 50K erst >=4.7) wieder dazu.
+  bool city_only = (g_viewport.zoom_idx == MAP_Z_COUNTRY);
+
+  uint32_t cities_drawn = 0;
+  uint32_t n_idx = g_map.pt_idx ? g_map.pt_idx_n : 0;
+  for (uint32_t i = 0; i < n_idx; i++) {
+    size_t poff = g_map.pt_idx[i].off;
+    if (poff + 8 > g_map.buf_len) continue;
+    uint8_t  type_id  = g_map.buf[poff];
+    uint8_t  zoom_min = g_map.buf[poff + 1];
+    uint16_t lat_q, lon_q;
+    memcpy(&lat_q, g_map.buf + poff + 2, 2);
+    memcpy(&lon_q, g_map.buf + poff + 4, 2);
+    uint8_t  pop_log  = g_map.buf[poff + 6];
+    uint8_t  name_len = g_map.buf[poff + 7];
+    const char *name  = (const char *)(g_map.buf + poff + 8);
+
+    if (zoom_min > g_viewport.zoom_idx) continue;
+    if (pop_log < min_pop) continue;
+    if (city_only && type_id != MAP_P_CITY) continue;
+
+    float lat = map_q_to_lat(lat_q);
+    float lon = map_q_to_lon(lon_q);
+    int sx, sy;
+    map_project(&g_viewport, lat, lon, cx_screen, cy_screen, &sx, &sy);
+    if (sx < box_x || sx >= box_x + box_w || sy < box_y || sy >= box_y + box_h) continue;
+
+    // Kollisions-Check gegen schon gezeichnete (Manhattan-Distanz, schnell)
+    bool collision = false;
+    for (int k = 0; k < n_drawn; k++) {
+      int adx = abs(sx - drawn_cities[k].x);
+      int ady = abs(sy - drawn_cities[k].y);
+      if (adx < min_dist_px && ady < min_dist_px / 2) {
+        collision = true;
+        break;
+      }
+    }
+    if (collision) continue;
+
+    int dot_sz = (type_id == MAP_P_CITY) ? 6 : 4;
+    if (pop_log >= 6) dot_sz = 9;
+    else if (pop_log >= 5) dot_sz = 7;
+    lv_draw_rect_dsc_t rd;
+    lv_draw_rect_dsc_init(&rd);
+    rd.bg_color = lv_color_hex(MOKI_INK);
+    rd.bg_opa = LV_OPA_COVER;
+    lv_area_t dot = { (lv_coord_t)(sx - dot_sz/2), (lv_coord_t)(sy - dot_sz/2),
+                       (lv_coord_t)(sx - dot_sz/2 + dot_sz - 1),
+                       (lv_coord_t)(sy - dot_sz/2 + dot_sz - 1) };
+    lv_draw_rect(draw_ctx, &rd, &dot);
+
+    if (name_len > 0 && name_len < 40) {
+      char nbuf[40];
+      memcpy(nbuf, name, name_len);
+      nbuf[name_len] = 0;
+      lv_draw_label_dsc_t ld;
+      lv_draw_label_dsc_init(&ld);
+      ld.color = lv_color_hex(MOKI_INK);
+      ld.font = (pop_log >= 5) ? &moki_fraunces_italic_22 : &moki_fraunces_italic_18;
+      lv_area_t la = { (lv_coord_t)(sx + dot_sz/2 + 3), (lv_coord_t)(sy - 12),
+                       (lv_coord_t)(sx + dot_sz/2 + 3 + 220), (lv_coord_t)(sy + 12) };
+      lv_draw_label(draw_ctx, &ld, &la, nbuf, NULL);
+    }
+
+    if (n_drawn < (int)(sizeof(drawn_cities) / sizeof(drawn_cities[0]))) {
+      drawn_cities[n_drawn].x = (lv_coord_t)sx;
+      drawn_cities[n_drawn].y = (lv_coord_t)sy;
+      n_drawn++;
+    }
+    cities_drawn++;
+  }
+
+  // ── PINS (eigene Markierungen) ──────────────────────────────────────────
+  for (uint8_t pi = 0; pi < g_pins_n; pi++) {
+    int sx, sy;
+    map_project(&g_viewport, g_pins[pi].lat, g_pins[pi].lon,
+                cx_screen, cy_screen, &sx, &sy);
+    if (sx < box_x || sx >= box_x + box_w || sy < box_y || sy >= box_y + box_h) continue;
+
+    // Sterniges Quadrat (Outline) — visually distinct from city dots
+    lv_draw_rect_dsc_t pin_d;
+    lv_draw_rect_dsc_init(&pin_d);
+    pin_d.bg_color = lv_color_hex(MOKI_PAPER);
+    pin_d.bg_opa = LV_OPA_COVER;
+    pin_d.border_color = lv_color_hex(MOKI_INK);
+    pin_d.border_width = 2;
+    pin_d.radius = 0;
+    lv_area_t pa = { (lv_coord_t)(sx-7), (lv_coord_t)(sy-7),
+                     (lv_coord_t)(sx+6), (lv_coord_t)(sy+6) };
+    lv_draw_rect(draw_ctx, &pin_d, &pa);
+    // Innenpunkt
+    lv_draw_rect_dsc_t pin_inner;
+    lv_draw_rect_dsc_init(&pin_inner);
+    pin_inner.bg_color = lv_color_hex(MOKI_INK);
+    pin_inner.bg_opa = LV_OPA_COVER;
+    lv_area_t ia = { (lv_coord_t)(sx-2), (lv_coord_t)(sy-2),
+                     (lv_coord_t)(sx+1), (lv_coord_t)(sy+1) };
+    lv_draw_rect(draw_ctx, &pin_inner, &ia);
+
+    // Label
+    lv_draw_label_dsc_t pl;
+    lv_draw_label_dsc_init(&pl);
+    pl.color = lv_color_hex(MOKI_INK);
+    pl.font  = &moki_fraunces_italic_18;
+    lv_area_t la = { (lv_coord_t)(sx + 12), (lv_coord_t)(sy - 12),
+                     (lv_coord_t)(sx + 200), (lv_coord_t)(sy + 12) };
+    lv_draw_label(draw_ctx, &pl, &la, g_pins[pi].name, NULL);
+  }
+
+  // ── FRIENDS (MeshCore-Kontakte mit GPS) ─────────────────────────────────
+  int n_contacts = moki_mesh_contact_count();
+  uint32_t friends_drawn = 0;
+  for (int ci = 0; ci < n_contacts && ci < 32; ci++) {
+    float flat, flon;
+    uint32_t last_ts;
+    if (!moki_mesh_get_contact_loc(ci, &flat, &flon, &last_ts)) continue;
+    int sx, sy;
+    map_project(&g_viewport, flat, flon, cx_screen, cy_screen, &sx, &sy);
+    if (sx < box_x || sx >= box_x + box_w || sy < box_y || sy >= box_y + box_h) continue;
+
+    char fname[24];
+    uint8_t key4[4];
+    if (!moki_mesh_get_contact(ci, fname, sizeof(fname), key4)) continue;
+
+    // Friend-Marker: voller INK Punkt mit feinem PAPER-Ring
+    lv_draw_rect_dsc_t fr_ring;
+    lv_draw_rect_dsc_init(&fr_ring);
+    fr_ring.bg_color = lv_color_hex(MOKI_PAPER);
+    fr_ring.bg_opa = LV_OPA_COVER;
+    fr_ring.border_color = lv_color_hex(MOKI_INK);
+    fr_ring.border_width = 1;
+    fr_ring.radius = LV_RADIUS_CIRCLE;
+    lv_area_t fr_a = { (lv_coord_t)(sx - 9), (lv_coord_t)(sy - 9),
+                       (lv_coord_t)(sx + 8), (lv_coord_t)(sy + 8) };
+    lv_draw_rect(draw_ctx, &fr_ring, &fr_a);
+
+    lv_draw_rect_dsc_t fr_dot;
+    lv_draw_rect_dsc_init(&fr_dot);
+    fr_dot.bg_color = lv_color_hex(MOKI_INK);
+    fr_dot.bg_opa = LV_OPA_COVER;
+    fr_dot.radius = LV_RADIUS_CIRCLE;
+    lv_area_t fd = { (lv_coord_t)(sx - 4), (lv_coord_t)(sy - 4),
+                     (lv_coord_t)(sx + 3), (lv_coord_t)(sy + 3) };
+    lv_draw_rect(draw_ctx, &fr_dot, &fd);
+
+    // Name rechts vom Marker
+    lv_draw_label_dsc_t fl;
+    lv_draw_label_dsc_init(&fl);
+    fl.color = lv_color_hex(MOKI_INK);
+    fl.font  = &moki_fraunces_italic_18;
+    lv_area_t la = { (lv_coord_t)(sx + 13), (lv_coord_t)(sy - 12),
+                     (lv_coord_t)(sx + 200), (lv_coord_t)(sy + 12) };
+    lv_draw_label(draw_ctx, &fl, &la, fname, NULL);
+    friends_drawn++;
+  }
+
+  // ── ICH-PUNKT (g_self_pos: GPS oder manuell) ───────────────────────────
+  if (g_self_pos.source != 0) {
+    int sx, sy;
+    map_project(&g_viewport, g_self_pos.lat, g_self_pos.lon,
+                cx_screen, cy_screen, &sx, &sy);
+    bool in_view = (sx >= box_x && sx < box_x + box_w &&
+                    sy >= box_y && sy < box_y + box_h);
+    if (in_view) {
+      // Halo
+      lv_draw_rect_dsc_t halo;
+      lv_draw_rect_dsc_init(&halo);
+      halo.bg_color = lv_color_hex(MOKI_PAPER);
+      halo.bg_opa = LV_OPA_COVER;
+      halo.border_color = lv_color_hex(MOKI_INK);
+      halo.border_width = 2;
+      halo.radius = LV_RADIUS_CIRCLE;
+      lv_area_t ah = { (lv_coord_t)(sx-18), (lv_coord_t)(sy-18),
+                       (lv_coord_t)(sx+17), (lv_coord_t)(sy+17) };
+      lv_draw_rect(draw_ctx, &halo, &ah);
+
+      // Inner dot — solid für GPS, hollow für manual/stale
+      lv_draw_rect_dsc_t dot;
+      lv_draw_rect_dsc_init(&dot);
+      dot.bg_color = lv_color_hex(MOKI_INK);
+      dot.bg_opa = LV_OPA_COVER;
+      dot.radius = LV_RADIUS_CIRCLE;
+      int ds = (g_self_pos.source == 1) ? 7 : 5;
+      lv_area_t ad = { (lv_coord_t)(sx-ds), (lv_coord_t)(sy-ds),
+                       (lv_coord_t)(sx+ds-1), (lv_coord_t)(sy+ds-1) };
+      lv_draw_rect(draw_ctx, &dot, &ad);
+
+      // Label "ich" oder "ich (manuell/letzter fix)"
+      const char *lbl = "ich";
+      if (g_self_pos.source == 2) lbl = "ich · letzter fix";
+      else if (g_self_pos.source == 3) lbl = "ich · manuell";
+      lv_draw_label_dsc_t ld;
+      lv_draw_label_dsc_init(&ld);
+      ld.color = lv_color_hex(MOKI_INK);
+      ld.font  = &moki_fraunces_italic_22;
+      lv_area_t la = { (lv_coord_t)(sx + 22), (lv_coord_t)(sy - 14),
+                       (lv_coord_t)(sx + 240), (lv_coord_t)(sy + 14) };
+      lv_draw_label(draw_ctx, &ld, &la, lbl, NULL);
+    }
+  }
+
+  // ── Status-Pille oben links: GPS-Live-Info ─────────────────────────────
+  // Zeigt aktuellen GPS-Status auch wenn ich-Marker schon da ist
+  {
+    char hint[48];
+    if (g_gps.fix) {
+      snprintf(hint, sizeof(hint), "GPS · %u sats · ok", (unsigned)g_gps.sats_used);
+    } else if (g_self_pos.source != 0) {
+      snprintf(hint, sizeof(hint), "ortet · %u sats", (unsigned)g_gps.sats_tracked);
+    } else {
+      snprintf(hint, sizeof(hint), "kein fix · %u sats", (unsigned)g_gps.sats_tracked);
+    }
+    lv_draw_rect_dsc_t pill;
+    lv_draw_rect_dsc_init(&pill);
+    pill.bg_color = lv_color_hex(MOKI_PAPER);
+    pill.bg_opa = LV_OPA_COVER;
+    pill.border_color = lv_color_hex(MOKI_INK);
+    pill.border_width = 1;
+    pill.radius = 12;
+    lv_area_t pa = { (lv_coord_t)(box_x + 10), (lv_coord_t)(box_y + 10),
+                     (lv_coord_t)(box_x + 230), (lv_coord_t)(box_y + 38) };
+    lv_draw_rect(draw_ctx, &pill, &pa);
+
+    lv_draw_label_dsc_t ld;
+    lv_draw_label_dsc_init(&ld);
+    ld.color = lv_color_hex(MOKI_DARK);
+    ld.font  = &moki_jetbrains_mono_18;
+    lv_area_t la = { (lv_coord_t)(box_x + 18), (lv_coord_t)(box_y + 14),
+                     (lv_coord_t)(box_x + 230), (lv_coord_t)(box_y + 36) };
+    lv_draw_label(draw_ctx, &ld, &la, hint, NULL);
+  }
+
+  uint32_t t_end = millis();
+  Serial.printf("[map] draw · %u drawn, %u skipped, %u cities · %lums\n",
+                (unsigned)lines_drawn, (unsigned)lines_skipped,
+                (unsigned)cities_drawn, (unsigned long)(t_end - t_start));
+}
+
+// Inverse: screen-px → lat/lon. cx_screen/cy_screen sind die Map-Mitte
+// in Bildschirm-Koordinaten. Voraussetzung: viewport_compute_scale wurde
+// vor diesem Aufruf gerufen (passiert beim Render).
+static void map_unproject(int sx, int sy, int cx_screen, int cy_screen,
+                          float *out_lat, float *out_lon) {
+  float dx = (float)(sx - cx_screen);
+  float dy = (float)(sy - cy_screen);
+  *out_lon = g_viewport.lon_center + dx / g_viewport.px_per_deg_lon;
+  *out_lat = g_viewport.lat_center - dy / g_viewport.px_per_deg_lat;
+}
+
+// Pan: Press records start state. Release moves viewport by drag delta,
+// OR if it was a long-press without movement, drops a pin.
+static void map_press_event_cb(lv_event_t *e) {
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev) return;
+  lv_point_t p; lv_indev_get_point(indev, &p);
+  g_drag_start_x = p.x;
+  g_drag_start_y = p.y;
+  g_drag_start_lat = g_viewport.lat_center;
+  g_drag_start_lon = g_viewport.lon_center;
+  g_drag_active = true;
+  g_press_start_ms = millis();
+}
+
+static void map_release_event_cb(lv_event_t *e) {
+  if (!g_drag_active) return;
+  g_drag_active = false;
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev) return;
+  lv_point_t p; lv_indev_get_point(indev, &p);
+  int dx = p.x - g_drag_start_x;
+  int dy = p.y - g_drag_start_y;
+  uint32_t held_ms = millis() - g_press_start_ms;
+
+  // LONG-PRESS (>600ms, kaum Bewegung) → Pin setzen
+  if (held_ms > 600 && abs(dx) < 12 && abs(dy) < 12) {
+    if (!g_map_obj) return;
+    lv_area_t coords; lv_obj_get_coords(g_map_obj, &coords);
+    int cx_s = coords.x1 + (coords.x2 - coords.x1 + 1) / 2;
+    int cy_s = coords.y1 + (coords.y2 - coords.y1 + 1) / 2;
+    float plat, plon;
+    map_unproject(p.x, p.y, cx_s, cy_s, &plat, &plon);
+    char nm[16];
+    snprintf(nm, sizeof(nm), "ort %u", (unsigned)(g_pins_n + 1));
+    if (pins_add(plat, plon, nm)) {
+      Serial.printf("[pin] added '%s' at %.4f,%.4f (held=%lums)\n",
+                    nm, plat, plon, (unsigned long)held_ms);
+      lv_obj_invalidate(g_map_obj);
+    } else {
+      Serial.println(F("[pin] add failed (max reached?)"));
+    }
+    return;
+  }
+
+  // Threshold — kleine Bewegung = Tap. Prüfen ob ein Pin getroffen wurde.
+  if (abs(dx) < 8 && abs(dy) < 8) {
+    // Tap-on-Pin? Reproject Pins auf den aktuellen Screen-Frame
+    if (!g_map_obj) return;
+    lv_area_t coords; lv_obj_get_coords(g_map_obj, &coords);
+    int box_w = coords.x2 - coords.x1 + 1;
+    int box_h = coords.y2 - coords.y1 + 1;
+    int cx_s = coords.x1 + box_w / 2;
+    int cy_s = coords.y1 + box_h / 2;
+    viewport_compute_scale(&g_viewport, box_w, box_h);
+    for (uint8_t pi = 0; pi < g_pins_n; pi++) {
+      int psx, psy;
+      map_project(&g_viewport, g_pins[pi].lat, g_pins[pi].lon,
+                  cx_s, cy_s, &psx, &psy);
+      if (abs(p.x - psx) < 22 && abs(p.y - psy) < 22) {
+        g_active_pin = pi;
+        Serial.printf("[pin] tap → '%s' (idx=%d)\n", g_pins[pi].name, pi);
+        switch_screen(SCR_PIN_DETAIL);
+        return;
+      }
+    }
+    return;
+  }
+
+  // Drag um (dx, dy) Pixel = Verschiebung um (-dx, -dy) Grad-Anteil
+  if (g_viewport.px_per_deg_lat > 0 && g_viewport.px_per_deg_lon > 0) {
+    g_viewport.lat_center = g_drag_start_lat + (float)dy / g_viewport.px_per_deg_lat;
+    g_viewport.lon_center = g_drag_start_lon - (float)dx / g_viewport.px_per_deg_lon;
+    Serial.printf("[map] pan to lat=%.4f lon=%.4f\n",
+                  g_viewport.lat_center, g_viewport.lon_center);
+    if (g_map_obj) lv_obj_invalidate(g_map_obj);
+  }
+}
+
+// Zoom-Buttons + Center-on-GPS
+static void on_map_zoom_in(lv_event_t *e) {
+  if (g_viewport.zoom_idx < MAP_Z_CITY) {
+    g_viewport.zoom_idx++;
+    Serial.printf("[map] zoom in → %d\n", (int)g_viewport.zoom_idx);
+    if (g_map_obj) lv_obj_invalidate(g_map_obj);
+    // Reset draggable state
+    g_drag_active = false;
+  }
+}
+
+static void on_map_zoom_out(lv_event_t *e) {
+  if (g_viewport.zoom_idx > MAP_Z_COUNTRY) {
+    g_viewport.zoom_idx--;
+    Serial.printf("[map] zoom out → %d\n", (int)g_viewport.zoom_idx);
+    if (g_map_obj) lv_obj_invalidate(g_map_obj);
+    g_drag_active = false;
+  }
+}
+
+static void on_map_center_me(lv_event_t *e) {
+  if (g_self_pos.source != 0) {
+    g_viewport.lat_center = g_self_pos.lat;
+    g_viewport.lon_center = g_self_pos.lon;
+    Serial.printf("[map] center on self src=%u lat=%.4f lon=%.4f\n",
+                  (unsigned)g_self_pos.source, g_self_pos.lat, g_self_pos.lon);
+    if (g_map_obj) lv_obj_invalidate(g_map_obj);
+  } else {
+    Serial.println(F("[map] center_me: keine self-position bekannt — long-press oder 'h'-Button drücken"));
+  }
+  g_drag_active = false;
+}
+
+static void on_map_set_self_here(lv_event_t *e) {
+  // Manuell setzen — auf Viewport-Mitte (= aktueller Karten-Mittelpunkt)
+  self_pos_set_manual(g_viewport.lat_center, g_viewport.lon_center);
+  Serial.printf("[map] manual self-pos set lat=%.4f lon=%.4f\n",
+                g_self_pos.lat, g_self_pos.lon);
+  if (g_map_obj) lv_obj_invalidate(g_map_obj);
+  g_drag_active = false;
+}
+
+// Floating-Button-Helper für die kleine Toolbar in der Map-Ecke
+static void make_map_button(lv_obj_t *parent, const char *glyph,
+                            int dx, int dy, lv_event_cb_t cb) {
+  lv_obj_t *b = lv_obj_create(parent);
+  lv_obj_remove_style_all(b);
+  lv_obj_set_size(b, 44, 44);
+  lv_obj_set_style_bg_color(b, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(b, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(b, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(b, 2, LV_PART_MAIN);
+  lv_obj_align(b, LV_ALIGN_TOP_RIGHT, dx, dy);
+  lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *l = lv_label_create(b);
+  lv_label_set_text(l, glyph);
+  lv_obj_set_style_text_font(l, &moki_jetbrains_mono_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_center(l);
+  lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+}
+
 static void build_map_canvas(lv_obj_t *parent) {
-  // Container with grid background and pin overlay. Map is sized to fit the
-  // remaining vertical space; LVGL's flex_grow handles the height.
   lv_obj_t *map = lv_obj_create(parent);
   lv_obj_remove_style_all(map);
   lv_obj_set_size(map, LV_PCT(100), LV_PCT(100));
@@ -4072,83 +5417,30 @@ static void build_map_canvas(lv_obj_t *parent) {
   lv_obj_set_style_bg_opa(map, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(map, lv_color_hex(MOKI_MID), LV_PART_MAIN);
   lv_obj_set_style_border_width(map, 1, LV_PART_MAIN);
-  lv_obj_set_style_radius(map, 2, LV_PART_MAIN);
 
-  // River line (Neckar, spiritually) — a wide MID rectangle approximating
-  // the curved path from the simulator. Keeps it simple without canvas.
-  lv_obj_t *river = lv_obj_create(map);
-  lv_obj_remove_style_all(river);
-  lv_obj_set_size(river, LV_PCT(120), 8);
-  lv_obj_align(river, LV_ALIGN_LEFT_MID, -20, 80);
-  lv_obj_set_style_bg_color(river, lv_color_hex(MOKI_MID), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(river, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_radius(river, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  g_map_obj = map;
 
-  // Place pins
-  for (int i = 0; i < SAMPLE_PLACES_COUNT; i++) {
-    const moki_place_t *p = &SAMPLE_PLACES[i];
-    lv_obj_t *pin = lv_obj_create(map);
-    lv_obj_remove_style_all(pin);
-    lv_obj_set_size(pin, 14, 14);
-    lv_obj_set_style_bg_color(pin, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(pin, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(pin, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_style_border_width(pin, 2, LV_PART_MAIN);
-    lv_obj_align(pin, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_pos(pin, (int)(p->x * 4.5f), (int)(p->y * 5.0f));
-
-    lv_obj_t *lbl = lv_label_create(map);
-    lv_label_set_text(lbl, p->name);
-    lv_obj_set_style_text_font(lbl, &moki_fraunces_italic_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(lbl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_pad_left(lbl, 4, LV_PART_MAIN);
-    lv_obj_set_style_pad_right(lbl, 4, LV_PART_MAIN);
-    lv_obj_set_pos(lbl, (int)(p->x * 4.5f) + 18, (int)(p->y * 5.0f) - 8);
+  if (!g_map.ready) {
+    lv_obj_t *msg = lv_label_create(map);
+    lv_label_set_text(msg, "Karte wird geladen ...");
+    lv_obj_set_style_text_font(msg, &moki_fraunces_italic_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(msg, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+    lv_obj_center(msg);
+    return;
   }
 
-  // Friend-live pins
-  for (int i = 0; i < SAMPLE_FRIENDS_LIVE_COUNT; i++) {
-    const moki_friend_live_t *f = &SAMPLE_FRIENDS_LIVE[i];
-    lv_obj_t *pin = lv_obj_create(map);
-    lv_obj_remove_style_all(pin);
-    lv_obj_set_size(pin, 16, 16);
-    lv_obj_set_style_bg_color(pin, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(pin, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(pin, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_pos(pin, (int)(f->x * 4.5f), (int)(f->y * 5.0f));
+  // Custom-Draw: rendert die Map direkt mit lv_draw_line auf den Display-Buffer
+  lv_obj_add_event_cb(map, map_draw_event_cb, LV_EVENT_DRAW_MAIN, NULL);
+  // Pan-Gesture: Drag verschiebt Viewport
+  lv_obj_add_flag(map, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(map, map_press_event_cb,   LV_EVENT_PRESSED,  NULL);
+  lv_obj_add_event_cb(map, map_release_event_cb, LV_EVENT_RELEASED, NULL);
 
-    char buf[32]; snprintf(buf, sizeof(buf), "%s · %s", f->name, f->fresh);
-    lv_obj_t *lbl = lv_label_create(map);
-    lv_label_set_text(lbl, buf);
-    lv_obj_set_style_text_font(lbl, &moki_fraunces_italic_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(lbl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_pad_left(lbl, 4, LV_PART_MAIN);
-    lv_obj_set_style_pad_right(lbl, 4, LV_PART_MAIN);
-    lv_obj_set_pos(lbl, (int)(f->x * 4.5f) + 22, (int)(f->y * 5.0f) - 8);
-  }
-
-  // Self pin (filled INK with PAPER ring) — center, slightly below middle
-  lv_obj_t *self_outer = lv_obj_create(map);
-  lv_obj_remove_style_all(self_outer);
-  lv_obj_set_size(self_outer, 22, 22);
-  lv_obj_set_style_bg_color(self_outer, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(self_outer, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_border_color(self_outer, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_border_width(self_outer, 2, LV_PART_MAIN);
-  lv_obj_set_style_radius(self_outer, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-  lv_obj_align(self_outer, LV_ALIGN_CENTER, 0, 0);
-
-  lv_obj_t *self_inner = lv_obj_create(self_outer);
-  lv_obj_remove_style_all(self_inner);
-  lv_obj_set_size(self_inner, 12, 12);
-  lv_obj_set_style_bg_color(self_inner, lv_color_hex(MOKI_INK), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(self_inner, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_radius(self_inner, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-  lv_obj_center(self_inner);
+  // Floating Toolbar in der oberen rechten Ecke
+  make_map_button(map, "+",  -8,  8,   on_map_zoom_in);
+  make_map_button(map, "-",  -8,  60,  on_map_zoom_out);
+  make_map_button(map, "o",  -8,  112, on_map_center_me);
+  make_map_button(map, "h",  -8,  164, on_map_set_self_here);   // "ich bin hier"
 }
 
 static void build_nearby_content(lv_obj_t *parent) {
@@ -5059,6 +6351,442 @@ static bool g_show_lora_advanced = false;
 static void on_lora_advanced_toggle(lv_event_t *e) {
   g_show_lora_advanced = !g_show_lora_advanced;
   switch_screen(SCR_CHAT_DETAIL);
+}
+
+// ----------------------------------------------------------------------------
+// Reader screen — Vollbild, kein Tab-Bar, kein Dock. Eigener Header mit
+// "← Buchtitel" links, darunter der Text, unten die Seiten-Navi.
+// ----------------------------------------------------------------------------
+static void on_reader_back(lv_event_t *e) {
+  current_read_tab = READ_BOOK;
+  switch_screen(SCR_READ);
+}
+
+static void reader_persist_page(void) {
+  if (g_book_active_idx < 0) {
+    state_save_book_page();
+  } else {
+    char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
+    g_prefs.begin("moki", false);
+    g_prefs.putUInt(k, (uint32_t)g_book_page);
+    g_prefs.end();
+  }
+}
+
+static void on_reader_prev(lv_event_t *e) {
+  if (g_book_page > 0) {
+    g_book_page--;
+    reader_persist_page();
+    switch_screen(SCR_READER);
+  }
+}
+
+static void on_reader_next(lv_event_t *e) {
+  size_t total = book_total_length();
+  int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
+  if (g_book_page < total_pages - 1) {
+    g_book_page++;
+    reader_persist_page();
+    switch_screen(SCR_READER);
+  }
+}
+
+// ── Pin-Detail-Screen ────────────────────────────────────────────────────
+// Zeigt einen Pin (Name, Notiz, Koords). Buttons: löschen + zurück. Rename
+// und Notiz-Editieren via Console-Befehle (pin_rename / pin_note) bis
+// keyboard-driven Editor in eigener Iteration kommt.
+static void on_pin_back(lv_event_t *e) {
+  g_active_pin = -1;
+  switch_screen(SCR_MAP);
+}
+
+static void on_pin_delete(lv_event_t *e) {
+  if (g_active_pin >= 0 && g_active_pin < (int)g_pins_n) {
+    pins_delete(g_active_pin);
+  }
+  g_active_pin = -1;
+  switch_screen(SCR_MAP);
+}
+
+static void on_pin_open_rename(lv_event_t *e) {
+  if (g_active_pin >= 0) switch_screen(SCR_PIN_RENAME);
+}
+static void on_pin_open_note(lv_event_t *e) {
+  if (g_active_pin >= 0) switch_screen(SCR_PIN_NOTE);
+}
+// Send-to-all: pragmatisches v0 — sendet an alle bekannten Kontakte. v1
+// kommt mit Picker (eigener Screen mit Kontaktliste).
+static void on_pin_share_all(lv_event_t *e) {
+  if (g_active_pin < 0 || g_active_pin >= (int)g_pins_n) return;
+  if (!g_settings.lora_tx_armed) {
+    Serial.println(F("[pin] tx not armed"));
+    return;
+  }
+  const moki_pin_t *p = &g_pins[g_active_pin];
+  String payload = pin_share_format(p);
+  int n = moki_mesh_contact_count();
+  int sent = 0;
+  for (int i = 0; i < n; i++) {
+    if (moki_mesh_dm(i, payload.c_str())) sent++;
+  }
+  Serial.printf("[pin] shared '%s' to %d/%d contacts\n",
+                p->name, sent, n);
+}
+
+// Generic: tasten-edit screen with lv_textarea + lv_keyboard
+//   title  — kicker text shown above (z.B. "ORT UMBENENNEN")
+//   initial — initialer Textarea-Inhalt
+//   on_save_cb — wird aufgerufen mit textarea-text, schreibt zurück
+//   back_to — Screen, zu dem nach OK / Cancel zurückgekehrt wird
+static lv_obj_t *g_pin_edit_ta = nullptr;
+static char     g_pin_edit_initial[128] = "";
+static const char *g_pin_edit_title = "";
+
+static void on_pin_edit_save(lv_event_t *e) {
+  if (g_active_pin < 0 || !g_pin_edit_ta) return;
+  const char *txt = lv_textarea_get_text(g_pin_edit_ta);
+  if (!txt) txt = "";
+  // Welcher Edit ist gerade offen — basierend auf Title
+  if (strstr(g_pin_edit_title, "UMBENENNEN")) {
+    pins_rename(g_active_pin, txt);
+  } else if (strstr(g_pin_edit_title, "NOTIZ")) {
+    pins_set_note(g_active_pin, txt);
+  }
+  switch_screen(SCR_PIN_DETAIL);
+}
+static void on_pin_edit_cancel(lv_event_t *e) {
+  switch_screen(SCR_PIN_DETAIL);
+}
+
+// Tastatur-Event: OK = Save, Cancel = back
+static void on_pin_edit_kb_event(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY)  { on_pin_edit_save(NULL); }
+  if (code == LV_EVENT_CANCEL) { on_pin_edit_cancel(NULL); }
+}
+
+static void build_pin_edit_screen(const char *title, const char *initial) {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+
+  // Header strip — back / kicker
+  lv_obj_t *hdr = lv_obj_create(scr);
+  lv_obj_remove_style_all(hdr);
+  lv_obj_set_size(hdr, LV_PCT(100), 56);
+  lv_obj_set_style_pad_left(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(hdr, 24, LV_PART_MAIN);
+  lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *back = lv_obj_create(hdr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, 100, 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_pin_edit_cancel, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← ZURÜCK");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_add_flag(bl, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  lv_obj_t *kicker = lv_label_create(hdr);
+  lv_label_set_text(kicker, title);
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  // Save button on the right
+  lv_obj_t *save = lv_obj_create(hdr);
+  lv_obj_remove_style_all(save);
+  lv_obj_set_size(save, 100, 36);
+  lv_obj_set_style_bg_color(save, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(save, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_flex_flow(save, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(save, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(save, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(save, on_pin_edit_save, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *sl = lv_label_create(save);
+  lv_label_set_text(sl, "OK");
+  lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
+  lv_obj_add_flag(sl, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  // Textarea
+  lv_obj_t *ta = lv_textarea_create(scr);
+  lv_obj_set_size(ta, LV_PCT(100), 120);
+  lv_obj_set_style_text_font(ta, &moki_fraunces_italic_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ta, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(ta, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_border_width(ta, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(ta, 16, LV_PART_MAIN);
+  lv_textarea_set_one_line(ta, false);
+  lv_textarea_set_text(ta, initial ? initial : "");
+  g_pin_edit_ta = ta;
+  g_pin_edit_title = title;
+
+  // Keyboard
+  lv_obj_t *kb = lv_keyboard_create(scr);
+  lv_keyboard_set_textarea(kb, ta);
+  lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_obj_set_size(kb, LV_PCT(100), 380);
+  lv_obj_set_style_text_font(kb, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_add_event_cb(kb, on_pin_edit_kb_event, LV_EVENT_ALL, NULL);
+}
+
+void build_pin_rename(void) {
+  if (g_active_pin < 0 || g_active_pin >= (int)g_pins_n) {
+    switch_screen(SCR_MAP); return;
+  }
+  build_pin_edit_screen("ORT UMBENENNEN", g_pins[g_active_pin].name);
+}
+void build_pin_note(void) {
+  if (g_active_pin < 0 || g_active_pin >= (int)g_pins_n) {
+    switch_screen(SCR_MAP); return;
+  }
+  build_pin_edit_screen("NOTIZ", g_pins[g_active_pin].note);
+}
+
+void build_pin_detail(void) {
+  if (g_active_pin < 0 || g_active_pin >= (int)g_pins_n) {
+    switch_screen(SCR_MAP); return;
+  }
+  const moki_pin_t *p = &g_pins[g_active_pin];
+
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 32, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 32, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 18, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 18, LV_PART_MAIN);
+
+  // Header: ← back
+  lv_obj_t *back = lv_obj_create(scr);
+  lv_obj_remove_style_all(back);
+  lv_obj_set_size(back, LV_PCT(100), 36);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, on_pin_back, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(back);
+  lv_label_set_text(bl, "← KARTE");
+  lv_obj_set_style_text_font(bl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(bl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(bl, 2, LV_PART_MAIN);
+
+  // Kicker
+  lv_obj_t *kicker = lv_label_create(scr);
+  lv_label_set_text(kicker, "ORT");
+  lv_obj_set_style_text_font(kicker, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(kicker, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(kicker, 3, LV_PART_MAIN);
+
+  // Name
+  lv_obj_t *name = lv_label_create(scr);
+  lv_label_set_text(name, p->name);
+  lv_obj_set_style_text_font(name, &moki_fraunces_italic_36, LV_PART_MAIN);
+  lv_obj_set_style_text_color(name, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_width(name, LV_PCT(100));
+  lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+
+  // Coords
+  char coords[64];
+  snprintf(coords, sizeof(coords), "%.4f °N · %.4f °O", p->lat, p->lon);
+  lv_obj_t *cl = lv_label_create(scr);
+  lv_label_set_text(cl, coords);
+  lv_obj_set_style_text_font(cl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+
+  // Note (or hint if empty)
+  lv_obj_t *note = lv_label_create(scr);
+  if (p->note[0]) {
+    lv_label_set_text(note, p->note);
+    lv_obj_set_style_text_color(note, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  } else {
+    lv_label_set_text(note, "(noch keine notiz · tippe »NOTIZ« unten)");
+    lv_obj_set_style_text_color(note, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  }
+  lv_obj_set_style_text_font(note, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(note, LV_PCT(100));
+  lv_obj_set_flex_grow(note, 1);
+  lv_obj_set_style_text_line_space(note, 6, LV_PART_MAIN);
+
+  // Action-Reihe: UMBENENNEN | NOTIZ
+  lv_obj_t *actions = lv_obj_create(scr);
+  lv_obj_remove_style_all(actions);
+  lv_obj_set_size(actions, LV_PCT(100), 50);
+  lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(actions, 12, LV_PART_MAIN);
+  auto add_action = [&](const char *label, lv_event_cb_t cb) {
+    lv_obj_t *b = lv_obj_create(actions);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_flex_grow(b, 1);
+    lv_obj_set_height(b, 50);
+    lv_obj_set_style_bg_color(b, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(b, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(b, 1, LV_PART_MAIN);
+    lv_obj_set_flex_flow(b, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, label);
+    lv_obj_set_style_text_font(l, &moki_jetbrains_mono_22, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(l, 3, LV_PART_MAIN);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+  };
+  add_action("UMBENENNEN", on_pin_open_rename);
+  add_action("NOTIZ",      on_pin_open_note);
+  add_action("TEILEN",     on_pin_share_all);
+
+  // Delete button (groß, klar markiert)
+  lv_obj_t *del = lv_obj_create(scr);
+  lv_obj_remove_style_all(del);
+  lv_obj_set_size(del, LV_PCT(100), 56);
+  lv_obj_set_style_bg_color(del, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(del, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(del, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(del, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(del, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(del, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(del, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(del, on_pin_delete, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *dl = lv_label_create(del);
+  lv_label_set_text(dl, "ORT LÖSCHEN");
+  lv_obj_set_style_text_font(dl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(dl, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(dl, 3, LV_PART_MAIN);
+  lv_obj_add_flag(dl, LV_OBJ_FLAG_EVENT_BUBBLE);
+}
+
+void build_reader(void) {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(scr, 36, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(scr, 36, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(scr, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(scr, 14, LV_PART_MAIN);
+  lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(scr, 14, LV_PART_MAIN);
+
+  // Resolve title for header
+  const char *book_title;
+  if (g_book_active_idx == -2)      book_title = "anleitung";
+  else if (g_book_active_idx == -1) book_title = "walden";
+  else if (g_book_active_idx >= 0 && g_book_active_idx < g_book_count)
+                                    book_title = g_books[g_book_active_idx].title;
+  else                              book_title = "buch";
+
+  // Header: "← title" — single tap-target, dezent
+  lv_obj_t *header = lv_obj_create(scr);
+  lv_obj_remove_style_all(header);
+  lv_obj_set_size(header, LV_PCT(100), 32);
+  lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(header, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(header, on_reader_back, LV_EVENT_CLICKED, NULL);
+
+  char head[64];
+  snprintf(head, sizeof(head), "← %s", book_title);
+  lv_obj_t *hl = lv_label_create(header);
+  lv_label_set_text(hl, head);
+  lv_obj_set_style_text_font(hl, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(hl, 1, LV_PART_MAIN);
+  lv_obj_add_flag(hl, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  // Pagination
+  size_t total = book_total_length();
+  int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
+  if (total_pages < 1) total_pages = 1;
+  if (g_book_page >= total_pages) g_book_page = total_pages - 1;
+  if (g_book_page < 0) g_book_page = 0;
+
+  // Read current page
+  static char page_buf[BOOK_CHARS_PER_PAGE + 8];
+  size_t start = g_book_page * BOOK_CHARS_PER_PAGE;
+  size_t want  = BOOK_CHARS_PER_PAGE;
+  if (start + want > total) want = total - start;
+  size_t got = book_read_chunk(start, want, page_buf, sizeof(page_buf));
+  if (got == 0) {
+    strncpy(page_buf, "(leer)", sizeof(page_buf));
+    got = strlen(page_buf);
+  }
+  // Trim back to last whitespace to avoid mid-word cut
+  if (g_book_page < total_pages - 1) {
+    for (int i = (int)got - 1; i > (int)got - 80 && i > 0; i--) {
+      if (page_buf[i] == ' ' || page_buf[i] == '\n') {
+        page_buf[i] = 0;
+        break;
+      }
+    }
+  }
+
+  // Body — füllt den ganzen Bildschirm zwischen Header und Footer
+  lv_obj_t *body = lv_label_create(scr);
+  lv_label_set_text(body, page_buf);
+  lv_obj_set_style_text_font(body, &moki_fraunces_italic_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(body, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(body, LV_PCT(100));
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_style_text_line_space(body, 7, LV_PART_MAIN);
+
+  // Footer-Navi: ZURÜCK · Seite X/Y · WEITER
+  lv_obj_t *nav = lv_obj_create(scr);
+  lv_obj_remove_style_all(nav);
+  lv_obj_set_size(nav, LV_PCT(100), 44);
+  lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(nav, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+  lv_obj_set_style_border_color(nav, lv_color_hex(MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_border_width(nav, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_top(nav, 8, LV_PART_MAIN);
+
+  lv_obj_t *prev = lv_label_create(nav);
+  lv_label_set_text(prev, "← ZURÜCK");
+  lv_obj_set_style_text_font(prev, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(prev,
+      lv_color_hex(g_book_page > 0 ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(prev, 2, LV_PART_MAIN);
+  if (g_book_page > 0) {
+    lv_obj_add_flag(prev, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(prev, on_reader_prev, LV_EVENT_CLICKED, NULL);
+  }
+
+  char pagebuf[24];
+  int pct = total_pages > 1 ? (g_book_page * 100) / (total_pages - 1) : 0;
+  if (pct > 100) pct = 100;
+  snprintf(pagebuf, sizeof(pagebuf), "%d / %d · %d%%", g_book_page + 1, total_pages, pct);
+  lv_obj_t *page = lv_label_create(nav);
+  lv_label_set_text(page, pagebuf);
+  lv_obj_set_style_text_font(page, &moki_jetbrains_mono_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(page, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+
+  lv_obj_t *next = lv_label_create(nav);
+  lv_label_set_text(next, "WEITER →");
+  lv_obj_set_style_text_font(next, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(next,
+      lv_color_hex(g_book_page < total_pages - 1 ? MOKI_INK : MOKI_MID), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(next, 2, LV_PART_MAIN);
+  if (g_book_page < total_pages - 1) {
+    lv_obj_add_flag(next, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(next, on_reader_next, LV_EVENT_CLICKED, NULL);
+  }
 }
 
 void build_chat_detail(void) {
@@ -6072,6 +7800,23 @@ void setup() {
 
   // I2C bus shared by GT911, TPS65185, PCF8563, BQ25896, BQ27220, PCA9535.
   // (39, 40) = (SDA, SCL) per LILYGO wiring.
+  // PSRAM-Heap-Allokation für die großen Arrays (M8.5 DRAM-Optimierung).
+  // Zusammen ~50KB DRAM frei für WiFi/LWIP/epdiy LUT.
+  g_habits      = (moki_habit_t  *)heap_caps_calloc(MAX_HABITS,    sizeof(moki_habit_t),    MALLOC_CAP_SPIRAM);
+  g_todos       = (moki_todo_t   *)heap_caps_calloc(MAX_TODOS,     sizeof(moki_todo_t),     MALLOC_CAP_SPIRAM);
+  g_events      = (moki_event_t  *)heap_caps_calloc(MAX_EVENTS,    sizeof(moki_event_t),    MALLOC_CAP_SPIRAM);
+  g_notes       = (moki_note_t   *)heap_caps_calloc(MAX_NOTES,     sizeof(moki_note_t),     MALLOC_CAP_SPIRAM);
+  g_lora_msgs   = (moki_lora_msg_t*)heap_caps_calloc(LORA_MSG_CAP, sizeof(moki_lora_msg_t), MALLOC_CAP_SPIRAM);
+  g_books       = (moki_book_t   *)heap_caps_calloc(MOKI_MAX_BOOKS,sizeof(moki_book_t),     MALLOC_CAP_SPIRAM);
+  g_pins        = (moki_pin_t    *)heap_caps_calloc(MOKI_MAX_PINS, sizeof(moki_pin_t),      MALLOC_CAP_SPIRAM);
+  g_map_proj_pts= (lv_point_t    *)heap_caps_calloc(2048,          sizeof(lv_point_t),      MALLOC_CAP_SPIRAM);
+  if (!g_habits || !g_todos || !g_events || !g_notes ||
+      !g_lora_msgs || !g_books || !g_pins || !g_map_proj_pts) {
+    Serial.println(F("[boot] PSRAM-heap alloc FAILED — fatal"));
+    while (1) delay(1000);
+  }
+  Serial.println(F("[boot] PSRAM-heap allocs OK"));
+
   Wire.begin(39, 40);
 
   // E-Paper init — board v7 + ED047TC1 panel.
@@ -6131,8 +7876,22 @@ void setup() {
   Serial.println(F("[lvgl] synth indev registered"));
 
   fs_mount();
-  sd_mount();
-  books_scan();
+  // sd_mount muss NACH lora_init laufen — sonst korrumpiert ein
+  // fehlgeschlagener SD-Mount den geteilten SPI-Bus, und SX1262
+  // antwortet nicht mehr (CHIP_NOT_FOUND).
+  // sd_mount() wird weiter unten gerufen, NACH lora_init().
+  books_scan();   // läuft erstmal auf LittleFS only (SD kommt nach lora_init)
+  map_load();
+  pins_load();
+  self_pos_load();
+#ifdef MOKI_WIFI
+  // WiFi-Creds laden, Init kommt aber erst nach lora_init() — sonst stört
+  // der WiFi-Stack die SPI/Power-Sequenz für SX1262 (CHIP_NOT_FOUND).
+  wifi_load();
+  ota_url_load();
+#endif
+
+  gps_init();
 
   state_load_todos();
   state_load_habits();
@@ -6150,6 +7909,19 @@ void setup() {
   if (g_lora_ready) {
     lora_apply_preset(g_settings.lora_preset);
   }
+
+  // SD jetzt mounten — der LoRa-Radio teilt sich den SPI-Bus mit der SD-Karte.
+  // Wenn SD vor LoRa initialisiert wird und ohne Karte fehlschlägt, bleibt
+  // der Bus in einem komischen Zustand und SX1262 antwortet nicht mehr.
+  sd_mount();
+  // Falls SD jetzt da ist, indexieren wir die Bücher dort nach.
+  if (g_sd_ready) books_scan();
+
+#ifdef MOKI_WIFI
+  // WiFi-Init NACH lora_init: Reihenfolge ist wichtig — wenn WiFi vor SX1262
+  // hochkommt, klemmt's beim Radio-Begin (CHIP_NOT_FOUND).
+  wifi_init();
+#endif
   // Identity needs RNG → must come after radio is up. First boot only.
   state_ensure_identity();
 
@@ -6329,6 +8101,215 @@ static void poll_serial(void) {
         Serial.printf("[sleep] requested %ds via serial\n", secs);
         enter_deep_sleep((uint32_t)secs);
         // never returns
+      } else if (line == "gps") {
+        Serial.printf("[gps] fix=%d ant=%s used=%u track=%u hdop=%.1f lat=%.6f lon=%.6f age=%lums\n",
+                      g_gps.fix ? 1 : 0,
+                      g_gps.antenna_ok ? "ok" : "?",
+                      (unsigned)g_gps.sats_used,
+                      (unsigned)g_gps.sats_tracked,
+                      g_gps.hdop_x10 / 10.0f,
+                      g_gps.lat_deg, g_gps.lon_deg,
+                      g_gps.fix ? (unsigned long)(millis() - g_gps.fix_ts_ms) : 0UL);
+      } else if (line == "zoom_in") {
+        if (g_viewport.zoom_idx < MAP_Z_CITY) {
+          g_viewport.zoom_idx++;
+          if (g_map_obj) lv_obj_invalidate(g_map_obj);
+        }
+        Serial.printf("[map] zoom=%d\n", (int)g_viewport.zoom_idx);
+      } else if (line == "zoom_out") {
+        if (g_viewport.zoom_idx > MAP_Z_COUNTRY) {
+          g_viewport.zoom_idx--;
+          if (g_map_obj) lv_obj_invalidate(g_map_obj);
+        }
+        Serial.printf("[map] zoom=%d\n", (int)g_viewport.zoom_idx);
+      } else if (line.startsWith("pin_add ")) {
+        // pin_add <name> — fügt Pin am aktuellen Viewport-Center ein
+        String name = line.substring(8);
+        if (pins_add(g_viewport.lat_center, g_viewport.lon_center, name.c_str())) {
+          Serial.printf("[pin] added '%s' at %.4f,%.4f\n",
+                        name.c_str(), g_viewport.lat_center, g_viewport.lon_center);
+          if (g_map_obj) lv_obj_invalidate(g_map_obj);
+        } else Serial.println(F("[pin] add failed"));
+      } else if (line == "pin_list") {
+        Serial.printf("[pin] %u pins:\n", (unsigned)g_pins_n);
+        for (uint8_t i = 0; i < g_pins_n; i++) {
+          Serial.printf("  [%u] %.4f,%.4f  %s\n",
+                        (unsigned)i, g_pins[i].lat, g_pins[i].lon, g_pins[i].name);
+        }
+      } else if (line == "pin_clear") {
+        g_pins_n = 0;
+        pins_save();
+        Serial.println(F("[pin] cleared"));
+        if (g_map_obj) lv_obj_invalidate(g_map_obj);
+      } else if (line.startsWith("pin_rename ")) {
+        // pin_rename <idx> <name>
+        int sp = line.indexOf(' ', 11);
+        if (sp > 11) {
+          int idx = line.substring(11, sp).toInt();
+          String nm = line.substring(sp + 1);
+          if (pins_rename(idx, nm.c_str())) {
+            Serial.printf("[pin] renamed %d → '%s'\n", idx, nm.c_str());
+            if (g_map_obj) lv_obj_invalidate(g_map_obj);
+          }
+        }
+      } else if (line.startsWith("pin_note ")) {
+        // pin_note <idx> <text>
+        int sp = line.indexOf(' ', 9);
+        if (sp > 9) {
+          int idx = line.substring(9, sp).toInt();
+          String nt = line.substring(sp + 1);
+          if (pins_set_note(idx, nt.c_str())) {
+            Serial.printf("[pin] note %d set\n", idx);
+          }
+        }
+      } else if (line.startsWith("pin_share ")) {
+        // pin_share <contact_idx> <pin_idx>  — sendet pin per DM an Kontakt
+        String rest = line.substring(10);
+        int sp = rest.indexOf(' ');
+        if (sp <= 0) {
+          Serial.println(F("[pin] usage: pin_share <contact_idx> <pin_idx>"));
+        } else {
+          int contact_idx = rest.substring(0, sp).toInt();
+          int pin_idx     = rest.substring(sp + 1).toInt();
+          if (pin_idx < 0 || pin_idx >= (int)g_pins_n) {
+            Serial.printf("[pin] no pin %d (have %u)\n", pin_idx, (unsigned)g_pins_n);
+          } else if (!g_settings.lora_tx_armed) {
+            Serial.println(F("[pin] tx not armed"));
+          } else {
+            String payload = pin_share_format(&g_pins[pin_idx]);
+            bool ok = moki_mesh_dm(contact_idx, payload.c_str());
+            Serial.printf("[pin] share '%s' → contact[%d] %s (%u bytes)\n",
+                          g_pins[pin_idx].name, contact_idx,
+                          ok ? "queued" : "FAILED",
+                          (unsigned)payload.length());
+          }
+        }
+      } else if (line.startsWith("pin_del ")) {
+        int idx = line.substring(8).toInt();
+        if (pins_delete(idx)) {
+          Serial.printf("[pin] deleted %d\n", idx);
+          if (g_map_obj) lv_obj_invalidate(g_map_obj);
+        }
+#ifdef MOKI_WIFI
+      } else if (line.startsWith("wifi_set ")) {
+        // wifi_set <ssid> <psk>  — psk darf Leerzeichen enthalten ab 2. Wort
+        String rest = line.substring(9);
+        rest.trim();
+        int sp = rest.indexOf(' ');
+        if (sp <= 0) {
+          Serial.println(F("[wifi] usage: wifi_set <ssid> <psk>"));
+        } else {
+          String ssid = rest.substring(0, sp);
+          String psk  = rest.substring(sp + 1);
+          wifi_set_creds(ssid.c_str(), psk.c_str());
+        }
+      } else if (line == "wifi_clear") {
+        wifi_clear_creds();
+      } else if (line == "wifi_status") {
+        Serial.printf("[wifi] enabled=%d connected=%d ssid='%s' ip=%s rssi=%d\n",
+                      g_wifi.enabled, g_wifi.connected,
+                      g_wifi.ssid, g_wifi.ip[0] ? g_wifi.ip : "-",
+                      g_wifi.connected ? WiFi.RSSI() : 0);
+      } else if (line == "wifi_help" || line == "ota_help") {
+        Serial.println(F("\n[ota] Quickstart:"));
+        Serial.println(F("  WiFi setup: wifi_set <SSID> <PSK>  /  wifi_status"));
+        Serial.println(F(""));
+        Serial.println(F("  LOKAL (Mac im LAN):"));
+        Serial.println(F("    Mac:  cd tools/ota-server && bun run start"));
+        Serial.println(F("    Moki: ota http://<MAC-IP>:8080/firmware.bin"));
+        Serial.println(F(""));
+        Serial.println(F("  REMOTE (GitHub Releases — funktioniert von überall):"));
+        Serial.println(F("    Mac:  ./tools/release.sh \"meine änderung\""));
+        Serial.println(F("    Moki: ota_url https://github.com/<USER>/<REPO>/releases/latest/download/firmware.bin   (einmalig)"));
+        Serial.println(F("    Moki: ota_release"));
+        Serial.println(F(""));
+        Serial.println(F("  Diagnose: 'info' (heap/wifi/gps/pins), 'ota_url_get' (URL anzeigen)."));
+      } else if (line.startsWith("ota ")) {
+        String url = line.substring(4);
+        url.trim();
+        if (url.length() < 8) {
+          Serial.println(F("[ota] usage: ota <http(s)://host/firmware.bin>"));
+        } else {
+          ota_pull(url.c_str());
+        }
+      } else if (line == "ota_release") {
+        if (!g_ota_url[0]) {
+          Serial.println(F("[ota] no default URL — set with 'ota_url <url>' first"));
+          Serial.println(F("[ota] tip: https://github.com/<user>/<repo>/releases/latest/download/firmware.bin"));
+        } else {
+          ota_pull(g_ota_url);
+        }
+      } else if (line.startsWith("ota_url ")) {
+        String url = line.substring(8);
+        url.trim();
+        if (url.length() < 8) {
+          Serial.println(F("[ota] usage: ota_url <url>  (set persistent default)"));
+        } else {
+          ota_url_save(url.c_str());
+        }
+      } else if (line == "ota_url_get") {
+        Serial.printf("[ota] url='%s'\n", g_ota_url[0] ? g_ota_url : "(unset)");
+#endif // MOKI_WIFI
+      } else if (line == "info") {
+        // Eine-Zeile-Snapshot für schnelle Diagnose
+        Serial.printf("[info] uptime=%lus heap=%u psram=%u(free) ",
+                      (unsigned long)(millis() / 1000),
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getFreePsram());
+#ifdef MOKI_WIFI
+        Serial.printf("wifi=%s ip=%s ",
+                      g_wifi.connected ? "up" : (g_wifi.enabled ? "trying" : "off"),
+                      g_wifi.ip[0] ? g_wifi.ip : "-");
+#endif
+        Serial.printf("gps=%s sats=%u/%u self=%s pins=%u\n",
+                      g_gps.fix ? "fix" : "-",
+                      (unsigned)g_gps.sats_tracked, (unsigned)g_gps.sats_used,
+                      g_self_pos.source ? "yes" : "no",
+                      (unsigned)g_pins_n);
+      } else if (line == "pin_demo") {
+        // Drei Demo-Pins rund um Heidelberg
+        pins_add(49.4099f, 8.6943f, "schloss-cafe");
+        pins_add(49.4196f, 8.6940f, "neckarwiese");
+        pins_add(49.4045f, 8.6779f, "hbf");
+        pins_set_note(g_pins_n - 3, "kaffee mit blick auf den neckar");
+        pins_set_note(g_pins_n - 2, "lieblingsspot zum nachmittag");
+        Serial.printf("[pin] +3 demo pins (total %u)\n", (unsigned)g_pins_n);
+        if (g_map_obj) lv_obj_invalidate(g_map_obj);
+      } else if (line == "restart" || line == "reboot") {
+        Serial.println(F("[boot] manual restart"));
+        delay(100);
+        ESP.restart();
+      } else if (line == "set_self_here") {
+        self_pos_set_manual(g_viewport.lat_center, g_viewport.lon_center);
+        Serial.printf("[self] manual set lat=%.4f lon=%.4f\n",
+                      g_self_pos.lat, g_self_pos.lon);
+        if (g_map_obj) lv_obj_invalidate(g_map_obj);
+      } else if (line == "self") {
+        Serial.printf("[self] source=%u lat=%.4f lon=%.4f\n",
+                      (unsigned)g_self_pos.source, g_self_pos.lat, g_self_pos.lon);
+      } else if (line == "center_me") {
+        if (g_gps.fix) {
+          g_viewport.lat_center = g_gps.lat_deg;
+          g_viewport.lon_center = g_gps.lon_deg;
+          if (g_map_obj) lv_obj_invalidate(g_map_obj);
+          Serial.printf("[map] centered on GPS lat=%.4f lon=%.4f\n",
+                        g_viewport.lat_center, g_viewport.lon_center);
+        } else {
+          Serial.println(F("[map] no GPS fix"));
+        }
+      } else if (line == "gps_raw") {
+        // Dumpe 10s lang raw NMEA-Bytes vom Modul. Diagnostik wenn der
+        // Parser nichts sieht oder etwas Komisches macht.
+        Serial.println(F("[gps_raw] dumping raw NMEA for 10 seconds..."));
+        uint32_t t_end = millis() + 10000;
+        while (millis() < t_end) {
+          while (GPSSerial.available()) {
+            int c = GPSSerial.read();
+            if (c >= 0) Serial.write((char)c);
+          }
+          delay(10);
+        }
+        Serial.println(F("\n[gps_raw] done"));
       } else if (line == "time") {
         if (g_rtc_ready) {
           RTC_DateTime now = g_rtc.getDateTime();
@@ -6569,16 +8550,31 @@ void loop() {
   // mode" toggle in a future iteration.
   moki_mesh_loop();
 
+  // GPS — drain Serial2 NMEA, update g_gps state
+  gps_loop();
+
+#ifdef MOKI_WIFI
+  // WiFi — Reconnect-Watchdog
+  wifi_loop();
+#endif
+
   // RTC tick — habit midnight rollover (cheap, runs ~once / 30s)
   rtc_tick();
 
   // Periodic self-advert — fires once 5s after boot, then every 15 min, so
   // other Mokis can discover this one without manual `advert` commands.
   // Requires TX armed (otherwise we'd risk damage on antenna-less Mokis).
+  // Wenn ein GPS-Fix da ist, senden wir die Position mit, sodass andere
+  // Mokis uns auf der Karte sehen können.
   static uint32_t next_advert_ms = 5000;
   if (g_settings.lora_tx_armed && g_lora_ready &&
       millis() > next_advert_ms) {
-    moki_mesh_advert(g_settings.handle);
+    if (g_gps.fix) {
+      moki_mesh_advert_with_loc(g_settings.handle,
+                                (double)g_gps.lat_deg, (double)g_gps.lon_deg);
+    } else {
+      moki_mesh_advert(g_settings.handle);
+    }
     next_advert_ms = millis() + 15UL * 60UL * 1000UL;  // every 15 min
   }
 
@@ -6616,6 +8612,25 @@ void loop() {
                   (unsigned long)(now / 1000),
                   (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getFreePsram());
+  }
+
+  // GPS heartbeat — alle 10s ausgeben, damit Lucas draußen das Fix-Verhalten
+  // im Serial sieht. Hört auf, sobald Status-Bar GPS anzeigt.
+  static uint32_t last_gps_beat = 0;
+  if (now - last_gps_beat >= 10000) {
+    last_gps_beat = now;
+    if (g_gps.fix) {
+      Serial.printf("[gps] FIX  lat=%.6f lon=%.6f used=%u track=%u hdop=%.1f\n",
+                    g_gps.lat_deg, g_gps.lon_deg,
+                    (unsigned)g_gps.sats_used,
+                    (unsigned)g_gps.sats_tracked,
+                    g_gps.hdop_x10 / 10.0f);
+    } else {
+      Serial.printf("[gps] no fix · tracking %u sats · ant=%s · hdop=%.1f\n",
+                    (unsigned)g_gps.sats_tracked,
+                    g_gps.antenna_ok ? "ok" : "?",
+                    g_gps.hdop_x10 / 10.0f);
+    }
   }
   delay(1);
 }

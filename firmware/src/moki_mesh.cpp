@@ -32,6 +32,7 @@ extern WRAPPER_CLASS radio_driver;
 
 // Bridge into Moki's existing ring buffer (defined in main.cpp).
 extern "C" void moki_lora_push_msg_external(const char *from, const char *text, int16_t rssi);
+extern "C" void moki_pin_share_received(const char *from, const char *payload);
 extern "C" void moki_lora_push_msg_channel(const char *from, const char *text, int16_t rssi, int channel_idx);
 
 // Identity secret from Stage 3c (in main.cpp).
@@ -128,6 +129,11 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   void onContactPathUpdated(const ContactInfo& contact) override {}
   void onMessageRecv(const ContactInfo& contact, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
     Serial.printf("[mesh] direct msg from %s: %s\n", contact.name, text);
+    // M6.10 — Pin-Share Erkennung: Format "MOKI_PLACE:lat:lon:name|note"
+    if (text && strncmp(text, "MOKI_PLACE:", 11) == 0) {
+      moki_pin_share_received(contact.name, text + 11);
+      return;   // schreibt sich selbst ins UI, kein Bubble in DM-Liste
+    }
     // channel_idx = -1 → direct-message bucket (separate from any group channel)
     moki_lora_push_msg_channel(contact.name, text, 0, -1);
   }
@@ -222,14 +228,34 @@ public:
 
   // Send a self-advert so other Mokis discover us. Uses the user's handle
   // as the public name. Repeaters flood it across the mesh.
-  bool sendSelfAdvert(const char *name) {
-    auto pkt = createSelfAdvert(name);
+  // Wenn fix_lat/fix_lon != 0 → mit GPS-Position senden (für Friend-Map).
+  bool sendSelfAdvert(const char *name, double fix_lat = 0.0, double fix_lon = 0.0) {
+    mesh::Packet *pkt;
+    if (fix_lat != 0.0 || fix_lon != 0.0) {
+      pkt = createSelfAdvert(name, fix_lat, fix_lon);
+    } else {
+      pkt = createSelfAdvert(name);
+    }
     if (!pkt) {
       Serial.println(F("[mesh] advert: alloc failed"));
       return false;
     }
     sendFlood(pkt);
-    Serial.printf("[mesh] sent self-advert as '%s'\n", name);
+    Serial.printf("[mesh] sent self-advert as '%s' (loc=%s)\n",
+                  name, (fix_lat || fix_lon) ? "yes" : "no");
+    return true;
+  }
+
+  // GPS-Position eines Kontakts. Liefert false bei out-of-range oder wenn
+  // der Kontakt keine Location veröffentlicht (gps_lat == gps_lon == 0).
+  bool getContactLocation(int idx, float *out_lat, float *out_lon,
+                          uint32_t *out_last_advert_ts) {
+    ContactInfo c;
+    if (!getContactByIdx((uint32_t)idx, c)) return false;
+    if (c.gps_lat == 0 && c.gps_lon == 0) return false;
+    *out_lat = (float)c.gps_lat / 1000000.0f;
+    *out_lon = (float)c.gps_lon / 1000000.0f;
+    *out_last_advert_ts = c.last_advert_timestamp;
     return true;
   }
 
@@ -306,6 +332,17 @@ bool moki_mesh_send(const char *sender_name, const char *text) {
 bool moki_mesh_advert(const char *name) {
   if (!g_mesh) return false;
   return g_mesh->sendSelfAdvert(name);
+}
+
+bool moki_mesh_advert_with_loc(const char *name, double lat, double lon) {
+  if (!g_mesh) return false;
+  return g_mesh->sendSelfAdvert(name, lat, lon);
+}
+
+bool moki_mesh_get_contact_loc(int idx, float *out_lat, float *out_lon,
+                               uint32_t *out_last_advert_ts) {
+  if (!g_mesh) return false;
+  return g_mesh->getContactLocation(idx, out_lat, out_lon, out_last_advert_ts);
 }
 
 int moki_mesh_contact_count() {

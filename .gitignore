@@ -6,5 +6,18 @@ firmware/.vscode/
 firmware/.cache/
 firmware/build/
 *.elf
-*.bin
-*.map
+# *.map  -- removed: would block firmware/data/moki.map. Use specific paths below.
+firmware/.pio/build/**/*.map
+
+# Note: *.bin globally would block firmware.bin from release uploads, scope it:
+firmware/build/*.bin
+firmware/.pio/build/**/*.bin
+
+# Map pipeline intermediate files (regenerable, several GB)
+tools/map-pipeline/pbf/*.osm.pbf
+tools/map-pipeline/filtered/
+tools/map-pipeline/output/
+
+# Bun / Node
+node_modules/
+*.log
