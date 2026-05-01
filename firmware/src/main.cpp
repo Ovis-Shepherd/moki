@@ -3644,12 +3644,9 @@ static void build_chats_content(lv_obj_t *parent) {
       sub_buf[sizeof(sub_buf) - 1] = 0;
       format_clock(latest->ts_ms, meta_buf, sizeof(meta_buf));
     }
-    moki_chat_row_t r = { strdup(title_buf), strdup(sub_buf), strdup(meta_buf),
-                          /*kind=*/0, /*idx=*/i };
+    // No strdup — build_chat_row_dynamic copies via lv_label_set_text.
+    moki_chat_row_t r = { title_buf, sub_buf, meta_buf, /*kind=*/0, /*idx=*/i };
     build_chat_row_dynamic(col, &r);
-    // Note: strdup memory leak — acceptable for re-render-on-switch UI; LVGL
-    // doesn't free our strings when row is destroyed. For long-running
-    // sessions this can grow; we accept it for now.
   }
 
   // ── DM CONTACTS — one row per discovered Moki ────────────────────────
@@ -3685,8 +3682,7 @@ static void build_chats_content(lv_obj_t *parent) {
         snprintf(sub_buf, sizeof(sub_buf), "id %02x%02x%02x%02x — noch keine nachricht",
                  key4[0], key4[1], key4[2], key4[3]);
       }
-      moki_chat_row_t r = { strdup(name), strdup(sub_buf), strdup(meta_buf),
-                            /*kind=*/1, /*idx=*/i };
+      moki_chat_row_t r = { name, sub_buf, meta_buf, /*kind=*/1, /*idx=*/i };
       build_chat_row_dynamic(col, &r);
     }
   }
@@ -4799,7 +4795,8 @@ void build_chat_detail(void) {
   lv_obj_set_style_text_font(title, &moki_fraunces_italic_36, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(MOKI_INK), LV_PART_MAIN);
 
-  if (c->reset && c->reset[0]) {
+  // Reset phrase only relevant in legacy mockup-chat path (where c != NULL).
+  if (!new_style && c && c->reset && c->reset[0]) {
     lv_obj_t *r = lv_label_create(scr);
     lv_label_set_text(r, chat_reset_phrase(c->reset));
     lv_obj_set_style_text_font(r, &moki_jetbrains_mono_22, LV_PART_MAIN);
