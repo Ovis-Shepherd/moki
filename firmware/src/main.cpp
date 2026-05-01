@@ -4044,6 +4044,29 @@ static void build_profile(void) {
   lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
 
+  // Neustart-Link (allgemein erreichbar)
+  lv_obj_t *reboot_link = lv_obj_create(scr);
+  lv_obj_remove_style_all(reboot_link);
+  lv_obj_set_size(reboot_link, LV_PCT(100), 56);
+  lv_obj_set_style_border_color(reboot_link, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(reboot_link, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(reboot_link, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(reboot_link, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(reboot_link, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(reboot_link, LV_OBJ_FLAG_CLICKABLE);
+  static auto reboot_cb = [](lv_event_t *) {
+    Serial.println(F("[boot] reboot via Profil"));
+    delay(200);
+    ESP.restart();
+  };
+  lv_obj_add_event_cb(reboot_link, reboot_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *rbl = lv_label_create(reboot_link);
+  lv_label_set_text(rbl, "↻ MOKI NEU STARTEN");
+  lv_obj_set_style_text_font(rbl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(rbl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(rbl, 3, LV_PART_MAIN);
+
 #ifdef MOKI_WIFI
   // WLAN link
   lv_obj_t *wifi_link = lv_obj_create(scr);
@@ -6788,6 +6811,12 @@ static void on_wifi_open_ota(lv_event_t *e) {
   switch_screen(SCR_OTA);
 }
 
+static void on_wifi_reboot(lv_event_t *e) {
+  Serial.println(F("[boot] reboot via WLAN-Screen"));
+  delay(200);
+  ESP.restart();
+}
+
 void build_wifi(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(MOKI_PAPER), LV_PART_MAIN);
@@ -7010,6 +7039,26 @@ void build_wifi(void) {
   lv_obj_set_style_text_color(ml, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(ml, 2, LV_PART_MAIN);
   lv_obj_add_flag(ml, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  // Reboot-Button — nach WiFi-Setup oft sinnvoll (mehr DRAM frei beim
+  // Boot-Connect als bei Live-Reconnect)
+  lv_obj_t *reb = lv_obj_create(scr);
+  lv_obj_remove_style_all(reb);
+  lv_obj_set_size(reb, LV_PCT(100), 56);
+  lv_obj_set_style_border_color(reb, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(reb, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(reb, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(reb, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(reb, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(reb, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(reb, on_wifi_reboot, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *rl = lv_label_create(reb);
+  lv_label_set_text(rl, "↻ NEU STARTEN");
+  lv_obj_set_style_text_font(rl, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(rl, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(rl, 2, LV_PART_MAIN);
+  lv_obj_add_flag(rl, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
 
 void build_wifi_psk(void) {
