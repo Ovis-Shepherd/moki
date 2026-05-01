@@ -11,6 +11,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <LittleFS.h>
+#include <SD.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -726,6 +727,66 @@ static void lora_push_msg(const char *from, const char *text, int16_t rssi) {
 #define LORA_LOG_MAX_BYTES (256u * 1024u)  // ~1300 messages → soft cap, then truncate
 
 static bool g_fs_ready = false;
+static bool g_sd_ready = false;
+
+// ── SD-Card book index (M5-Full step 1) ──────────────────────────────────
+// Plain .txt files on microSD, one per book. EPUB-zip parsing comes later.
+// Books live in /books/ at SD root. We index them lazily on tab-open.
+#define MOKI_MAX_BOOKS 12
+typedef struct {
+  char path[40];   // "/books/walden.txt"
+  char title[32];  // pretty filename ("walden")
+} moki_book_t;
+static moki_book_t g_books[MOKI_MAX_BOOKS];
+static int g_book_count = 0;
+
+static void sd_mount(void) {
+  // SD shares SPI with the LoRa radio. SPI.begin() was called by target.cpp's
+  // radio_init() so we just need to assert the right CS pin and let SD.begin
+  // probe.
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);   // de-assert until SD.begin
+  if (SD.begin(SD_CS, SPI, 4000000)) {
+    g_sd_ready = true;
+    Serial.printf("[sd] mounted: type=%d size=%lluMB\n",
+                  SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
+  } else {
+    Serial.println(F("[sd] mount failed (no card? wrong CS? format?)"));
+  }
+}
+
+// Scan /books/ for *.txt files and populate g_books[]. Returns count.
+static int books_scan(void) {
+  g_book_count = 0;
+  if (!g_sd_ready) return 0;
+  File dir = SD.open("/books");
+  if (!dir || !dir.isDirectory()) {
+    Serial.println(F("[sd] /books/ directory missing"));
+    if (dir) dir.close();
+    return 0;
+  }
+  while (g_book_count < MOKI_MAX_BOOKS) {
+    File f = dir.openNextFile();
+    if (!f) break;
+    if (f.isDirectory()) { f.close(); continue; }
+    const char *name = f.name();   // basename only on Arduino-ESP32 SD
+    size_t nlen = strlen(name);
+    if (nlen < 5 || strcmp(name + nlen - 4, ".txt") != 0) { f.close(); continue; }
+
+    moki_book_t *b = &g_books[g_book_count];
+    snprintf(b->path, sizeof(b->path), "/books/%s", name);
+    // Pretty title — strip the .txt extension.
+    size_t copy_len = nlen - 4;
+    if (copy_len > sizeof(b->title) - 1) copy_len = sizeof(b->title) - 1;
+    memcpy(b->title, name, copy_len);
+    b->title[copy_len] = 0;
+    g_book_count++;
+    f.close();
+  }
+  dir.close();
+  Serial.printf("[sd] indexed %d books\n", g_book_count);
+  return g_book_count;
+}
 
 static void fs_mount(void) {
   // .begin(format_on_fail=true) → if first boot or partition broken, format.
@@ -5795,6 +5856,8 @@ void setup() {
   Serial.println(F("[lvgl] synth indev registered"));
 
   fs_mount();
+  sd_mount();
+  books_scan();
 
   state_load_todos();
   state_load_habits();
@@ -6068,6 +6131,13 @@ static void poll_serial(void) {
         } else {
           Serial.println(F("[mesh] cannot remove (last/invalid)"));
         }
+      } else if (line == "sd_list") {
+        Serial.printf("[sd] ready=%d, %d books indexed:\n", g_sd_ready, g_book_count);
+        for (int i = 0; i < g_book_count; i++) {
+          Serial.printf("  [%d] %s  → %s\n", i, g_books[i].title, g_books[i].path);
+        }
+      } else if (line == "sd_rescan") {
+        books_scan();
       } else if (line == "advert") {
         if (!g_settings.lora_tx_armed) {
           Serial.println(F("[mesh] tx not armed"));
