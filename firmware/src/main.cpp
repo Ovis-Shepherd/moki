@@ -458,6 +458,9 @@ static const char MOKI_BOOK_TEXT[] PROGMEM =
   "übermäßig gewachsene Einrichtung.";
 #define BOOK_PAGE_KEY "book_p"
 static int g_book_page = 0;
+
+// -1 = read from embedded MOKI_BOOK_TEXT, otherwise index into g_books[]
+static int g_book_active_idx = -1;
 static moki_note_t g_notes[MAX_NOTES];
 static int g_notes_count = 0;
 
@@ -983,6 +986,66 @@ static void state_load_book_page(void) {
   g_prefs.begin("moki", true);
   g_book_page = (int)g_prefs.getUInt(BOOK_PAGE_KEY, 0);
   g_prefs.end();
+}
+
+// ── M5-Full step 2: file-backed pagination ────────────────────────────────
+// Returns total length of the active book (PROGMEM length OR SD file size).
+static size_t book_total_length(void) {
+  if (g_book_active_idx < 0) return strlen_P(MOKI_BOOK_TEXT);
+  if (!g_sd_ready) return 0;
+  if (g_book_active_idx >= g_book_count) return 0;
+  File f = SD.open(g_books[g_book_active_idx].path);
+  if (!f) return 0;
+  size_t sz = f.size();
+  f.close();
+  return sz;
+}
+
+// Reads up to `want` bytes starting at byte offset `start` into out_buf.
+// Works for both embedded text and SD-files. NUL-terminates.
+static size_t book_read_chunk(size_t start, size_t want, char *out_buf, size_t buf_size) {
+  if (want > buf_size - 1) want = buf_size - 1;
+  if (g_book_active_idx < 0) {
+    // PROGMEM source
+    size_t total = strlen_P(MOKI_BOOK_TEXT);
+    if (start + want > total) want = (start < total) ? total - start : 0;
+    memcpy_P(out_buf, MOKI_BOOK_TEXT + start, want);
+    out_buf[want] = 0;
+    return want;
+  }
+  if (!g_sd_ready) { out_buf[0] = 0; return 0; }
+  File f = SD.open(g_books[g_book_active_idx].path);
+  if (!f) { out_buf[0] = 0; return 0; }
+  if (!f.seek(start)) { f.close(); out_buf[0] = 0; return 0; }
+  size_t got = f.read((uint8_t *)out_buf, want);
+  out_buf[got] = 0;
+  f.close();
+  return got;
+}
+
+// Tap on a book in the list — switch active book + reset page + bookmark.
+// Per-book bookmark scheme: NVS key "book_p_<idx>".
+static void book_select(int idx) {
+  if (idx < -1 || idx >= g_book_count) return;
+  // Save current page under its own key first
+  if (g_book_active_idx >= 0) {
+    char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
+    g_prefs.begin("moki", false);
+    g_prefs.putUInt(k, (uint32_t)g_book_page);
+    g_prefs.end();
+  } else {
+    state_save_book_page();   // legacy embedded
+  }
+  // Switch + load new page
+  g_book_active_idx = idx;
+  if (idx >= 0) {
+    char k[16]; snprintf(k, sizeof(k), "book_p_%d", idx);
+    g_prefs.begin("moki", true);
+    g_book_page = (int)g_prefs.getUInt(k, 0);
+    g_prefs.end();
+  } else {
+    state_load_book_page();
+  }
 }
 
 // ── Mesh-Identity (32-byte secret) ───────────────────────────────────────
@@ -2727,39 +2790,106 @@ static void build_read_content(lv_obj_t *parent) {
   make_tab_button(bar, "notizen", current_read_tab == READ_NOTES, on_read_tab_clicked, READ_NOTES);
 
   if (current_read_tab == READ_BOOK) {
-    // Total pages computed from PROGMEM string length.
-    size_t total = strlen_P(MOKI_BOOK_TEXT);
+    // Book selector — only render when SD has books
+    if (g_book_count > 0) {
+      lv_obj_t *picker = lv_obj_create(col);
+      lv_obj_remove_style_all(picker);
+      lv_obj_set_size(picker, LV_PCT(100), LV_SIZE_CONTENT);
+      lv_obj_set_flex_flow(picker, LV_FLEX_FLOW_ROW_WRAP);
+      lv_obj_set_style_pad_column(picker, 6, LV_PART_MAIN);
+      lv_obj_set_style_pad_row(picker, 6, LV_PART_MAIN);
+      lv_obj_set_style_pad_bottom(picker, 8, LV_PART_MAIN);
+
+      static auto on_book_picked_cb = [](lv_event_t *e) {
+        int new_idx = (int)(intptr_t)lv_event_get_user_data(e);
+        book_select(new_idx);
+        switch_screen(SCR_READ);
+      };
+
+      // Embedded fallback chip
+      {
+        bool active = (g_book_active_idx == -1);
+        lv_obj_t *c = lv_obj_create(picker);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_size(c, LV_SIZE_CONTENT, 40);
+        lv_obj_set_style_bg_color(c,
+            lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(c, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+        lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+        lv_obj_set_style_pad_left(c, 12, LV_PART_MAIN);
+        lv_obj_set_style_pad_right(c, 12, LV_PART_MAIN);
+        lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(c, on_book_picked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
+        lv_obj_t *l = lv_label_create(c);
+        lv_label_set_text(l, "walden");
+        lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l,
+            lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+        lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+      }
+
+      for (int bi = 0; bi < g_book_count; bi++) {
+        bool active = (g_book_active_idx == bi);
+        lv_obj_t *c = lv_obj_create(picker);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_size(c, LV_SIZE_CONTENT, 40);
+        lv_obj_set_style_bg_color(c,
+            lv_color_hex(active ? MOKI_INK : MOKI_PAPER), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(c, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+        lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(c, 2, LV_PART_MAIN);
+        lv_obj_set_style_pad_left(c, 12, LV_PART_MAIN);
+        lv_obj_set_style_pad_right(c, 12, LV_PART_MAIN);
+        lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(c, on_book_picked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)bi);
+        lv_obj_t *l = lv_label_create(c);
+        lv_label_set_text(l, g_books[bi].title);
+        lv_obj_set_style_text_font(l, &moki_jetbrains_mono_18, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l,
+            lv_color_hex(active ? MOKI_PAPER : MOKI_DARK), LV_PART_MAIN);
+        lv_obj_add_flag(l, LV_OBJ_FLAG_EVENT_BUBBLE);
+      }
+    }
+
+    // Total pages
+    size_t total = book_total_length();
     int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
     if (total_pages < 1) total_pages = 1;
     if (g_book_page >= total_pages) g_book_page = total_pages - 1;
     if (g_book_page < 0) g_book_page = 0;
 
-    lv_obj_t *author = lv_label_create(col);
-    lv_label_set_text(author, "HENRY DAVID THOREAU");
-    lv_obj_set_style_text_font(author, &moki_jetbrains_mono_22, LV_PART_MAIN);
-    lv_obj_set_style_text_color(author, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
-    lv_obj_set_style_text_letter_space(author, 3, LV_PART_MAIN);
-    lv_obj_set_style_text_align(author, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_width(author, LV_PCT(100));
-
+    // Title
+    const char *book_title = (g_book_active_idx >= 0)
+                             ? g_books[g_book_active_idx].title
+                             : "Walden";
     lv_obj_t *book = lv_label_create(col);
-    lv_label_set_text(book, "Walden");
+    lv_label_set_text(book, book_title);
     lv_obj_set_style_text_font(book, &moki_fraunces_italic_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(book, lv_color_hex(MOKI_INK), LV_PART_MAIN);
     lv_obj_set_style_text_align(book, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(book, LV_PCT(100));
 
-    // Extract current page slice into a stack buffer.
+    // Read current page
     static char page_buf[BOOK_CHARS_PER_PAGE + 8];
     size_t start = g_book_page * BOOK_CHARS_PER_PAGE;
     size_t want  = BOOK_CHARS_PER_PAGE;
     if (start + want > total) want = total - start;
-    memcpy_P(page_buf, MOKI_BOOK_TEXT + start, want);
-    page_buf[want] = 0;
-    // Trim back to last whitespace so we don't split mid-word — only when
-    // we're not on the final page.
+    size_t got = book_read_chunk(start, want, page_buf, sizeof(page_buf));
+    if (got == 0) {
+      strncpy(page_buf, "(leer)", sizeof(page_buf));
+    }
+    // Trim back to last whitespace
     if (g_book_page < total_pages - 1) {
-      for (int i = (int)want - 1; i > (int)want - 80 && i > 0; i--) {
+      for (int i = (int)got - 1; i > (int)got - 80 && i > 0; i--) {
         if (page_buf[i] == ' ' || page_buf[i] == '\n') {
           page_buf[i] = 0;
           break;
@@ -2789,12 +2919,32 @@ static void build_read_content(lv_obj_t *parent) {
     lv_obj_set_style_pad_top(nav, 8, LV_PART_MAIN);
 
     static auto on_book_prev = [](lv_event_t *e) {
-      if (g_book_page > 0) { g_book_page--; state_save_book_page(); switch_screen(SCR_READ); }
+      if (g_book_page > 0) {
+        g_book_page--;
+        if (g_book_active_idx < 0) state_save_book_page();
+        else {
+          char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
+          g_prefs.begin("moki", false);
+          g_prefs.putUInt(k, (uint32_t)g_book_page);
+          g_prefs.end();
+        }
+        switch_screen(SCR_READ);
+      }
     };
     static auto on_book_next = [](lv_event_t *e) {
-      size_t total = strlen_P(MOKI_BOOK_TEXT);
+      size_t total = book_total_length();
       int total_pages = (int)((total + BOOK_CHARS_PER_PAGE - 1) / BOOK_CHARS_PER_PAGE);
-      if (g_book_page < total_pages - 1) { g_book_page++; state_save_book_page(); switch_screen(SCR_READ); }
+      if (g_book_page < total_pages - 1) {
+        g_book_page++;
+        if (g_book_active_idx < 0) state_save_book_page();
+        else {
+          char k[16]; snprintf(k, sizeof(k), "book_p_%d", g_book_active_idx);
+          g_prefs.begin("moki", false);
+          g_prefs.putUInt(k, (uint32_t)g_book_page);
+          g_prefs.end();
+        }
+        switch_screen(SCR_READ);
+      }
     };
 
     lv_obj_t *prev = lv_label_create(nav);
