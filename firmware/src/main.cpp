@@ -873,13 +873,18 @@ static void sd_mount(void) {
   }
 }
 
-// Scan /books/ for *.txt files and populate g_books[]. Returns count.
-static int books_scan(void) {
-  g_book_count = 0;
-  if (!g_sd_ready) return 0;
-  File dir = SD.open("/books");
+// New book entry: source flag tells us where to read from.
+// Re-using moki_book_t — we encode source in the path prefix:
+//   "/books/foo.txt"        → SD
+//   "lfs:/books/foo.txt"    → LittleFS
+// book_read_chunk + book_total_length below sniff the prefix.
+
+// Scan /books/ on a FS. Returns count of books added.
+template <typename FS>
+static int scan_books_on_fs(FS &fs, const char *path_prefix, bool is_lfs) {
+  int added = 0;
+  File dir = fs.open(is_lfs ? "/books" : "/books");
   if (!dir || !dir.isDirectory()) {
-    Serial.println(F("[sd] /books/ directory missing"));
     if (dir) dir.close();
     return 0;
   }
@@ -887,22 +892,33 @@ static int books_scan(void) {
     File f = dir.openNextFile();
     if (!f) break;
     if (f.isDirectory()) { f.close(); continue; }
-    const char *name = f.name();   // basename only on Arduino-ESP32 SD
+    const char *name = f.name();
     size_t nlen = strlen(name);
     if (nlen < 5 || strcmp(name + nlen - 4, ".txt") != 0) { f.close(); continue; }
 
     moki_book_t *b = &g_books[g_book_count];
-    snprintf(b->path, sizeof(b->path), "/books/%s", name);
-    // Pretty title — strip the .txt extension.
+    snprintf(b->path, sizeof(b->path), "%s/%s", path_prefix, name);
     size_t copy_len = nlen - 4;
     if (copy_len > sizeof(b->title) - 1) copy_len = sizeof(b->title) - 1;
     memcpy(b->title, name, copy_len);
     b->title[copy_len] = 0;
     g_book_count++;
+    added++;
     f.close();
   }
   dir.close();
-  Serial.printf("[sd] indexed %d books\n", g_book_count);
+  return added;
+}
+
+static int books_scan(void) {
+  g_book_count = 0;
+  int from_lfs = 0, from_sd = 0;
+  // LittleFS first — these are firmware-bundled books (e.g., Nietzsche
+  // uploaded via `pio run -t uploadfs`). Always available, no SD needed.
+  if (g_fs_ready) from_lfs = scan_books_on_fs(LittleFS, "lfs:/books", true);
+  if (g_sd_ready) from_sd  = scan_books_on_fs(SD, "/books", false);
+  Serial.printf("[books] indexed %d books (lfs=%d sd=%d)\n",
+                g_book_count, from_lfs, from_sd);
   return g_book_count;
 }
 
@@ -1103,22 +1119,31 @@ static void state_load_book_page(void) {
   g_prefs.end();
 }
 
+// Returns true if the active book's path is on LittleFS, else SD.
+static bool active_book_is_lfs(void) {
+  if (g_book_active_idx < 0 || g_book_active_idx >= g_book_count) return false;
+  return strncmp(g_books[g_book_active_idx].path, "lfs:", 4) == 0;
+}
+
+// Open helper that picks the right FS based on path prefix.
+static File book_open_active(void) {
+  if (g_book_active_idx < 0 || g_book_active_idx >= g_book_count) return File();
+  const char *p = g_books[g_book_active_idx].path;
+  if (strncmp(p, "lfs:", 4) == 0) return LittleFS.open(p + 4);
+  return SD.open(p);
+}
+
 // ── M5-Full step 2: file-backed pagination ────────────────────────────────
-// Returns total length of the active book (PROGMEM length OR SD file size).
 static size_t book_total_length(void) {
   if (g_book_active_idx == -2) return strlen_P(MOKI_MANUAL_TEXT);
   if (g_book_active_idx == -1) return strlen_P(MOKI_BOOK_TEXT);
-  if (!g_sd_ready) return 0;
-  if (g_book_active_idx >= g_book_count) return 0;
-  File f = SD.open(g_books[g_book_active_idx].path);
+  File f = book_open_active();
   if (!f) return 0;
   size_t sz = f.size();
   f.close();
   return sz;
 }
 
-// Reads up to `want` bytes starting at byte offset `start` into out_buf.
-// Works for embedded books and SD-files. NUL-terminates.
 static size_t book_read_chunk(size_t start, size_t want, char *out_buf, size_t buf_size) {
   if (want > buf_size - 1) want = buf_size - 1;
   if (g_book_active_idx == -2 || g_book_active_idx == -1) {
@@ -1129,8 +1154,7 @@ static size_t book_read_chunk(size_t start, size_t want, char *out_buf, size_t b
     out_buf[want] = 0;
     return want;
   }
-  if (!g_sd_ready) { out_buf[0] = 0; return 0; }
-  File f = SD.open(g_books[g_book_active_idx].path);
+  File f = book_open_active();
   if (!f) { out_buf[0] = 0; return 0; }
   if (!f.seek(start)) { f.close(); out_buf[0] = 0; return 0; }
   size_t got = f.read((uint8_t *)out_buf, want);
