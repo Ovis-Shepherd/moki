@@ -3567,11 +3567,17 @@ static void build_chat_row_dynamic(lv_obj_t *parent, const moki_chat_row_t *r) {
   lv_obj_remove_style_all(left);
   lv_obj_set_flex_grow(left, 1);
   lv_obj_set_flex_flow(left, LV_FLEX_FLOW_COLUMN);
+  // LVGL doesn't bubble click events by default. The `left` container fills
+  // most of the row's tappable area, so without EVENT_BUBBLE the row never
+  // gets the click.
+  lv_obj_clear_flag(left, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(left, LV_OBJ_FLAG_EVENT_BUBBLE);
 
   lv_obj_t *t = lv_label_create(left);
   lv_label_set_text(t, r->title);
   lv_obj_set_style_text_font(t, &moki_fraunces_italic_28, LV_PART_MAIN);
   lv_obj_set_style_text_color(t, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_add_flag(t, LV_OBJ_FLAG_EVENT_BUBBLE);
 
   if (r->subtitle && r->subtitle[0]) {
     lv_obj_t *s = lv_label_create(left);
@@ -3581,6 +3587,7 @@ static void build_chat_row_dynamic(lv_obj_t *parent, const moki_chat_row_t *r) {
     lv_obj_set_width(s, LV_PCT(100));
     lv_label_set_long_mode(s, LV_LABEL_LONG_DOT);
     lv_obj_set_style_pad_top(s, 4, LV_PART_MAIN);
+    lv_obj_add_flag(s, LV_OBJ_FLAG_EVENT_BUBBLE);
   }
 
   // Right meta: time or count
@@ -3590,6 +3597,7 @@ static void build_chat_row_dynamic(lv_obj_t *parent, const moki_chat_row_t *r) {
     lv_obj_set_style_text_font(m, &moki_jetbrains_mono_18, LV_PART_MAIN);
     lv_obj_set_style_text_color(m, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
     lv_obj_set_style_pad_left(m, 12, LV_PART_MAIN);
+    lv_obj_add_flag(m, LV_OBJ_FLAG_EVENT_BUBBLE);
   }
 }
 
