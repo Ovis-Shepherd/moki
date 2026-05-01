@@ -3103,6 +3103,35 @@ static void build_profile(void) {
   lv_obj_set_style_text_font(sl, &moki_jetbrains_mono_22, LV_PART_MAIN);
   lv_obj_set_style_text_color(sl, lv_color_hex(MOKI_INK), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sl, 3, LV_PART_MAIN);
+
+  // ── DISKOVERY: announce me to the mesh ───────────────────────────────
+  // Manual self-advert button — useful right after setting handle/joining
+  // a new room, when Lucas wants to be discovered by friends NOW (not
+  // waiting for the 15-minute auto-advert).
+  lv_obj_t *advert = lv_obj_create(scr);
+  lv_obj_remove_style_all(advert);
+  lv_obj_set_size(advert, LV_PCT(100), 56);
+  lv_obj_set_style_border_color(advert, lv_color_hex(MOKI_DARK), LV_PART_MAIN);
+  lv_obj_set_style_border_width(advert, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(advert, 2, LV_PART_MAIN);
+  lv_obj_set_flex_flow(advert, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(advert, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(advert, LV_OBJ_FLAG_CLICKABLE);
+  static auto on_advert_cb = [](lv_event_t *) {
+    if (!g_settings.lora_tx_armed) {
+      show_toast("ANTENNE FREIGEBEN");
+      return;
+    }
+    bool ok = moki_mesh_advert(g_settings.handle);
+    show_toast(ok ? "BIN IM MESH SICHTBAR" : "ADVERT FEHLGESCHLAGEN");
+  };
+  lv_obj_add_event_cb(advert, on_advert_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *al = lv_label_create(advert);
+  lv_label_set_text(al, "MICH IM MESH ZEIGEN");
+  lv_obj_set_style_text_font(al, &moki_jetbrains_mono_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(al, lv_color_hex(MOKI_INK), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(al, 3, LV_PART_MAIN);
 }
 
 // ----------------------------------------------------------------------------
@@ -5018,9 +5047,15 @@ void build_chat_detail(void) {
             // here? No — only msgs from this channel).
             if (m->channel_idx != filter_idx) continue;
           } else if (filter_kind == 1) {
-            // DM: only DMs (channel_idx=-1) from the matching contact name.
+            // DM: only DMs (channel_idx=-1) — bidirectional thread.
+            //   incoming: m->from == dm_contact_name
+            //   outgoing: m->from == "→ <dm_contact_name>" (compose handler tag)
             if (m->channel_idx != -1) continue;
-            if (strncmp(m->from, dm_contact_name, sizeof(m->from)) != 0) continue;
+            bool is_incoming = (strncmp(m->from, dm_contact_name, sizeof(m->from)) == 0);
+            char out_tag[40];
+            snprintf(out_tag, sizeof(out_tag), "→ %s", dm_contact_name);
+            bool is_outgoing = (strncmp(m->from, out_tag, sizeof(m->from)) == 0);
+            if (!is_incoming && !is_outgoing) continue;
           }
         } else {
           // Legacy path: same as before
@@ -5171,11 +5206,14 @@ static void on_lora_compose_save(lv_event_t *e) {
       // Direct-Message to a specific contact (M4 Phase 2).
       ok = moki_mesh_dm(g_dm_target_idx, g_lora_compose);
       if (ok) {
-        char from[32]; uint8_t key4[4];
-        moki_mesh_get_contact(g_dm_target_idx, from, sizeof(from), key4);
-        char tag[40];
-        snprintf(tag, sizeof(tag), "dm → %s", from);
-        lora_push_msg(tag, g_lora_compose, 0);
+        char contact_name[32]; uint8_t key4[4];
+        moki_mesh_get_contact(g_dm_target_idx, contact_name, sizeof(contact_name), key4);
+        // Push to ring buffer with channel_idx=-1 so it lives in the DM
+        // thread bucket, AND prefix the from-field with "→ <contact>" so
+        // the DM-thread filter can match outgoing messages too.
+        char outgoing_tag[40];
+        snprintf(outgoing_tag, sizeof(outgoing_tag), "→ %s", contact_name);
+        moki_lora_push_msg_channel(outgoing_tag, g_lora_compose, 0, -1);
       }
     } else {
       // Group-channel broadcast.
